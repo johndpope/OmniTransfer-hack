@@ -10,6 +10,7 @@ This file provides guidance to AI coding assistants (Claude, Cursor, etc.) when 
 - **Full fine-tuning** - Complete model training
 - **Audio-video training** - Joint audio and video generation
 - **IC-LoRA training** - In-context control adapters for video-to-video transformations
+- **OmniTransfer training** - Unified spatio-temporal video transfer (identity preservation, style transfer, motion transfer)
 
 **Key Dependencies:**
 
@@ -35,6 +36,13 @@ packages/ltx-trainer/
 │   │   ├── base_strategy.py   # TrainingStrategy ABC, ModelInputs, TrainingStrategyConfigBase
 │   │   ├── text_to_video.py   # TextToVideoStrategy, TextToVideoConfig
 │   │   └── video_to_video.py  # VideoToVideoStrategy, VideoToVideoConfig
+│   ├── omnitransfer/          # OmniTransfer implementation (arXiv:2601.14250v1)
+│   │   ├── __init__.py        # Module exports
+│   │   ├── components.py      # TPB, RCL, TMA core components
+│   │   ├── latent_constructor.py  # Reference latent construction
+│   │   ├── strategy.py        # OmniTransferStrategy, OmniTransferConfig
+│   │   ├── visualization.py   # W&B reconstruction logging
+│   │   └── training_callback.py   # Training callback for auto-logging
 │   ├── timestep_samplers.py   # Flow matching timestep sampling
 │   ├── captioning.py          # Video captioning utilities
 │   ├── video_utils.py         # Video processing utilities
@@ -48,7 +56,11 @@ packages/ltx-trainer/
 │   ├── decode_latents.py      # Latent decoding for debugging
 │   ├── inference.py           # Inference with trained models
 │   ├── compute_reference.py   # Generate IC-LoRA reference videos
-│   └── split_scenes.py        # Scene detection and splitting
+│   ├── split_scenes.py        # Scene detection and splitting
+│   ├── prepare_omnitransfer_dataset.py  # OmniTransfer dataset preparation
+│   ├── generate_omnitransfer_dataset.py # Generate synthetic training data
+│   ├── omnitransfer_inference.py        # OmniTransfer inference
+│   └── test_msi_generation.py           # Test video generation via Temporal
 ├── configs/                   # Example training configurations
 │   ├── ltx2_av_lora.yaml      # Audio-video LoRA training
 │   ├── ltx2_v2v_ic_lora.yaml  # IC-LoRA video-to-video
@@ -206,6 +218,7 @@ Key classes:
 - `base_strategy.py`: `TrainingStrategy` ABC, `ModelInputs` dataclass
 - `text_to_video.py`: Standard text-to-video (with optional audio)
 - `video_to_video.py`: IC-LoRA video-to-video transformations
+- `omnitransfer/strategy.py`: OmniTransfer unified spatio-temporal transfer
 
 Key methods each strategy implements:
 - `get_data_sources()` - Required data directories
@@ -299,6 +312,101 @@ audio = replace(audio, enabled=False)
 - Validation errors: Check validators in `config.py`
 - Unknown fields: Config uses `extra="forbid"` - all fields must be defined
 - Strategy validation: IC-LoRA requires `reference_videos` in validation config
+
+## OmniTransfer Training
+
+OmniTransfer implements unified spatio-temporal video transfer based on arXiv:2601.14250v1. It enables:
+- **Identity preservation** - Maintain subject identity across different scenes/motions
+- **Style transfer** - Apply artistic styles while preserving content
+- **Motion transfer** - Transfer motion patterns between videos
+- **Pose reenactment** - Drive target with reference poses
+
+### OmniTransfer Components
+
+1. **Task-aware Positional Bias (TPB)** - RoPE offsets distinguish reference vs target
+2. **Reference-decoupled Causal Learning (RCL)** - Separate attention branches for efficiency
+3. **Task-adaptive Multimodal Alignment (TMA)** - MLLM with MetaQueries for semantic guidance
+
+### OmniTransfer Training (Local GPU)
+
+**VRAM Requirements:**
+| Configuration | VRAM Required | Notes |
+|--------------|---------------|-------|
+| Full (no quantization) | 80GB+ | A100/H100 recommended |
+| LoRA + gradient checkpointing | 48GB+ | A6000, RTX 6000 Ada |
+| LoRA + INT8 + grad checkpoint | 24GB+ | RTX 4090, RTX 3090 |
+| LoRA + INT8 + low batch | 16GB+ | RTX 4080, experimental |
+
+**Quick Start (24GB+ GPU):**
+
+```bash
+# 1. Prepare dataset with reference/target video pairs
+python scripts/prepare_omnitransfer_dataset.py \
+    --input-dir /path/to/videos \
+    --output-dir /path/to/processed \
+    --task-type identity_preservation
+
+# 2. Train Stage 1 (TPB + RCL, 10k steps)
+uv run python scripts/train.py configs/ltx2_omnitransfer_lora.yaml
+
+# 3. Train Stage 2 (TMA connector, 2k steps) - optional
+uv run python scripts/train.py configs/ltx2_omnitransfer_stage2.yaml
+
+# 4. Train Stage 3 (joint fine-tuning, 5k steps) - optional
+uv run python scripts/train.py configs/ltx2_omnitransfer_stage3.yaml
+```
+
+**Low VRAM Configuration (24GB):**
+
+Edit your config YAML:
+```yaml
+model:
+  training_mode: lora
+
+lora:
+  rank: 32  # Lower rank saves memory
+  alpha: 32
+
+optimization:
+  batch_size: 1
+  gradient_accumulation_steps: 16  # Effective batch = 16
+  enable_gradient_checkpointing: true
+
+acceleration:
+  mixed_precision_mode: bf16
+  load_text_encoder_in_8bit: true  # INT8 quantization
+```
+
+**Generate Synthetic Training Data:**
+
+```bash
+# Dry run to preview prompts
+python scripts/test_msi_generation.py --dry-run --num-videos 5
+
+# Generate with LTX-2 T2V
+python scripts/test_msi_generation.py --backend ltx2 --num-videos 10
+
+# Generate with LTX-2 I2V (needs reference image)
+python scripts/test_msi_generation.py --backend ltx2_i2v \
+    --reference-image /path/to/identity_ref.png --num-videos 10
+```
+
+### OmniTransfer W&B Visualization
+
+The training automatically logs to Weights & Biases:
+- **Reconstruction grids**: Reference → Target → Prediction comparisons
+- **Video comparisons**: Side-by-side videos at configurable intervals
+- **Metrics**: Loss, PSNR, learning rate, sigma statistics
+
+Configure in YAML:
+```yaml
+training_strategy:
+  log_reconstructions: true
+  reconstruction_log_interval: 500
+  num_frames_to_visualize: 8
+  log_video_comparisons: true
+  video_log_interval: 2000
+```
 
 ## Key Constraints
 

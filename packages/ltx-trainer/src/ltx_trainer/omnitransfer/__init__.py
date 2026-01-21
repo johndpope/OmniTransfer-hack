@@ -1,0 +1,70 @@
+"""OmniTransfer: Unified Spatio-Temporal Video Transfer for LTX-2.
+
+This module implements OmniTransfer (arXiv:2601.14250v1) adapted for LTX-2.
+OmniTransfer enables unified spatio-temporal video transfer with three key components:
+1. Task-aware Positional Bias (TPB) - RoPE offsets for spatial/temporal tasks
+2. Reference-decoupled Causal Learning (RCL) - Separate branches for ref/target
+3. Task-adaptive Multimodal Alignment (TMA) - MLLM with MetaQueries for semantic guidance
+
+Quote: "OmniTransfer comprises three key components: 1) Task-aware Positional Bias that
+applies distinct positional biases for different task types, 2) Reference-decoupled
+Causal Learning that separates reference and target branches for improved efficiency,
+3) Task-adaptive Multimodal Alignment that provides task-specific semantic guidance."
+(Section 4, OmniTransfer paper)
+
+Includes W&B integration for training visualization:
+- Reconstruction comparisons (reference, target, prediction)
+- Video comparisons
+- Training metrics
+"""
+
+from ltx_trainer.omnitransfer.components import (
+    OmniTransferTask,
+    TaskAwarePositionalBias,
+    ReferenceDecoupledCausalLearning,
+    TaskAdaptiveMultimodalAlignment,
+    MetaQueryBank,
+)
+from ltx_trainer.omnitransfer.latent_constructor import ReferenceLatentConstructor
+from ltx_trainer.omnitransfer.strategy import (
+    OmniTransferConfig,
+    OmniTransferStrategy,
+    OmniTransferModelInputs,
+    OmniTransferStage,
+    get_omnitransfer_training_schedule,
+)
+from ltx_trainer.omnitransfer.visualization import (
+    OmniTransferVisualizer,
+    OmniTransferWandBCallback,
+    ReconstructionSample,
+    decode_latents_for_visualization,
+)
+from ltx_trainer.omnitransfer.training_callback import (
+    OmniTransferTrainingCallback,
+    create_omnitransfer_callback,
+)
+
+__all__ = [
+    # Core components
+    "OmniTransferTask",
+    "TaskAwarePositionalBias",
+    "ReferenceDecoupledCausalLearning",
+    "TaskAdaptiveMultimodalAlignment",
+    "MetaQueryBank",
+    # Latent construction
+    "ReferenceLatentConstructor",
+    # Strategy
+    "OmniTransferConfig",
+    "OmniTransferStrategy",
+    "OmniTransferModelInputs",
+    "OmniTransferStage",
+    "get_omnitransfer_training_schedule",
+    # Visualization
+    "OmniTransferVisualizer",
+    "OmniTransferWandBCallback",
+    "ReconstructionSample",
+    "decode_latents_for_visualization",
+    # Training callback
+    "OmniTransferTrainingCallback",
+    "create_omnitransfer_callback",
+]

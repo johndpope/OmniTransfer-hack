@@ -127,8 +127,9 @@ class GenerationResult:
 
 def find_ltx2_paths() -> tuple[str | None, str | None]:
     """Try to find LTX-2 model paths automatically."""
-    # Common locations to check
+    # Common locations to check (in order of preference)
     model_locations = [
+        "/media/2TB/ltx-models",
         "/media/2TB/models/ltx2",
         "/media/2tb/models/ltx2",
         "/mnt/2TB-backup/models/ltx2",
@@ -137,17 +138,42 @@ def find_ltx2_paths() -> tuple[str | None, str | None]:
         "/opt/models/ltx2",
     ]
 
+    # Model file names to search for (in order of preference)
+    model_names = [
+        "ltx2/ltx-2-19b-dev.safetensors",
+        "ltx2/ltx-2-19b-dev-fp8.safetensors",
+        "ltx-2-19b-dev.safetensors",
+        "ltx-2-19b-dev-fp8.safetensors",
+    ]
+
+    # Text encoder directory names to search for
+    gemma_names = [
+        "gemma",
+        "gemma-3-12b-it-qat-q4_0-unquantized",
+    ]
+
     model_path = None
     text_encoder_path = None
 
     for loc in model_locations:
-        safetensors = os.path.join(loc, "ltx-2-19b-dev-fp8.safetensors")
-        gemma = os.path.join(loc, "gemma-3-12b-it-qat-q4_0-unquantized")
+        if not os.path.exists(loc):
+            continue
 
-        if os.path.exists(safetensors):
-            model_path = safetensors
-        if os.path.exists(gemma):
-            text_encoder_path = gemma
+        # Find model file
+        if not model_path:
+            for model_name in model_names:
+                candidate = os.path.join(loc, model_name)
+                if os.path.exists(candidate):
+                    model_path = candidate
+                    break
+
+        # Find text encoder
+        if not text_encoder_path:
+            for gemma_name in gemma_names:
+                candidate = os.path.join(loc, gemma_name)
+                if os.path.exists(candidate):
+                    text_encoder_path = candidate
+                    break
 
         if model_path and text_encoder_path:
             break
@@ -166,52 +192,60 @@ def generate_video_subprocess(
     num_frames: int = 65,
     seed: int = 42,
     negative_prompt: str = NEGATIVE_PROMPT,
+    num_inference_steps: int = 40,
+    cfg_guidance_scale: float = 3.0,
+    enable_fp8: bool = True,
 ) -> GenerationResult:
-    """Generate video using LTX-2 via subprocess."""
+    """Generate video using LTX-2 via subprocess.
+
+    Uses the ti2vid_one_stage pipeline which supports both T2V and I2V modes.
+    For I2V, pass a reference_image which will be used as conditioning at frame 0.
+
+    Args:
+        enable_fp8: If True, keeps model weights in FP8 to reduce memory usage.
+                   Calculations are still in bfloat16 for quality.
+    """
     start_time = time.time()
 
     # Find LTX-2 repo path
     ltx2_repo = os.getenv("LTX2_PATH", "/home/johndpope/Documents/GitHub/LTX-2")
 
-    # Build command
+    # Use the unified text/image-to-video one-stage pipeline
+    pipeline = "ltx_pipelines.ti2vid_one_stage"
+
+    # Build base command
+    cmd = [
+        sys.executable, "-m", pipeline,
+        "--checkpoint-path", model_path,
+        "--gemma-root", text_encoder_path,
+        "--prompt", prompt,
+        "--negative-prompt", negative_prompt,
+        "--width", str(width),
+        "--height", str(height),
+        "--num-frames", str(num_frames),
+        "--seed", str(seed),
+        "--num-inference-steps", str(num_inference_steps),
+        "--cfg-guidance-scale", str(cfg_guidance_scale),
+        "--output-path", str(output_path),
+    ]
+
+    # Enable FP8 mode for reduced memory usage (keeps weights in 8-bit)
+    if enable_fp8:
+        cmd.append("--enable-fp8")
+
+    # Add image conditioning if reference image is provided (I2V mode)
     if reference_image:
-        # Image-to-video pipeline
-        pipeline = "ltx_pipelines.image_to_video"
-        cmd = [
-            sys.executable, "-m", pipeline,
-            "--checkpoint-path", model_path,
-            "--gemma-root", text_encoder_path,
-            "--input-image", reference_image,
-            "--prompt", prompt,
-            "--negative-prompt", negative_prompt,
-            "--width", str(width),
-            "--height", str(height),
-            "--num-frames", str(num_frames),
-            "--seed", str(seed),
-            "--output-path", str(output_path),
-        ]
-    else:
-        # Text-to-video pipeline
-        pipeline = "ltx_pipelines.text_to_video"
-        cmd = [
-            sys.executable, "-m", pipeline,
-            "--checkpoint-path", model_path,
-            "--gemma-root", text_encoder_path,
-            "--prompt", prompt,
-            "--negative-prompt", negative_prompt,
-            "--width", str(width),
-            "--height", str(height),
-            "--num-frames", str(num_frames),
-            "--seed", str(seed),
-            "--output-path", str(output_path),
-        ]
+        # Format: --image PATH FRAME_IDX STRENGTH
+        # Use frame 0 with strength 1.0 for strong identity conditioning
+        cmd.extend(["--image", reference_image, "0", "1.0"])
 
     # Set up environment
     env = os.environ.copy()
     env["PYTHONPATH"] = f"{ltx2_repo}/packages/ltx-pipelines/src:{ltx2_repo}/packages/ltx-core/src"
 
     try:
-        print(f"  Running: {pipeline}")
+        mode = "I2V" if reference_image else "T2V"
+        print(f"  Running: {pipeline} ({mode})")
         result = subprocess.run(
             cmd,
             cwd=ltx2_repo,
@@ -233,7 +267,10 @@ def generate_video_subprocess(
                 prompt=prompt,
             )
         else:
-            error_msg = result.stderr[:500] if result.stderr else f"Return code: {result.returncode}"
+            error_msg = result.stderr[-1000:] if result.stderr else f"Return code: {result.returncode}"
+            # Also include stdout for debugging
+            if result.stdout:
+                error_msg = f"stdout: {result.stdout[-500:]}\nstderr: {error_msg}"
             return GenerationResult(
                 success=False,
                 prompt_name=output_path.stem,

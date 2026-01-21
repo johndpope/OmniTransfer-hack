@@ -431,6 +431,37 @@ Width and height must be divisible by 32.
 - Linux required (uses `triton` which is Linux-only)
 - CUDA GPU with 24GB+ VRAM recommended
 
+### CUDA Environment Setup
+
+Before running training or inference, verify CUDA is properly configured:
+
+```bash
+# Check CUDA in zshrc - ensure these are set:
+# In ~/.zshrc:
+export CUDA_HOME=/usr/local/cuda
+export PATH=$CUDA_HOME/bin:$PATH
+export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
+
+# Verify nvcc is available
+nvcc --version
+
+# Check PyTorch CUDA support
+python -c "import torch; print('CUDA available:', torch.cuda.is_available()); print('Device:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A')"
+```
+
+**RTX 5090 (Blackwell/sm_120) Requirements:**
+- CUDA 13.0 or later
+- PyTorch 2.10.0+cu130 or later
+- Install with: `pip install torch==2.10.0+cu130 torchvision==0.25.0+cu130 --index-url https://download.pytorch.org/whl/cu130`
+
+**Common CUDA Issues:**
+1. **Error 804 (forward compatibility)**: PyTorch CUDA version doesn't match driver
+   - Solution: Install PyTorch with matching CUDA version (e.g., cu130 for CUDA 13.0)
+2. **NCCL undefined symbol**: Version mismatch
+   - Solution: `pip install nvidia-nccl-cu13==2.28.9` (match PyTorch requirements)
+3. **No kernel image available**: GPU architecture not supported
+   - Solution: Ensure PyTorch includes sm_XX for your GPU (sm_120 for RTX 5090)
+
 ## Reference: ltx-core Key Components
 
 ```

@@ -44,12 +44,79 @@ from pathlib import Path
 import torch
 from tqdm import tqdm
 
+import torch.nn.functional as F
+from einops import rearrange
+
 from ltx_trainer import logger
 from ltx_trainer.model_loader import (
     load_video_vae_encoder,
     load_text_encoder,
 )
-from ltx_trainer.video_utils import load_video_frames, resize_for_vae
+from ltx_trainer.video_utils import read_video
+
+
+def resize_video_for_vae(video: torch.Tensor, target_width: int, target_height: int) -> torch.Tensor:
+    """Resize video tensor to target dimensions for VAE encoding.
+
+    Args:
+        video: Video tensor [F, C, H, W] in range [0, 1]
+        target_width: Target width (must be divisible by 32)
+        target_height: Target height (must be divisible by 32)
+
+    Returns:
+        Resized video tensor [F, C, H, W]
+    """
+    # video is [F, C, H, W]
+    f, c, h, w = video.shape
+
+    # Compute resize dimensions preserving aspect ratio
+    aspect_ratio = w / h
+    target_aspect = target_width / target_height
+
+    if aspect_ratio > target_aspect:
+        # Wider - resize to target height, crop width
+        resize_h = target_height
+        resize_w = int(target_height * aspect_ratio)
+    else:
+        # Taller - resize to target width, crop height
+        resize_w = target_width
+        resize_h = int(target_width / aspect_ratio)
+
+    # Resize
+    video = F.interpolate(
+        video, size=(resize_h, resize_w), mode="bilinear", align_corners=False
+    )
+
+    # Center crop
+    h_start = (resize_h - target_height) // 2
+    w_start = (resize_w - target_width) // 2
+    video = video[:, :, h_start:h_start + target_height, w_start:w_start + target_width]
+
+    return video
+
+
+def prepare_video_for_vae(video: torch.Tensor, max_frames: int) -> torch.Tensor:
+    """Convert video from [F, C, H, W] to [B, C, F, H, W] format for VAE.
+
+    Args:
+        video: Video tensor [F, C, H, W] in range [0, 1]
+        max_frames: Maximum frames (must satisfy frames % 8 == 1)
+
+    Returns:
+        Video tensor [B, C, F, H, W] in range [-1, 1]
+    """
+    # Trim to valid frame count (k*8 + 1)
+    valid_frames = (video.shape[0] - 1) // 8 * 8 + 1
+    valid_frames = min(valid_frames, max_frames)
+    video = video[:valid_frames]
+
+    # Convert from [F, C, H, W] to [B, C, F, H, W]
+    video = rearrange(video, "f c h w -> 1 c f h w")
+
+    # Normalize from [0, 1] to [-1, 1] for VAE
+    video = video * 2.0 - 1.0
+
+    return video
 
 
 def parse_args():
@@ -114,6 +181,164 @@ def parse_args():
     return parser.parse_args()
 
 
+def stage1_encode_videos(
+    args,
+    pairs: list[dict],
+    ref_latents_dir: Path,
+    tgt_latents_dir: Path,
+    dtype: torch.dtype,
+) -> None:
+    """Stage 1: Encode all videos to latents using VAE encoder.
+
+    Loads only the VAE encoder (~5GB) to fit in limited VRAM.
+    """
+    logger.info("=" * 60)
+    logger.info("STAGE 1: Encoding videos to latents")
+    logger.info("=" * 60)
+
+    # Load VAE encoder
+    logger.info("Loading VAE encoder...")
+    vae_encoder = load_video_vae_encoder(args.model_path, dtype=dtype)
+    vae_encoder = vae_encoder.to(args.device)
+    vae_encoder.eval()
+
+    # Collect all unique videos to process
+    videos_to_process = []
+    for pair in pairs:
+        ref_name = Path(pair["reference"]).stem
+        tgt_name = Path(pair["target"]).stem
+        ref_output = ref_latents_dir / f"{ref_name}.safetensors"
+        tgt_output = tgt_latents_dir / f"{tgt_name}.safetensors"
+
+        if not ref_output.exists():
+            videos_to_process.append({
+                "video_path": args.input_dir / "videos" / pair["reference"],
+                "output_path": ref_output,
+                "name": ref_name,
+            })
+        if not tgt_output.exists():
+            videos_to_process.append({
+                "video_path": args.input_dir / "videos" / pair["target"],
+                "output_path": tgt_output,
+                "name": tgt_name,
+            })
+
+    # Remove duplicates (same reference used in multiple pairs)
+    seen = set()
+    unique_videos = []
+    for v in videos_to_process:
+        if v["name"] not in seen:
+            seen.add(v["name"])
+            unique_videos.append(v)
+
+    logger.info(f"Encoding {len(unique_videos)} unique videos to latents")
+
+    for video_info in tqdm(unique_videos, desc="Encoding videos"):
+        try:
+            frames, _ = read_video(
+                video_info["video_path"],
+                max_frames=args.max_frames,
+            )
+            frames = resize_video_for_vae(
+                frames,
+                target_width=args.target_width,
+                target_height=args.target_height,
+            )
+            frames = prepare_video_for_vae(frames, args.max_frames)
+            frames = frames.to(args.device, dtype=dtype)
+
+            with torch.inference_mode():
+                latent = vae_encoder(frames)
+
+            # Save latent
+            torch.save(
+                {
+                    "latents": latent.cpu(),
+                    "num_frames": torch.tensor([latent.shape[2]]),
+                    "height": torch.tensor([latent.shape[3]]),
+                    "width": torch.tensor([latent.shape[4]]),
+                },
+                video_info["output_path"],
+            )
+
+            # Clear CUDA cache after each video
+            del frames, latent
+            torch.cuda.empty_cache()
+
+        except Exception as e:
+            logger.error(f"Error encoding {video_info['name']}: {e}")
+            continue
+
+    # Unload VAE encoder
+    del vae_encoder
+    torch.cuda.empty_cache()
+    import gc
+    gc.collect()
+    logger.info("VAE encoder unloaded, VRAM freed")
+
+
+def stage2_compute_embeddings(
+    args,
+    pairs: list[dict],
+    conditions_dir: Path,
+    dtype: torch.dtype,
+) -> None:
+    """Stage 2: Compute text embeddings for all captions.
+
+    Loads only the text encoder (~27GB) after VAE is unloaded.
+    """
+    logger.info("=" * 60)
+    logger.info("STAGE 2: Computing text embeddings")
+    logger.info("=" * 60)
+
+    # Load text encoder
+    logger.info("Loading text encoder...")
+    text_encoder = load_text_encoder(
+        checkpoint_path=args.model_path,
+        gemma_model_path=args.text_encoder_path,
+        device=args.device,
+        dtype=dtype,
+    )
+    text_encoder.eval()
+
+    # Process each pair's caption
+    for pair in tqdm(pairs, desc="Computing embeddings"):
+        tgt_name = Path(pair["target"]).stem
+        cond_output = conditions_dir / f"{tgt_name}.safetensors"
+
+        if cond_output.exists():
+            continue
+
+        caption = pair.get("caption", "A video")
+
+        try:
+            with torch.inference_mode():
+                embeddings = text_encoder(caption)
+
+            # Save embeddings
+            torch.save(
+                {
+                    "video_prompt_embeds": embeddings.video_encoding.cpu(),
+                    "audio_prompt_embeds": embeddings.audio_encoding.cpu()
+                    if embeddings.audio_encoding is not None
+                    else None,
+                    "prompt_attention_mask": embeddings.attention_mask.cpu(),
+                },
+                cond_output,
+            )
+
+        except Exception as e:
+            logger.error(f"Error computing embeddings for {tgt_name}: {e}")
+            continue
+
+    # Unload text encoder
+    del text_encoder
+    torch.cuda.empty_cache()
+    import gc
+    gc.collect()
+    logger.info("Text encoder unloaded, VRAM freed")
+
+
 def main():
     args = parse_args()
 
@@ -155,111 +380,12 @@ def main():
 
     logger.info(f"Found {len(pairs)} video pairs to process")
 
-    # Load models
-    logger.info("Loading VAE encoder...")
-    vae_encoder = load_video_vae_encoder(args.model_path, dtype=dtype)
-    vae_encoder = vae_encoder.to(args.device)
-    vae_encoder.eval()
+    # STAGED PROCESSING to avoid OOM
+    # Stage 1: VAE encoding (~5GB VRAM for encoder + ~10GB for video tensors)
+    stage1_encode_videos(args, pairs, ref_latents_dir, tgt_latents_dir, dtype)
 
-    logger.info("Loading text encoder...")
-    text_encoder = load_text_encoder(args.text_encoder_path, dtype=dtype)
-    text_encoder = text_encoder.to(args.device)
-    text_encoder.eval()
-
-    # Process each pair
-    for pair in tqdm(pairs, desc="Processing video pairs"):
-        ref_video_path = args.input_dir / "videos" / pair["reference"]
-        tgt_video_path = args.input_dir / "videos" / pair["target"]
-        caption = pair.get("caption", "A video")
-
-        # Get base names for output files
-        ref_name = Path(pair["reference"]).stem
-        tgt_name = Path(pair["target"]).stem
-
-        # Check if already processed
-        ref_output = ref_latents_dir / f"{ref_name}.safetensors"
-        tgt_output = tgt_latents_dir / f"{tgt_name}.safetensors"
-        cond_output = conditions_dir / f"{tgt_name}.safetensors"
-
-        if ref_output.exists() and tgt_output.exists() and cond_output.exists():
-            logger.debug(f"Skipping {tgt_name}, already processed")
-            continue
-
-        try:
-            # Process reference video
-            if not ref_output.exists():
-                ref_frames = load_video_frames(
-                    ref_video_path,
-                    max_frames=args.max_frames,
-                )
-                ref_frames = resize_for_vae(
-                    ref_frames,
-                    target_width=args.target_width,
-                    target_height=args.target_height,
-                )
-                ref_frames = ref_frames.to(args.device, dtype=dtype)
-
-                with torch.inference_mode():
-                    ref_latent = vae_encoder.encode(ref_frames.unsqueeze(0))
-
-                # Save reference latent
-                torch.save(
-                    {
-                        "latents": ref_latent.cpu(),
-                        "num_frames": torch.tensor([ref_latent.shape[2]]),
-                        "height": torch.tensor([ref_latent.shape[3]]),
-                        "width": torch.tensor([ref_latent.shape[4]]),
-                    },
-                    ref_output,
-                )
-
-            # Process target video
-            if not tgt_output.exists():
-                tgt_frames = load_video_frames(
-                    tgt_video_path,
-                    max_frames=args.max_frames,
-                )
-                tgt_frames = resize_for_vae(
-                    tgt_frames,
-                    target_width=args.target_width,
-                    target_height=args.target_height,
-                )
-                tgt_frames = tgt_frames.to(args.device, dtype=dtype)
-
-                with torch.inference_mode():
-                    tgt_latent = vae_encoder.encode(tgt_frames.unsqueeze(0))
-
-                # Save target latent
-                torch.save(
-                    {
-                        "latents": tgt_latent.cpu(),
-                        "num_frames": torch.tensor([tgt_latent.shape[2]]),
-                        "height": torch.tensor([tgt_latent.shape[3]]),
-                        "width": torch.tensor([tgt_latent.shape[4]]),
-                    },
-                    tgt_output,
-                )
-
-            # Process caption
-            if not cond_output.exists():
-                with torch.inference_mode():
-                    embeddings = text_encoder.encode(caption)
-
-                # Save embeddings
-                torch.save(
-                    {
-                        "video_prompt_embeds": embeddings.video_encoding.cpu(),
-                        "audio_prompt_embeds": embeddings.audio_encoding.cpu()
-                        if embeddings.audio_encoding is not None
-                        else None,
-                        "prompt_attention_mask": embeddings.attention_mask.cpu(),
-                    },
-                    cond_output,
-                )
-
-        except Exception as e:
-            logger.error(f"Error processing pair {tgt_name}: {e}")
-            continue
+    # Stage 2: Text embedding (~27GB VRAM for Gemma)
+    stage2_compute_embeddings(args, pairs, conditions_dir, dtype)
 
     logger.info(f"Dataset preparation complete. Output saved to {args.output_dir}")
 

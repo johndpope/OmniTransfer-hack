@@ -146,6 +146,13 @@ class OptimizationConfig(ConfigBaseModel):
         description="Parameters for the scheduler",
     )
 
+    weight_decay: float = Field(
+        default=0.0,
+        description="Weight decay (L2 regularization) for AdamW optimizer. "
+        "Recommended 1e-4 to 1e-2 for small datasets to prevent overfitting.",
+        ge=0.0,
+    )
+
     enable_gradient_checkpointing: bool = Field(
         default=False,
         description="Enable gradient checkpointing to save memory at the cost of slower training",

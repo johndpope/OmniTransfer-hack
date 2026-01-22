@@ -1067,6 +1067,35 @@ class LtxvTrainer:
             with open(info_path, "w") as f:
                 f.write(f"Step: {step}\nSigma: {sigma:.4f}\n")
 
+            # Decode actual frames every step (move VAE to GPU temporarily)
+            if self._vae_decoder is not None:
+                try:
+                    # Move VAE to GPU, decode, move back
+                    self._vae_decoder = self._vae_decoder.to("cuda")
+
+                    ref_frame_lat = ref_lat[0:1, :, mid_f:mid_f+1, :, :]
+                    tgt_frame_lat = tgt_lat[0:1, :, mid_f:mid_f+1, :, :]
+
+                    with torch.inference_mode():
+                        ref_decoded = self._vae_decoder(ref_frame_lat)[0, :, 0].cpu()
+                        tgt_decoded = self._vae_decoder(tgt_frame_lat)[0, :, 0].cpu()
+
+                    # Move VAE back to CPU
+                    self._vae_decoder = self._vae_decoder.to("cpu")
+                    torch.cuda.empty_cache()
+
+                    # Normalize: VAE outputs [-1, 1] -> [0, 1]
+                    def norm_decoded(x):
+                        return ((x.float() + 1) / 2).clamp(0, 1)
+
+                    decoded_grid = torch.cat([norm_decoded(ref_decoded), norm_decoded(tgt_decoded)], dim=2)
+                    save_image(decoded_grid, Path(self._config.output_dir) / "debug_decoded.png")
+                except Exception as e:
+                    logger.debug(f"Decoded frame save failed: {e}")
+                    # Ensure VAE back on CPU even on error
+                    if hasattr(self, '_vae_decoder') and self._vae_decoder is not None:
+                        self._vae_decoder = self._vae_decoder.to("cpu")
+
         except Exception as e:
             # Silent fail - debug only
             logger.debug(f"Debug image save failed: {e}")

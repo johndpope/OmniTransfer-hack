@@ -9,6 +9,9 @@ authors = [
 requires-python = ">=3.10"
 dependencies = [
     "ltx-core",
+    # MetaQuery is optional - clone repo and add to PYTHONPATH if needed:
+    # git clone https://github.com/facebookresearch/metaquery.git
+    # export PYTHONPATH=$PYTHONPATH:/path/to/metaquery
     "accelerate>=1.2.1",
     "av>=14.2.1",
     "bitsandbytes >=0.45.2; sys_platform == 'linux'",

@@ -167,6 +167,31 @@ class OmniTransferConfig(TrainingStrategyConfigBase):
         "Quote: 'projected through a three-layer MLP connector' (Section 4.4)",
     )
 
+    # MetaQuery MLLM configuration (Facebook Research integration)
+    use_metaquery_mllm: bool = Field(
+        default=False,
+        description="Use Facebook's MetaQuery MLLM for semantic feature extraction. "
+        "If False, uses simple learnable TMA. Requires metaquery package.",
+    )
+
+    metaquery_model: str = Field(
+        default="llava-hf/llava-onevision-qwen2-7b-ov-hf",
+        description="HuggingFace model name for MetaQuery MLLM backbone. "
+        "Options: 'llava-hf/llava-onevision-qwen2-7b-ov-hf', 'Qwen/Qwen2.5-VL-7B-Instruct'",
+    )
+
+    metaquery_load_in_8bit: bool = Field(
+        default=True,
+        description="Load MetaQuery MLLM in 8-bit for memory efficiency. "
+        "Recommended for GPUs with <48GB VRAM.",
+    )
+
+    metaquery_freeze: bool = Field(
+        default=True,
+        description="Freeze MetaQuery MLLM backbone (inference-only). "
+        "Set False to fine-tune MLLM jointly (requires more VRAM).",
+    )
+
     # Loss weighting
     target_loss_weight: float = Field(
         default=1.0,

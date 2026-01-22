@@ -43,6 +43,11 @@ from ltx_trainer.omnitransfer.training_callback import (
     OmniTransferTrainingCallback,
     create_omnitransfer_callback,
 )
+from ltx_trainer.omnitransfer.metaquery_tma import (
+    MetaQueryTMA,
+    MetaQueryTMAConfig,
+    MetaQueryFeatureExtractor,
+)
 
 __all__ = [
     # Core components
@@ -67,4 +72,8 @@ __all__ = [
     # Training callback
     "OmniTransferTrainingCallback",
     "create_omnitransfer_callback",
+    # MetaQuery TMA (Facebook Research integration)
+    "MetaQueryTMA",
+    "MetaQueryTMAConfig",
+    "MetaQueryFeatureExtractor",
 ]

@@ -6,6 +6,10 @@ This package implements the Strategy Pattern to handle different training modes:
 Each strategy encapsulates the specific logic for preparing model inputs and computing loss.
 """
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 from ltx_trainer import logger
 from ltx_trainer.training_strategies.base_strategy import (
     DEFAULT_FPS,
@@ -16,10 +20,19 @@ from ltx_trainer.training_strategies.base_strategy import (
 )
 from ltx_trainer.training_strategies.text_to_video import TextToVideoConfig, TextToVideoStrategy
 from ltx_trainer.training_strategies.video_to_video import VideoToVideoConfig, VideoToVideoStrategy
-from ltx_trainer.omnitransfer.strategy import OmniTransferConfig, OmniTransferStrategy
 
-# Type alias for all strategy config types
-TrainingStrategyConfig = TextToVideoConfig | VideoToVideoConfig | OmniTransferConfig
+# Lazy import to avoid circular dependency with omnitransfer
+if TYPE_CHECKING:
+    from ltx_trainer.omnitransfer.strategy import OmniTransferConfig, OmniTransferStrategy
+
+    # Type alias for all strategy config types (only for type checking)
+    TrainingStrategyConfig = TextToVideoConfig | VideoToVideoConfig | OmniTransferConfig
+
+
+def _get_omnitransfer_types() -> tuple:
+    """Lazy import of OmniTransfer types to avoid circular imports."""
+    from ltx_trainer.omnitransfer.strategy import OmniTransferConfig, OmniTransferStrategy  # noqa: PLC0415
+    return OmniTransferConfig, OmniTransferStrategy
 
 __all__ = [
     "DEFAULT_FPS",
@@ -28,13 +41,12 @@ __all__ = [
     "TextToVideoConfig",
     "TextToVideoStrategy",
     "TrainingStrategy",
-    "TrainingStrategyConfig",
     "TrainingStrategyConfigBase",
     "VideoToVideoConfig",
     "VideoToVideoStrategy",
-    "OmniTransferConfig",
-    "OmniTransferStrategy",
     "get_training_strategy",
+    # OmniTransfer types: import from ltx_trainer.omnitransfer.strategy directly
+    # to avoid circular imports
 ]
 
 
@@ -48,6 +60,8 @@ def get_training_strategy(config: TrainingStrategyConfig) -> TrainingStrategy:
     Raises:
         ValueError: If strategy name is not supported
     """
+    # Lazy import OmniTransfer to avoid circular imports
+    OmniTransferConfig, OmniTransferStrategy = _get_omnitransfer_types()
 
     match config:
         case TextToVideoConfig():

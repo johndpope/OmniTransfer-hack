@@ -5,3 +5,4 @@ configs/*.yaml
 datasets
 outputs
 wandb
+training.log

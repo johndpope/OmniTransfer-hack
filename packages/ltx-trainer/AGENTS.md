@@ -430,6 +430,128 @@ training_strategy:
   video_log_interval: 2000
 ```
 
+## Memory-Efficient Workflows (RTX 5090 / 32GB VRAM)
+
+The RTX 5090 has 32GB VRAM which is tight for LTX-2 training. The key insight is that **models cannot be loaded simultaneously** - you must precompute data in stages.
+
+### VRAM Budget Breakdown
+
+| Component | VRAM Usage | Notes |
+|-----------|------------|-------|
+| Gemma Text Encoder | ~28GB | Cannot run alongside other models |
+| Video VAE Encoder | ~8GB | Used for latent encoding |
+| Video VAE Decoder | ~8GB | Used for visualization only |
+| LTX-2 Transformer (INT8) | ~12GB | Main training model |
+| LTX-2 Transformer (bf16) | ~20GB | Without quantization |
+| Training overhead | ~4-8GB | Gradients, optimizer states |
+
+### Required Precomputation Pipeline
+
+**CRITICAL: Never load text encoder and VAE simultaneously!**
+
+```bash
+# Step 1: Encode videos/images to latents (VAE only, ~8GB)
+python scripts/encode_website_demos.py \
+    --input-dir /path/to/raw_data \
+    --output-dir /path/to/processed \
+    --skip-text-encoding  # Don't load text encoder yet!
+
+# Step 2: Compute text embeddings SEPARATELY (Gemma only, ~28GB)
+python scripts/compute_text_embeddings.py \
+    --output-dir /path/to/processed \
+    --model-path /path/to/ltx-2.safetensors \
+    --text-encoder-path /path/to/gemma
+
+# Step 3: NOW train (transformer + pre-computed data)
+python scripts/train.py configs/your_config.yaml
+```
+
+### Dataset Directory Structure
+
+The trainer expects this structure with **precomputed** data:
+
+```
+/path/to/dataset/
+├── latents/                    # Video latents [C, F, H, W]
+│   ├── 0.pt                    # Sample naming must match across dirs
+│   ├── 1.pt
+│   └── ...
+├── conditions/                 # Text embeddings (PRECOMPUTED!)
+│   ├── 0.pt                    # {prompt_embeds: [1024, 3840], prompt_attention_mask: [1024]}
+│   ├── 1.pt
+│   └── ...
+├── reference_latents/          # Reference video/image latents
+│   ├── 0.pt
+│   └── ...
+├── target_image_latents/       # Optional: first frame latents for I2V
+│   └── ...
+└── metadata.json               # Optional: task types, captions
+```
+
+### Text Embedding Format
+
+Each `conditions/*.pt` file must contain:
+```python
+{
+    'prompt_embeds': torch.Tensor,        # Shape: [1024, 3840], dtype: bfloat16
+    'prompt_attention_mask': torch.Tensor, # Shape: [1024], dtype: int64
+}
+```
+
+### Memory-Safe Training Config (32GB)
+
+```yaml
+model:
+  training_mode: lora
+
+lora:
+  rank: 32  # Lower rank = less memory
+  alpha: 32
+
+optimization:
+  batch_size: 1
+  gradient_accumulation_steps: 8
+  enable_gradient_checkpointing: true  # CRITICAL for 32GB
+
+acceleration:
+  mixed_precision_mode: bf16
+  quantization: int8-quanto  # Quantize transformer to INT8
+  load_text_encoder_in_8bit: false  # Text encoder not loaded during training!
+```
+
+### Common OOM Scenarios and Fixes
+
+| Error | Cause | Fix |
+|-------|-------|-----|
+| OOM during text encoding | Gemma + VAE loaded together | Use `--skip-text-encoding`, run separately |
+| OOM during training | Batch too large | Reduce `batch_size`, increase `gradient_accumulation_steps` |
+| OOM during validation | VAE decoder loaded | Set `validation.interval: null` or increase interval |
+| OOM with video logging | Decoding full videos | Reduce `num_frames_to_visualize` |
+
+### Movie Weaver Multi-Concept Training
+
+Movie Weaver (CVPR 2025) uses multiple reference images per sample with concept embeddings:
+
+```
+/media/2TB/movie_weaver_training/
+├── latents/                    # Ground truth videos
+├── conditions/                 # Text embeddings with [R1], [R2] anchors
+├── reference_latents_R1/       # Face references
+├── reference_latents_R2/       # Body references
+├── reference_latents_R3/       # Third concept (pet, etc.)
+├── reference_latents_R4/       # Fourth concept
+├── multi_concept_refs/         # Combined refs with concept_assignments
+└── manifest.json               # Sample metadata with concept mappings
+```
+
+Concept assignments example:
+```python
+{
+    "refs": {"R1": "man face", "R2": "man body", "R3": "woman face", "R4": "woman body"},
+    "concept_assignments": [0, 0, 1, 1],  # R1,R2=Person0, R3,R4=Person1
+}
+```
+
 ## Key Constraints
 
 ### LTX-2 Frame Requirements

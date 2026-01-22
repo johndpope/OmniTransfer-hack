@@ -2,7 +2,7 @@ import os
 import time
 import warnings
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 import torch
 import wandb
@@ -1018,7 +1018,7 @@ class LtxvTrainer:
     ) -> None:
         """Save a debug reconstruction image (overwrites each step).
 
-        Creates a simple grid: [ref_frame | target_frame | pred_frame]
+        Creates a simple grid showing latent channels as grayscale.
         Saves to outputs/debug_recon.png
         """
         try:
@@ -1032,54 +1032,40 @@ class LtxvTrainer:
             tgt_lat = model_inputs.tgt_latent_raw
             sigmas = model_inputs.sigmas  # [B] or [B, 1, ...]
 
-            # Compute predicted clean: x0 = (noisy - sigma * v) / (1 - sigma)
-            # Use first sigma value
+            # Get sigma value
             if sigmas.dim() > 1:
-                sigma = sigmas.flatten()[0]
+                sigma = sigmas.flatten()[0].item()
             else:
-                sigma = sigmas[0]
+                sigma = sigmas[0].item()
 
-            noisy = model_inputs.video.latent  # patchified [B, S, D]
-            # Unpatchify prediction - rough approximation using target shape
             b, c, f, h, w = tgt_lat.shape
-            # video_pred is [B, S, D] - reshape to [B, C, F, H, W]
-            pred_clean = video_pred[0]  # [S, D]
-            s, d = pred_clean.shape
-            # d should be c * patch_h * patch_w = 128 * 1 * 1 for video
-            # Just take first channel slice for visualization
-            pred_vis = pred_clean[:, :c].reshape(-1, c).mean(dim=0)  # rough avg
 
-            # Decode a single frame from each using VAE
-            with torch.inference_mode():
-                # Take middle frame from each latent
-                mid_f = f // 2
-                ref_frame_lat = ref_lat[0:1, :, mid_f:mid_f+1, :, :]  # [1, C, 1, H, W]
-                tgt_frame_lat = tgt_lat[0:1, :, mid_f:mid_f+1, :, :]
+            # Take middle frame, first 3 channels as pseudo-RGB
+            mid_f = f // 2
+            ref_vis = ref_lat[0, :3, mid_f, :, :].cpu().float()  # [3, H, W]
+            tgt_vis = tgt_lat[0, :3, mid_f, :, :].cpu().float()
 
-                # Decode ref and target
-                ref_decoded = self._vae_decoder(ref_frame_lat)[0, :, 0]  # [3, H, W]
-                tgt_decoded = self._vae_decoder(tgt_frame_lat)[0, :, 0]
+            # Normalize to [0, 1]
+            def norm(x):
+                x = x - x.min()
+                x = x / (x.max() + 1e-8)
+                return x.clamp(0, 1)
 
-                # For prediction, we need to unpatchify properly
-                # This is a simplified version - just show target with noise level indicator
-                # Actual prediction would require proper unpatchification
-                noise_level = sigma.item()
+            ref_norm = norm(ref_vis)
+            tgt_norm = norm(tgt_vis)
 
-                # Create simple comparison: ref | target | noisy_target
-                noisy_tgt = tgt_decoded + noise_level * torch.randn_like(tgt_decoded) * 0.5
+            # Create grid: ref | target with sigma annotation
+            grid = torch.cat([ref_norm, tgt_norm], dim=2)  # [3, H, W*2]
 
-                # Normalize to [0, 1]
-                def norm(x):
-                    x = x.float()
-                    x = (x - x.min()) / (x.max() - x.min() + 1e-8)
-                    return x.clamp(0, 1)
+            # Save with step info in filename
+            out_path = Path(self._config.output_dir) / "debug_recon.png"
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            save_image(grid, out_path)
 
-                grid = torch.cat([norm(ref_decoded), norm(tgt_decoded), norm(noisy_tgt)], dim=2)  # [3, H, W*3]
-
-                # Save
-                out_path = Path(self._config.output_dir) / "debug_recon.png"
-                out_path.parent.mkdir(parents=True, exist_ok=True)
-                save_image(grid, out_path)
+            # Also save a text file with current step/sigma
+            info_path = Path(self._config.output_dir) / "debug_info.txt"
+            with open(info_path, "w") as f:
+                f.write(f"Step: {step}\nSigma: {sigma:.4f}\n")
 
         except Exception as e:
             # Silent fail - debug only

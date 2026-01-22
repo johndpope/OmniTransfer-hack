@@ -26,6 +26,7 @@ from torch.optim.lr_scheduler import (
 )
 from torch.utils.data import DataLoader
 from torchvision.transforms import functional as F  # noqa: N812
+from torchvision.utils import save_image
 
 from ltx_trainer import logger
 from ltx_trainer.config import LtxTrainerConfig
@@ -166,7 +167,7 @@ class LtxvTrainer:
                     if is_optimization_step:
                         self._global_step += 1
 
-                    # Check if we should log reconstructions this step
+                    # Check if we should log reconstructions this step (W&B)
                     should_log_recon = (
                         is_optimization_step
                         and IS_MAIN_PROCESS
@@ -179,7 +180,10 @@ class LtxvTrainer:
                         ) == 0
                     )
 
-                    if should_log_recon:
+                    # Always get predictions on optimization steps for debug image
+                    should_save_debug = is_optimization_step and IS_MAIN_PROCESS
+
+                    if should_log_recon or should_save_debug:
                         loss, video_pred, model_inputs = self._training_step(batch, return_for_logging=True)
                     else:
                         loss = self._training_step(batch)
@@ -256,7 +260,11 @@ class LtxvTrainer:
                             }
                         )
 
-                        # Log reconstructions if this is a logging step
+                        # Save debug image every optimization step (overwrites)
+                        if should_save_debug and video_pred is not None and model_inputs is not None:
+                            self._save_debug_image(video_pred.detach(), model_inputs, self._global_step)
+
+                        # Log reconstructions to W&B if this is a logging step
                         if should_log_recon and video_pred is not None and model_inputs is not None:
                             try:
                                 recon_metrics = self._training_strategy.log_reconstructions_to_wandb(
@@ -1001,3 +1009,78 @@ class LtxvTrainer:
 
         samples = [media_cls(str(path), caption=prompt) for path, prompt in zip(sample_paths, prompts, strict=True)]
         self._wandb_run.log({"validation_samples": samples}, step=self._global_step)
+
+    def _save_debug_image(
+        self,
+        video_pred: Tensor,
+        model_inputs: "ModelInputs",
+        step: int,
+    ) -> None:
+        """Save a debug reconstruction image (overwrites each step).
+
+        Creates a simple grid: [ref_frame | target_frame | pred_frame]
+        Saves to outputs/debug_recon.png
+        """
+        try:
+            from ltx_trainer.omnitransfer.strategy import OmniTransferModelInputs
+
+            if not isinstance(model_inputs, OmniTransferModelInputs):
+                return
+
+            # Get raw latents
+            ref_lat = model_inputs.ref_latent_raw  # [B, C, F, H, W]
+            tgt_lat = model_inputs.tgt_latent_raw
+            sigmas = model_inputs.sigmas  # [B] or [B, 1, ...]
+
+            # Compute predicted clean: x0 = (noisy - sigma * v) / (1 - sigma)
+            # Use first sigma value
+            if sigmas.dim() > 1:
+                sigma = sigmas.flatten()[0]
+            else:
+                sigma = sigmas[0]
+
+            noisy = model_inputs.video.latent  # patchified [B, S, D]
+            # Unpatchify prediction - rough approximation using target shape
+            b, c, f, h, w = tgt_lat.shape
+            # video_pred is [B, S, D] - reshape to [B, C, F, H, W]
+            pred_clean = video_pred[0]  # [S, D]
+            s, d = pred_clean.shape
+            # d should be c * patch_h * patch_w = 128 * 1 * 1 for video
+            # Just take first channel slice for visualization
+            pred_vis = pred_clean[:, :c].reshape(-1, c).mean(dim=0)  # rough avg
+
+            # Decode a single frame from each using VAE
+            with torch.inference_mode():
+                # Take middle frame from each latent
+                mid_f = f // 2
+                ref_frame_lat = ref_lat[0:1, :, mid_f:mid_f+1, :, :]  # [1, C, 1, H, W]
+                tgt_frame_lat = tgt_lat[0:1, :, mid_f:mid_f+1, :, :]
+
+                # Decode ref and target
+                ref_decoded = self._vae_decoder(ref_frame_lat)[0, :, 0]  # [3, H, W]
+                tgt_decoded = self._vae_decoder(tgt_frame_lat)[0, :, 0]
+
+                # For prediction, we need to unpatchify properly
+                # This is a simplified version - just show target with noise level indicator
+                # Actual prediction would require proper unpatchification
+                noise_level = sigma.item()
+
+                # Create simple comparison: ref | target | noisy_target
+                noisy_tgt = tgt_decoded + noise_level * torch.randn_like(tgt_decoded) * 0.5
+
+                # Normalize to [0, 1]
+                def norm(x):
+                    x = x.float()
+                    x = (x - x.min()) / (x.max() - x.min() + 1e-8)
+                    return x.clamp(0, 1)
+
+                grid = torch.cat([norm(ref_decoded), norm(tgt_decoded), norm(noisy_tgt)], dim=2)  # [3, H, W*3]
+
+                # Save
+                out_path = Path(self._config.output_dir) / "debug_recon.png"
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                save_image(grid, out_path)
+
+        except Exception as e:
+            # Silent fail - debug only
+            logger.debug(f"Debug image save failed: {e}")

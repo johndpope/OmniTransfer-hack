@@ -1,0 +1,63 @@
+# =============================================================================
+# Google Vertex AI Job Configuration for OmniTransfer Training
+# =============================================================================
+# Submit with: ./push-job.sh
+# Monitor at: https://console.cloud.google.com/vertex-ai/training/custom-jobs
+# =============================================================================
+
+workerPoolSpecs:
+  machineSpec:
+    # A100 80GB - Optimal for OmniTransfer training
+    machineType: a2-highgpu-1g
+    acceleratorType: NVIDIA_TESLA_A100
+    acceleratorCount: 1
+
+    # Alternative: H100 80GB (faster, more expensive)
+    # machineType: a3-highgpu-1g
+    # acceleratorType: NVIDIA_H100_80GB
+    # acceleratorCount: 1
+
+    # Budget option: A100 40GB (may need smaller batch)
+    # machineType: a2-highgpu-1g
+    # acceleratorType: NVIDIA_TESLA_A100
+    # acceleratorCount: 1
+
+  replicaCount: 1
+
+  containerSpec:
+    # Use our custom training image (built with build.sh)
+    imageUri: 'gcr.io/${GCP_PROJECT}/omnitransfer-train:latest'
+
+    # Environment variables for training
+    env:
+      - name: GCS_BUCKET
+        value: '${GCS_BUCKET}'
+      - name: GCS_DATA_PREFIX
+        value: 'omnitransfer/processed'
+      - name: GCS_CHECKPOINT_PREFIX
+        value: 'omnitransfer/checkpoints'
+      - name: WANDB_API_KEY
+        value: '${WANDB_API_KEY}'
+      - name: WANDB_PROJECT
+        value: 'omnitransfer-vertex'
+      - name: TRAINING_STEPS
+        value: '10000'
+      - name: HF_TOKEN
+        value: '${HF_TOKEN}'
+
+    # Training command
+    command:
+      - /bin/bash
+      - -c
+      - |
+        cd /workspace/ltx2-omnitransfer/packages/ltx-trainer && \
+        python scripts/train.py configs/ltx2_omnitransfer_unified_5task_cloud.yaml
+
+# Enable web access for debugging (optional)
+enableWebAccess: true
+
+# Scheduling options
+scheduling:
+  # Use spot/preemptible for cost savings (training should checkpoint frequently)
+  # restartJobOnWorkerRestart: true
+  timeout: 86400s  # 24 hours max

@@ -1,0 +1,53 @@
+# =============================================================================
+# Vast.ai OmniTransfer Training Configuration
+# =============================================================================
+# Copy to terraform.tfvars and fill in your values
+# terraform.tfvars is git-ignored for security
+# =============================================================================
+
+# Required: Vast.ai API key
+# Get from: https://cloud.vast.ai/cli/
+vast_api_key = "your-vast-api-key-here"
+
+# Required: AWS credentials for S3 (training data + checkpoints)
+aws_access_key_id     = "AKIA..."
+aws_secret_access_key = "your-secret-key"
+s3_bucket            = "omnitransfer-training"
+s3_region            = "us-east-1"
+
+# Optional: HuggingFace token (for private models)
+hf_token = ""
+
+# Optional: Weights & Biases for experiment tracking
+wandb_api_key = ""
+wandb_project = "omnitransfer-unified"
+
+# GPU configuration
+# A100 80GB recommended for LTX-2 19B training
+preferred_gpu      = "A100"
+num_gpus          = 1
+gpu_query         = "gpu_ram>=80 num_gpus>=1 inet_down>=200 disk_space>=200 reliability>=0.95 rentable=true"
+
+# Instance configuration
+interruptible      = false   # false = on-demand (stable), true = spot (cheaper)
+disk_gb           = 200      # Need space for model (~40GB) + data + checkpoints
+max_price_per_hour = 2.50
+
+# Training configuration
+training_config    = "ltx2_omnitransfer_unified_5task.yaml"
+training_steps     = 10000
+checkpoint_interval = 500
+max_runtime_hours  = 24      # Auto-shutdown after X hours (0 to disable)
+
+# S3 data paths
+s3_data_prefix = "processed/omnitransfer_unified_5task"
+
+# GitHub repo
+github_repo   = "johndpope/ltx2-omnitransfer"
+github_branch = "main"
+
+# Instance label
+instance_label = "omnitransfer-training"
+
+# Docker image - NGC PyTorch with flash-attn pre-installed
+image = "nvcr.io/nvidia/pytorch:24.01-py3"

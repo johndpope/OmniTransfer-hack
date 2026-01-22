@@ -1,0 +1,11 @@
+# Environment files with secrets
+.env
+
+# Terraform state (if using terraform wrapper)
+*.tfstate
+*.tfstate.*
+.terraform/
+
+# Temporary files
+*.tmp
+*.log

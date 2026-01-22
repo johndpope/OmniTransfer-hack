@@ -1,0 +1,19 @@
+# Credentials - NEVER commit these!
+.env
+terraform.tfvars
+*.credentials
+
+# Terraform state
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+
+# Instance tracking
+.instance_id
+
+# Logs
+*.log
+
+# AWS config
+.aws/

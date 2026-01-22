@@ -65,7 +65,7 @@ vastai ssh-url <instance_id>
 ssh -p <port> root@<host>
 
 # Start training
-cd /workspace/ltx2-omnitransfer
+cd /workspace/OmniTransfer-hack
 bash tools/vast-cloud-training/scripts/train_omnitransfer.sh
 ```
 

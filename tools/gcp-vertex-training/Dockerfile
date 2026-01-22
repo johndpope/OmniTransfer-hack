@@ -32,10 +32,10 @@ RUN pip install uv
 
 # Clone repository
 WORKDIR ${WORKSPACE}
-RUN git clone https://github.com/johndpope/ltx2-omnitransfer.git
+RUN git clone https://github.com/johndpope/OmniTransfer-hack.git
 
 # Install Python dependencies
-WORKDIR ${WORKSPACE}/ltx2-omnitransfer
+WORKDIR ${WORKSPACE}/OmniTransfer-hack
 RUN uv sync
 
 # Install additional training dependencies
@@ -49,7 +49,7 @@ COPY start.sh /start.sh
 RUN chmod +x /start.sh
 
 # Set working directory
-WORKDIR ${WORKSPACE}/ltx2-omnitransfer/packages/ltx-trainer
+WORKDIR ${WORKSPACE}/OmniTransfer-hack/packages/ltx-trainer
 
 # Default command
 ENTRYPOINT ["/start.sh"]

@@ -22,7 +22,7 @@ MAX_RUNTIME_HOURS=${MAX_RUNTIME_HOURS:-24}
 CHECKPOINT_INTERVAL=${CHECKPOINT_INTERVAL:-500}
 
 WORKSPACE="/workspace"
-REPO_PATH="$WORKSPACE/ltx2-omnitransfer"
+REPO_PATH="$WORKSPACE/OmniTransfer-hack"
 TRAINER_PATH="$REPO_PATH/packages/ltx-trainer"
 DATA_DIR="/data/omnitransfer_training"
 MODEL_DIR="/data/models"

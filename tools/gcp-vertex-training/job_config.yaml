@@ -50,7 +50,7 @@ workerPoolSpecs:
       - /bin/bash
       - -c
       - |
-        cd /workspace/ltx2-omnitransfer/packages/ltx-trainer && \
+        cd /workspace/OmniTransfer-hack/packages/ltx-trainer && \
         python scripts/train.py configs/ltx2_omnitransfer_unified_5task_cloud.yaml
 
 # Enable web access for debugging (optional)

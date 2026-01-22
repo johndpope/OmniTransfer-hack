@@ -146,7 +146,7 @@ variable "s3_data_prefix" {
 variable "github_repo" {
   description = "GitHub repo to clone"
   type        = string
-  default     = "johndpope/ltx2-omnitransfer"
+  default     = "johndpope/OmniTransfer-hack"
 }
 
 variable "github_branch" {
@@ -231,7 +231,7 @@ resource "null_resource" "vast_ai_instance" {
       fi
 
       # Onstart command - NGC image has flash-attn pre-installed
-      ONSTART_CMD="bash -c 'apt-get update && apt-get install -y git git-lfs awscli tmux htop && pip install uv wandb && git clone https://github.com/${var.github_repo}.git /workspace/ltx2-omnitransfer && cd /workspace/ltx2-omnitransfer && git checkout ${var.github_branch} && uv sync && python -c \"from flash_attn import flash_attn_func; print(flash_attn OK)\" && echo \"Setup complete - ready for training!\"'"
+      ONSTART_CMD="bash -c 'apt-get update && apt-get install -y git git-lfs awscli tmux htop && pip install uv wandb && git clone https://github.com/${var.github_repo}.git /workspace/OmniTransfer-hack && cd /workspace/OmniTransfer-hack && git checkout ${var.github_branch} && uv sync && python -c \"from flash_attn import flash_attn_func; print(flash_attn OK)\" && echo \"Setup complete - ready for training!\"'"
 
       RESULT=$(vastai create instance $OFFER_ID \
         --image "${var.image}" \
@@ -264,7 +264,7 @@ resource "null_resource" "vast_ai_instance" {
       echo ""
       echo "=== Next Steps ==="
       echo "1. SSH into instance: vastai ssh-url <instance_id>"
-      echo "2. Run training: bash /workspace/ltx2-omnitransfer/tools/vast-cloud-training/scripts/train_omnitransfer.sh"
+      echo "2. Run training: bash /workspace/OmniTransfer-hack/tools/vast-cloud-training/scripts/train_omnitransfer.sh"
     EOT
 
     environment = {
@@ -301,7 +301,7 @@ output "usage_info" {
     SSH connection: vastai ssh-url <instance_id>
 
     On the instance, run:
-      cd /workspace/ltx2-omnitransfer
+      cd /workspace/OmniTransfer-hack
       bash tools/vast-cloud-training/scripts/train_omnitransfer.sh
 
     Training checkpoints uploaded to: s3://${var.s3_bucket}/checkpoints/

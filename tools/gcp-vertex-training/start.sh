@@ -18,7 +18,7 @@ GCS_CHECKPOINT_PREFIX="${GCS_CHECKPOINT_PREFIX:-omnitransfer/checkpoints}"
 TRAINING_STEPS="${TRAINING_STEPS:-10000}"
 CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-500}"
 
-WORKSPACE="/workspace/ltx2-omnitransfer"
+WORKSPACE="/workspace/OmniTransfer-hack"
 TRAINER_PATH="$WORKSPACE/packages/ltx-trainer"
 DATA_DIR="/data/omnitransfer_training"
 MODEL_DIR="/data/models"

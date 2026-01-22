@@ -77,6 +77,74 @@ optimization objectives."
 
 ---
 
+## Core Classes
+
+### Strategy & Configuration
+
+| Class | File | Description |
+|-------|------|-------------|
+| [`OmniTransferStrategy`](packages/ltx-trainer/src/ltx_trainer/omnitransfer/strategy.py#L585) | strategy.py | Main training strategy orchestrating all components |
+| [`OmniTransferConfig`](packages/ltx-trainer/src/ltx_trainer/omnitransfer/strategy.py#L146) | strategy.py | Pydantic configuration for all training options |
+| [`OmniTransferModelInputs`](packages/ltx-trainer/src/ltx_trainer/omnitransfer/strategy.py#L552) | strategy.py | Dataclass for model inputs with metadata |
+| [`OmniTransferStage`](packages/ltx-trainer/src/ltx_trainer/omnitransfer/strategy.py#L96) | strategy.py | Enum for training stages (IN_CONTEXT, CONNECTOR, JOINT) |
+
+### Core Components (Paper Section 4)
+
+| Class | File | Description |
+|-------|------|-------------|
+| [`TaskAwarePositionalBias`](packages/ltx-trainer/src/ltx_trainer/omnitransfer/components.py#L115) | components.py | **TPB** - RoPE offsets for ref/target separation |
+| [`ReferenceDecoupledCausalLearning`](packages/ltx-trainer/src/ltx_trainer/omnitransfer/components.py#L522) | components.py | **RCL** - Separate attention branches |
+| [`TaskAdaptiveMultimodalAlignment`](packages/ltx-trainer/src/ltx_trainer/omnitransfer/components.py#L740) | components.py | **TMA** - MLLM semantic guidance |
+| [`MetaQueryBank`](packages/ltx-trainer/src/ltx_trainer/omnitransfer/components.py#L679) | components.py | Learnable query tokens for TMA |
+| [`OmniTransferTask`](packages/ltx-trainer/src/ltx_trainer/omnitransfer/components.py#L27) | components.py | Enum for task types (MOTION, STYLE, ID, etc.) |
+
+### Latent Construction
+
+| Class | File | Description |
+|-------|------|-------------|
+| [`ReferenceLatentConstructor`](packages/ltx-trainer/src/ltx_trainer/omnitransfer/latent_constructor.py#L58) | latent_constructor.py | Constructs ref+target latent pairs |
+| [`ConstructedLatents`](packages/ltx-trainer/src/ltx_trainer/omnitransfer/latent_constructor.py#L24) | latent_constructor.py | Dataclass holding constructed latents |
+
+### MLLM Integration (Optional)
+
+| Class | File | Description |
+|-------|------|-------------|
+| [`MetaQueryTMA`](packages/ltx-trainer/src/ltx_trainer/omnitransfer/metaquery_tma.py#L269) | metaquery_tma.py | MetaQuery MLLM integration |
+| [`QwenVLTMAIntegration`](packages/ltx-trainer/src/ltx_trainer/omnitransfer/qwen_vl_integration.py#L370) | qwen_vl_integration.py | Qwen2.5-VL integration for TMA |
+| [`QwenVLFeatureExtractor`](packages/ltx-trainer/src/ltx_trainer/omnitransfer/qwen_vl_integration.py#L122) | qwen_vl_integration.py | Extract features from Qwen-VL |
+
+### Multi-Concept (Movie Weaver)
+
+| Class | File | Description |
+|-------|------|-------------|
+| [`ConceptEmbedding`](packages/ltx-trainer/src/ltx_trainer/omnitransfer/components.py#L335) | components.py | Dynamic Identity Anchoring embeddings |
+| [`ConceptEmbeddingConfig`](packages/ltx-trainer/src/ltx_trainer/omnitransfer/components.py#L317) | components.py | Config for concept embeddings |
+
+### Visualization & Callbacks
+
+| Class | File | Description |
+|-------|------|-------------|
+| [`OmniTransferVisualizer`](packages/ltx-trainer/src/ltx_trainer/omnitransfer/visualization.py#L97) | visualization.py | Create reconstruction grids |
+| [`OmniTransferWandBCallback`](packages/ltx-trainer/src/ltx_trainer/omnitransfer/visualization.py#L486) | visualization.py | W&B logging integration |
+| [`OmniTransferTrainingCallback`](packages/ltx-trainer/src/ltx_trainer/omnitransfer/training_callback.py#L46) | training_callback.py | Training loop hooks |
+| [`ReconstructionSample`](packages/ltx-trainer/src/ltx_trainer/omnitransfer/visualization.py#L37) | visualization.py | Dataclass for viz samples |
+
+### Module Structure
+
+```
+packages/ltx-trainer/src/ltx_trainer/omnitransfer/
+├── __init__.py              # Module exports
+├── components.py            # TPB, RCL, TMA, ConceptEmbedding
+├── strategy.py              # OmniTransferStrategy, Config
+├── latent_constructor.py    # Reference latent construction
+├── visualization.py         # W&B visualization
+├── training_callback.py     # Training hooks
+├── metaquery_tma.py         # MetaQuery MLLM integration
+└── qwen_vl_integration.py   # Qwen-VL integration
+```
+
+---
+
 ## Loss Functions
 
 The implementation includes multiple loss components based on Grok recommendations for faster convergence:

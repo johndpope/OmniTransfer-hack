@@ -423,9 +423,26 @@ Never load text encoder and VAE simultaneously on 32GB GPUs. Use the staged pipe
 
 ---
 
+## Support This Project
+
+Training video models requires significant GPU compute. If you find this work useful, please consider donating [Vast.ai](https://vast.ai) credits to help continue development.
+
+**Send Vast.ai credits to:** `jp@bellgeorge.com`
+
+| Tier | Suggested Amount | What It Helps With |
+|------|------------------|-------------------|
+| **Buy Me a Coffee** | $5-10 | Quick experiments, bug fixes |
+| **Mates Rates** | $25-50 | A few hours of A100 training |
+| **Supporter** | $100-250 | Full training run (10k steps) |
+| **Enterprise** | $500+ | Multi-stage training, new features |
+
+Every contribution helps push this research forward. Thank you!
+
+---
+
 ## See Also
 
-- [ltx2.md](ltx2.md) - Original LTX-2 trainer documentation
+- [packages/ltx-trainer/ltx-2.md](packages/ltx-trainer/ltx-2.md) - Original LTX-2 trainer documentation
 - [docs/training-modes.md](docs/training-modes.md) - All training modes
 - [docs/configuration-reference.md](docs/configuration-reference.md) - Full config options
 - [CLAUDE.md](CLAUDE.md) - AI assistant guidelines

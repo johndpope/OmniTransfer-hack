@@ -71,6 +71,24 @@ except ImportError:
     INSIGHTFACE_AVAILABLE = False
     FaceAnalysis = None
 
+# Optional CLIP for semantic identity loss (Grok recommendation)
+try:
+    import open_clip
+    CLIP_AVAILABLE = True
+except ImportError:
+    CLIP_AVAILABLE = False
+    open_clip = None
+
+# Optional torchvision for VGG style features (Grok recommendation)
+try:
+    from torchvision import models as tv_models
+    from torchvision import transforms as tv_transforms
+    VGG_AVAILABLE = True
+except ImportError:
+    VGG_AVAILABLE = False
+    tv_models = None
+    tv_transforms = None
+
 
 class OmniTransferStage(Enum):
     """Training stages for OmniTransfer.
@@ -160,6 +178,21 @@ class OmniTransferConfig(TrainingStrategyConfigBase):
     reference_latents_dir: str = Field(
         default="reference_latents",
         description="Directory name for reference video latents",
+    )
+
+    # I2V (Image-to-Video) mode - for pose-free animation
+    i2v_mode: bool = Field(
+        default=False,
+        description="Enable I2V mode for pose-free animation. When True, uses first_frame_latents "
+        "as the static image to animate, and reference_latents as the motion source. "
+        "Per OmniTransfer website: 'Driven static images by directly injecting fluid, "
+        "complex motion from unseen sources without explicit pose extraction.'",
+    )
+
+    first_frame_latents_dir: str = Field(
+        default="first_frame_latents",
+        description="Directory name for first-frame latents (I2V mode). Contains single-frame "
+        "latents [128, 1, H, W] representing the static image to animate.",
     )
 
     # TPB configuration
@@ -261,6 +294,55 @@ class OmniTransferConfig(TrainingStrategyConfigBase):
         "prediction and reference. Recommended 0.1-1.0 for style transfer tasks. "
         "This is CRITICAL for style transfer - without it, the model ignores the reference.",
         ge=0.0,
+    )
+
+    # Grok-recommended: Use decoded pixels for perceptual losses
+    # LPIPS and style loss work MUCH better on decoded RGB pixels than raw latents
+    use_decoded_pixels_for_lpips: bool = Field(
+        default=True,
+        description="[GROK RECOMMENDED] Decode latents to RGB pixels before computing LPIPS. "
+        "VGG (used by LPIPS) expects image pixels, not latent space vectors. "
+        "Set False only if VAE decoder is not available or for speed testing.",
+    )
+
+    use_decoded_pixels_for_style: bool = Field(
+        default=True,
+        description="[GROK RECOMMENDED] Decode latents to RGB pixels before computing style loss. "
+        "Gram matrices work better on decoded pixels where styles are not entangled with content. "
+        "Set False for faster but lower quality style matching.",
+    )
+
+    use_vgg_style_features: bool = Field(
+        default=True,
+        description="[GROK RECOMMENDED] Use VGG features (conv layers) for style loss instead of raw pixels. "
+        "Multi-layer Gram matrices capture richer style information (textures, colors, patterns). "
+        "Requires torchvision.",
+    )
+
+    vgg_style_layers: list[str] = Field(
+        default=["relu1_2", "relu2_2", "relu3_3", "relu4_3"],
+        description="VGG layers to extract features from for style loss. "
+        "Earlier layers capture low-level textures, later layers capture higher-level patterns.",
+    )
+
+    # Grok-recommended: Use CLIP/SigLIP for identity loss
+    use_clip_identity: bool = Field(
+        default=False,
+        description="[GROK RECOMMENDED] Use CLIP/SigLIP for identity loss instead of mean pooling. "
+        "Provides robust semantic features for identity preservation. Requires open_clip package.",
+    )
+
+    clip_model_name: str = Field(
+        default="ViT-SO400M-14-SigLIP-384",
+        description="Vision encoder model. For Qwen2.5/Qwen3-VL compatibility, use SigLIP models: "
+        "'ViT-SO400M-14-SigLIP-384' (recommended), 'ViT-SO400M-14-SigLIP', 'ViT-SO400M-14-SigLIP2'. "
+        "For standard CLIP: 'ViT-B-32', 'ViT-L-14', 'ViT-H-14', 'ViT-bigG-14'.",
+    )
+
+    clip_pretrained: str = Field(
+        default="webli",
+        description="Pretrained weights. For SigLIP: 'webli'. For CLIP: 'openai', 'laion2b_s34b_b79k'. "
+        "For ViT-bigG-14 (matches original Qwen-VL): 'laion2b_s39b_b160k'.",
     )
 
     # W&B Visualization configuration
@@ -428,22 +510,265 @@ class OmniTransferStrategy(TrainingStrategy):
         else:
             self._tpb = None
 
+        # Log I2V mode if enabled
+        i2v_status = "I2V=True (pose-free animation)" if config.i2v_mode else "I2V=False"
         logger.info(
             f"Initialized OmniTransfer strategy: task={config.task_type}, "
-            f"TPB={config.enable_tpb}, RCL={config.enable_rcl}, TMA={config.enable_tma}"
+            f"TPB={config.enable_tpb}, RCL={config.enable_rcl}, TMA={config.enable_tma}, {i2v_status}"
         )
+
+        # VAE decoder for Grok-recommended pixel-space losses
+        self._vae_decoder = None
+
+        # VGG feature extractor for style loss (Grok recommended)
+        self._vgg_features = None
+        self._vgg_layers = None
+
+        # CLIP model for identity loss (Grok recommended)
+        self._clip_model = None
+        self._clip_preprocess = None
+
+    def set_vae_decoder(self, vae_decoder) -> None:
+        """Set VAE decoder for pixel-space loss computation.
+
+        [GROK RECOMMENDED] LPIPS and style loss should operate on decoded pixels,
+        not raw latents. VGG (used in LPIPS) and Gram matrices work much better
+        on RGB images where style/content are properly separated.
+
+        Args:
+            vae_decoder: LTX-2 video VAE decoder module
+        """
+        self._vae_decoder = vae_decoder
+        logger.info("VAE decoder set for pixel-space loss computation (Grok recommended)")
+
+    def _decode_latents_to_pixels(
+        self,
+        latents: Tensor,
+        sample_frames: int = 4,
+    ) -> Tensor | None:
+        """Decode latents to RGB pixels for perceptual loss computation.
+
+        [GROK RECOMMENDED] LPIPS expects RGB images in [-1, 1], not latent vectors.
+        VGG features are meaningless on latents - they need proper image pixels.
+
+        Args:
+            latents: Video latents [B, C, F, H, W]
+            sample_frames: Number of frames to decode (for efficiency)
+
+        Returns:
+            Decoded RGB frames [B*sample_frames, 3, H, W] in [-1, 1] or None if decoder unavailable
+        """
+        if self._vae_decoder is None:
+            if self.config.use_decoded_pixels_for_lpips or self.config.use_decoded_pixels_for_style:
+                logger.warning(
+                    "VAE decoder not set but use_decoded_pixels enabled. "
+                    "Call set_vae_decoder() from trainer. Falling back to latent-space loss."
+                )
+            return None
+
+        try:
+            device = latents.device
+            dtype = latents.dtype
+            batch_size = latents.shape[0]
+            num_frames = latents.shape[2]
+
+            # Sample frames for efficiency
+            sample_frames = min(sample_frames, num_frames)
+            frame_indices = torch.linspace(0, num_frames - 1, sample_frames, device=device).long()
+
+            # Extract sampled frames [B, C, sample_frames, H, W]
+            sampled = latents[:, :, frame_indices, :, :]
+
+            # Decode with VAE (expects [B, C, F, H, W])
+            with torch.inference_mode():
+                # VideoDecoder expects [B, C, F, H, W] and returns [B, C, F, H, W]
+                decoded = self._vae_decoder(sampled.to(self._vae_decoder.parameters().__next__().device))
+
+            # Reshape to [B*F, C, H, W] for LPIPS/VGG
+            decoded = decoded.to(device=device, dtype=dtype)
+            decoded = decoded.permute(0, 2, 1, 3, 4)  # [B, F, C, H, W]
+            decoded = decoded.reshape(-1, *decoded.shape[2:])  # [B*F, C, H, W]
+
+            # Ensure 3 channels (RGB)
+            if decoded.shape[1] != 3:
+                if decoded.shape[1] > 3:
+                    decoded = decoded[:, :3]
+                else:
+                    decoded = decoded.repeat(1, 3, 1, 1)[:, :3]
+
+            # Normalize to [-1, 1] for LPIPS
+            # VAE output is typically in [0, 1] or similar range
+            decoded = decoded.clamp(-1, 1)
+
+            return decoded
+
+        except Exception as e:
+            logger.warning(f"Failed to decode latents to pixels: {e}")
+            return None
+
+    def _get_vgg_features(self, images: Tensor) -> dict[str, Tensor]:
+        """Extract VGG features from images for style loss.
+
+        [GROK RECOMMENDED] Multi-layer Gram matrices on VGG features capture
+        richer style information than raw pixels or latents.
+
+        Args:
+            images: RGB images [B, 3, H, W] in [-1, 1]
+
+        Returns:
+            Dictionary mapping layer names to feature tensors
+        """
+        if not VGG_AVAILABLE:
+            logger.warning("torchvision not available for VGG features")
+            return {}
+
+        try:
+            # Initialize VGG lazily
+            if self._vgg_features is None:
+                vgg = tv_models.vgg19(weights=tv_models.VGG19_Weights.IMAGENET1K_V1).features
+                vgg = vgg.to(images.device).eval()
+                for p in vgg.parameters():
+                    p.requires_grad = False
+                self._vgg_features = vgg
+
+                # Layer name to index mapping for VGG19
+                self._vgg_layers = {
+                    'relu1_1': 1, 'relu1_2': 3,
+                    'relu2_1': 6, 'relu2_2': 8,
+                    'relu3_1': 11, 'relu3_2': 13, 'relu3_3': 15, 'relu3_4': 17,
+                    'relu4_1': 20, 'relu4_2': 22, 'relu4_3': 24, 'relu4_4': 26,
+                    'relu5_1': 29, 'relu5_2': 31, 'relu5_3': 33, 'relu5_4': 35,
+                }
+
+            # Normalize images for VGG (expects ImageNet normalization)
+            # Input is [-1, 1], convert to [0, 1] then normalize
+            images = (images + 1) / 2  # [-1, 1] -> [0, 1]
+            mean = torch.tensor([0.485, 0.456, 0.406], device=images.device).view(1, 3, 1, 1)
+            std = torch.tensor([0.229, 0.224, 0.225], device=images.device).view(1, 3, 1, 1)
+            images = (images - mean) / std
+
+            # Extract features at specified layers
+            features = {}
+            x = images.float()  # VGG expects float32
+            for name, layer_idx in self._vgg_layers.items():
+                if name in self.config.vgg_style_layers:
+                    # Run up to this layer
+                    while len(features) == 0 or max(self._vgg_layers[n] for n in features) < layer_idx:
+                        next_idx = min(k for k in self._vgg_layers.values() if k > max((self._vgg_layers[n] for n in features), default=-1))
+                        for i, layer in enumerate(self._vgg_features):
+                            if i <= next_idx:
+                                x = layer(x)
+                            if i == layer_idx:
+                                features[name] = x.clone()
+                                break
+
+            # Simpler approach: just run through and grab features
+            features = {}
+            x = images.float()
+            for i, layer in enumerate(self._vgg_features):
+                x = layer(x)
+                for name, idx in self._vgg_layers.items():
+                    if i == idx and name in self.config.vgg_style_layers:
+                        features[name] = x.clone()
+
+            return features
+
+        except Exception as e:
+            logger.warning(f"VGG feature extraction failed: {e}")
+            return {}
+
+    def _get_clip_features(self, images: Tensor) -> Tensor | None:
+        """Extract CLIP/SigLIP features from images for identity loss.
+
+        [GROK RECOMMENDED] CLIP/SigLIP provides robust semantic features that work
+        much better than mean pooling for identity preservation.
+
+        For Qwen2.5-VL and Qwen3-VL compatibility, SigLIP models are recommended
+        since those models also use SigLIP-trained vision encoders.
+
+        Args:
+            images: RGB images [B, 3, H, W] in [-1, 1]
+
+        Returns:
+            Features [B, feature_dim] or None if unavailable
+        """
+        if not CLIP_AVAILABLE:
+            logger.warning("open_clip not available for CLIP/SigLIP features")
+            return None
+
+        try:
+            # Initialize model lazily
+            if self._clip_model is None:
+                self._clip_model, _, self._clip_preprocess = open_clip.create_model_and_transforms(
+                    self.config.clip_model_name,
+                    pretrained=self.config.clip_pretrained,
+                    device=images.device,
+                )
+                self._clip_model.eval()
+                for p in self._clip_model.parameters():
+                    p.requires_grad = False
+
+                # Detect model type for proper preprocessing
+                model_name = self.config.clip_model_name.lower()
+                self._is_siglip = "siglip" in model_name
+                self._clip_image_size = 384 if "384" in model_name else 256 if "256" in model_name else 224
+
+                logger.info(
+                    f"Loaded {'SigLIP' if self._is_siglip else 'CLIP'} model: "
+                    f"{self.config.clip_model_name} (input size: {self._clip_image_size}px)"
+                )
+
+            # Convert [-1, 1] -> [0, 1]
+            images = (images + 1) / 2
+
+            # Resize to model's expected size
+            images = torch.nn.functional.interpolate(
+                images, size=(self._clip_image_size, self._clip_image_size),
+                mode='bilinear', align_corners=False
+            )
+
+            # Apply appropriate normalization
+            if self._is_siglip:
+                # SigLIP uses different normalization (closer to ImageNet but not identical)
+                # SigLIP: mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5] for webli checkpoints
+                mean = torch.tensor([0.5, 0.5, 0.5], device=images.device).view(1, 3, 1, 1)
+                std = torch.tensor([0.5, 0.5, 0.5], device=images.device).view(1, 3, 1, 1)
+            else:
+                # Standard CLIP normalization
+                mean = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=images.device).view(1, 3, 1, 1)
+                std = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=images.device).view(1, 3, 1, 1)
+
+            images = (images - mean) / std
+
+            # Extract features
+            with torch.inference_mode():
+                features = self._clip_model.encode_image(images.float())
+
+            return features
+
+        except Exception as e:
+            logger.warning(f"CLIP/SigLIP feature extraction failed: {e}")
+            return None
 
     def get_data_sources(self) -> dict[str, str]:
         """OmniTransfer requires latents, conditions, and reference latents.
 
+        In I2V mode, also requires first_frame_latents for static image conditioning.
+
         Returns:
             Dictionary mapping data directory names to output keys
         """
-        return {
+        sources = {
             "latents": "latents",
             "conditions": "conditions",
             self.config.reference_latents_dir: "ref_latents",
         }
+
+        # I2V mode requires first-frame latents for static image conditioning
+        if self.config.i2v_mode:
+            sources[self.config.first_frame_latents_dir] = "first_frame_latents"
+
+        return sources
 
     def prepare_training_inputs(
         self,
@@ -458,6 +783,12 @@ class OmniTransferStrategy(TrainingStrategy):
         3. Applies noise to target (reference stays at t=0)
         4. Computes task-aware positions for TPB
         5. Concatenates ref+target for model input
+
+        I2V Mode (pose-free animation):
+        - first_frame_latents: Static image to animate [B, C, 1, H, W]
+        - reference_latents: Motion source video [B, C, F, H, W]
+        - latents: Ground truth animated video [B, C, F, H, W]
+        The model learns to animate the static image with motion from reference.
 
         Quote: "The reference branch adopts a fixed t = 0, meaning it remains
         noise-free throughout the diffusion process." (Section 4.3)
@@ -474,6 +805,16 @@ class OmniTransferStrategy(TrainingStrategy):
         target_latents = latents_info["latents"]  # [B, C, F, H, W]
         ref_latents_info = batch["ref_latents"]
         ref_latents = ref_latents_info["latents"]  # [B, C, F, H, W]
+
+        # I2V mode: Extract first-frame latents for conditioning
+        first_frame_latent = None
+        if self.config.i2v_mode and "first_frame_latents" in batch:
+            first_frame_info = batch["first_frame_latents"]
+            first_frame_latent = first_frame_info["latents"]  # [B, C, 1, H, W]
+            # Only log once (at first call)
+            if not hasattr(self, '_logged_i2v_shape'):
+                logger.info(f"I2V mode: Using first_frame_latent shape {first_frame_latent.shape}")
+                self._logged_i2v_shape = True
 
         # Get dimensions
         num_frames = latents_info["num_frames"][0].item()
@@ -517,6 +858,7 @@ class OmniTransferStrategy(TrainingStrategy):
             self.config._task_step_counter += 1  # Increment for round-robin
 
         # Construct latents using ReferenceLatentConstructor
+        # In I2V mode, pass the explicit first_frame_latent for conditioning
         constructed = self._latent_constructor.construct(
             ref_video_latent=ref_latents,
             tgt_video_latent=target_latents,
@@ -525,6 +867,7 @@ class OmniTransferStrategy(TrainingStrategy):
             sigma=sigmas,
             first_frame_conditioning=True,
             first_frame_conditioning_prob=self.config.first_frame_conditioning_p,
+            first_frame_latent=first_frame_latent,  # None in standard mode, explicit in I2V mode
         )
 
         # Patchify latents: [B, C, F, H, W] -> [B, seq_len, C]
@@ -745,8 +1088,10 @@ class OmniTransferStrategy(TrainingStrategy):
     ) -> Tensor | None:
         """Compute LPIPS perceptual loss between predicted and target.
 
-        This provides richer gradients by measuring perceptual similarity
-        rather than pixel-wise differences.
+        [GROK RECOMMENDED] LPIPS should operate on decoded RGB pixels, not latents.
+        VGG (used internally by LPIPS) expects image pixels in [-1, 1] range.
+        Computing LPIPS on latent vectors is mathematically meaningless since
+        VGG was trained on natural images.
 
         Args:
             target_pred: Predicted target latents [B, seq_len, C]
@@ -768,19 +1113,37 @@ class OmniTransferStrategy(TrainingStrategy):
 
             # Compute predicted clean latent from velocity prediction
             # For flow matching: clean = noisy - sigma * velocity
-            sigmas = inputs.sigmas.view(-1, 1, 1)
+            dtype = inputs.tgt_latent_noisy.dtype
+            sigmas = inputs.sigmas.to(dtype=dtype).view(-1, 1, 1, 1, 1)
             clean_pred = inputs.tgt_latent_noisy - sigmas * target_pred.view_as(inputs.tgt_latent_noisy)
+            target_clean = inputs.tgt_latent_raw
 
-            # Sample a few frames for LPIPS (computing on all is expensive)
+            # [GROK RECOMMENDED] Decode to RGB pixels for proper LPIPS computation
+            if self.config.use_decoded_pixels_for_lpips:
+                pred_pixels = self._decode_latents_to_pixels(clean_pred, sample_frames=4)
+                target_pixels = self._decode_latents_to_pixels(target_clean, sample_frames=4)
+
+                if pred_pixels is not None and target_pixels is not None:
+                    # Pixels are already in [-1, 1] with 3 RGB channels
+                    # Cast to float32 for LPIPS model (VGG expects float32)
+                    lpips_loss = self._lpips_model(pred_pixels.float(), target_pixels.float()).mean()
+                    return lpips_loss
+                else:
+                    # Fall through to latent-space fallback
+                    logger.debug("VAE decode failed, falling back to latent-space LPIPS")
+
+            # Fallback: Latent-space LPIPS (less accurate but works without VAE)
+            # This is NOT recommended per Grok but provides a fallback
             batch_size = clean_pred.shape[0]
             num_frames = clean_pred.shape[2]
             sample_frames = min(4, num_frames)
-            frame_indices = torch.linspace(0, num_frames - 1, sample_frames).long()
+            device = clean_pred.device
+            frame_indices = torch.linspace(0, num_frames - 1, sample_frames, device=device).long()
 
             # Get sampled frames [B, C, sample_frames, H, W] -> [B*sample_frames, C, H, W]
             pred_frames = clean_pred[:, :, frame_indices].permute(0, 2, 1, 3, 4)
             pred_frames = pred_frames.reshape(-1, *pred_frames.shape[2:])
-            target_frames = inputs.tgt_latent_raw[:, :, frame_indices].permute(0, 2, 1, 3, 4)
+            target_frames = target_clean[:, :, frame_indices].permute(0, 2, 1, 3, 4)
             target_frames = target_frames.reshape(-1, *target_frames.shape[2:])
 
             # Normalize to [-1, 1] for LPIPS
@@ -789,7 +1152,6 @@ class OmniTransferStrategy(TrainingStrategy):
 
             # Expand to 3 channels if needed (LPIPS expects RGB)
             if pred_norm.shape[1] != 3:
-                # Take first 3 channels or tile
                 if pred_norm.shape[1] > 3:
                     pred_norm = pred_norm[:, :3]
                     target_norm = target_norm[:, :3]
@@ -797,7 +1159,8 @@ class OmniTransferStrategy(TrainingStrategy):
                     pred_norm = pred_norm.repeat(1, 3, 1, 1)[:, :3]
                     target_norm = target_norm.repeat(1, 3, 1, 1)[:, :3]
 
-            lpips_loss = self._lpips_model(pred_norm, target_norm).mean()
+            # Cast to float32 for LPIPS model (VGG expects float32)
+            lpips_loss = self._lpips_model(pred_norm.float(), target_norm.float()).mean()
             return lpips_loss
 
         except Exception as e:
@@ -811,8 +1174,13 @@ class OmniTransferStrategy(TrainingStrategy):
     ) -> Tensor | None:
         """Compute identity embedding similarity loss.
 
-        Uses ArcFace embeddings to enforce identity consistency between
-        reference and generated frames.
+        [GROK RECOMMENDED] Use CLIP for identity loss instead of mean pooling:
+        1. Decode latents to RGB pixels
+        2. Extract CLIP image features (trained on 400M image-text pairs)
+        3. Compute cosine similarity between reference and prediction
+
+        CLIP provides robust semantic features that capture identity better than
+        simple spatial mean pooling of latent vectors.
 
         Args:
             target_pred: Predicted target latents [B, seq_len, C]
@@ -821,23 +1189,42 @@ class OmniTransferStrategy(TrainingStrategy):
         Returns:
             Identity loss (1 - cosine_similarity) or None if unavailable
         """
-        # Identity loss requires a face recognition model which needs
-        # decoded frames. For latent-space training, we approximate by
-        # comparing latent statistics between reference and target prediction.
-        #
-        # For full identity loss, decode latents -> extract face embeddings
-        # This is expensive, so we use a lightweight latent-space proxy here.
-
         try:
-            # Latent-space identity proxy:
-            # Compare mean features between reference and predicted target
             ref_latent = inputs.ref_latent_raw  # [B, C, F, H, W]
+            device = ref_latent.device
+            dtype = ref_latent.dtype
 
             # Compute predicted clean from velocity
-            sigmas = inputs.sigmas.view(-1, 1, 1)
+            sigmas = inputs.sigmas.to(dtype=dtype).view(-1, 1, 1, 1, 1)
             tgt_pred_5d = inputs.tgt_latent_noisy - sigmas * target_pred.view_as(inputs.tgt_latent_noisy)
 
-            # Pool spatial dimensions to get identity features
+            # [GROK RECOMMENDED] Use CLIP for semantic identity features
+            if self.config.use_clip_identity and CLIP_AVAILABLE:
+                # Decode to pixels
+                ref_pixels = self._decode_latents_to_pixels(ref_latent, sample_frames=4)
+                pred_pixels = self._decode_latents_to_pixels(tgt_pred_5d, sample_frames=4)
+
+                if ref_pixels is not None and pred_pixels is not None:
+                    # Extract CLIP features
+                    ref_features = self._get_clip_features(ref_pixels)
+                    pred_features = self._get_clip_features(pred_pixels)
+
+                    if ref_features is not None and pred_features is not None:
+                        # Normalize for cosine similarity
+                        ref_norm = ref_features / ref_features.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+                        pred_norm = pred_features / pred_features.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+
+                        # Identity loss = 1 - cosine_similarity
+                        cosine_sim = (ref_norm * pred_norm).sum(dim=-1)
+                        identity_loss = (1 - cosine_sim).mean()
+                        return identity_loss.float()
+                    else:
+                        logger.debug("CLIP feature extraction failed, falling back")
+                else:
+                    logger.debug("VAE decode failed, falling back to latent-space identity")
+
+            # Fallback: Latent-space identity proxy (not recommended per Grok)
+            # Compare mean features between reference and predicted target
             # [B, C, F, H, W] -> [B, C]
             ref_features = ref_latent.mean(dim=(2, 3, 4))
             pred_features = tgt_pred_5d.mean(dim=(2, 3, 4))
@@ -847,7 +1234,7 @@ class OmniTransferStrategy(TrainingStrategy):
             pred_norm = pred_features / pred_features.norm(dim=-1, keepdim=True).clamp(min=1e-6)
 
             # Identity loss = 1 - cosine_similarity
-            cosine_sim = (ref_norm * pred_norm).sum(dim=-1)
+            cosine_sim = (ref_norm.float() * pred_norm.float()).sum(dim=-1)
             identity_loss = (1 - cosine_sim).mean()
 
             return identity_loss
@@ -863,10 +1250,14 @@ class OmniTransferStrategy(TrainingStrategy):
     ) -> Tensor | None:
         """Compute Gram matrix style loss between prediction and reference.
 
-        This is CRITICAL for style transfer - without it, the model ignores the
-        reference and just reconstructs the target. The Gram matrix captures
-        feature correlations that represent artistic style (textures, colors,
-        patterns) independent of content structure.
+        [GROK RECOMMENDED] Style loss should use VGG features on decoded pixels:
+        1. Decode latents to RGB pixels
+        2. Extract multi-layer VGG features (conv1_2, conv2_2, conv3_3, conv4_3)
+        3. Compute Gram matrices at each layer
+        4. MSE between reference and prediction Gram matrices
+
+        This captures richer style information (textures, colors, patterns) than
+        computing Gram matrices directly on latents where style is entangled with content.
 
         Args:
             target_pred: Predicted target latents [B, seq_len, C]
@@ -882,11 +1273,63 @@ class OmniTransferStrategy(TrainingStrategy):
             dtype = ref_latent.dtype
 
             # Compute predicted clean from velocity
-            # Ensure sigmas is same dtype
-            sigmas = inputs.sigmas.to(dtype=dtype).view(-1, 1, 1)
+            sigmas = inputs.sigmas.to(dtype=dtype).view(-1, 1, 1, 1, 1)
             tgt_pred_5d = inputs.tgt_latent_noisy - sigmas * target_pred.view_as(inputs.tgt_latent_noisy)
 
-            # Sample a few frames for efficiency
+            # [GROK RECOMMENDED] Use VGG features on decoded pixels
+            if self.config.use_decoded_pixels_for_style:
+                ref_pixels = self._decode_latents_to_pixels(ref_latent, sample_frames=3)
+                pred_pixels = self._decode_latents_to_pixels(tgt_pred_5d, sample_frames=3)
+
+                if ref_pixels is not None and pred_pixels is not None:
+                    # Use VGG features for multi-layer Gram matrices
+                    if self.config.use_vgg_style_features and VGG_AVAILABLE:
+                        ref_features = self._get_vgg_features(ref_pixels)
+                        pred_features = self._get_vgg_features(pred_pixels)
+
+                        if ref_features and pred_features:
+                            style_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+                            num_layers = 0
+
+                            for layer_name in ref_features:
+                                if layer_name in pred_features:
+                                    ref_feat = ref_features[layer_name]  # [B*F, C, H, W]
+                                    pred_feat = pred_features[layer_name]
+
+                                    # Compute Gram matrices
+                                    b, c, h, w = ref_feat.shape
+                                    ref_flat = ref_feat.view(b, c, -1)  # [B*F, C, H*W]
+                                    pred_flat = pred_feat.view(b, c, -1)
+
+                                    n_elements = float(h * w)
+                                    ref_gram = torch.bmm(ref_flat, ref_flat.transpose(1, 2)) / n_elements
+                                    pred_gram = torch.bmm(pred_flat, pred_flat.transpose(1, 2)) / n_elements
+
+                                    layer_loss = torch.nn.functional.mse_loss(pred_gram, ref_gram)
+                                    style_loss = style_loss + layer_loss
+                                    num_layers += 1
+
+                            if num_layers > 0:
+                                return style_loss / num_layers
+                        else:
+                            logger.debug("VGG feature extraction returned empty, falling back")
+
+                    # Fallback: Gram on decoded pixels without VGG (still better than latents)
+                    b = ref_pixels.shape[0]
+                    c = ref_pixels.shape[1]
+                    ref_flat = ref_pixels.view(b, c, -1)
+                    pred_flat = pred_pixels.view(b, c, -1)
+
+                    n_elements = float(ref_flat.shape[2])
+                    ref_gram = torch.bmm(ref_flat, ref_flat.transpose(1, 2)) / n_elements
+                    pred_gram = torch.bmm(pred_flat, pred_flat.transpose(1, 2)) / n_elements
+
+                    style_loss = torch.nn.functional.mse_loss(pred_gram.float(), ref_gram.float())
+                    return style_loss
+                else:
+                    logger.debug("VAE decode failed, falling back to latent-space style loss")
+
+            # Fallback: Latent-space Gram matrices (not recommended per Grok)
             num_frames = ref_latent.shape[2]
             sample_frames = min(3, num_frames)
             frame_indices = torch.linspace(0, num_frames - 1, sample_frames, device=device).long()
@@ -896,21 +1339,16 @@ class OmniTransferStrategy(TrainingStrategy):
             pred_frames = tgt_pred_5d[:, :, frame_indices, :, :].to(dtype=dtype)
 
             # Compute Gram matrices for style comparison
-            # Reshape to [B, C, N] where N = F*H*W
             b, c = ref_frames.shape[:2]
             ref_flat = ref_frames.reshape(b, c, -1)  # [B, C, N]
             pred_flat = pred_frames.reshape(b, c, -1)  # [B, C, N]
 
-            # Gram matrix: G = F @ F^T, captures feature correlations
-            # Normalize by number of elements for numerical stability
             n_elements = float(ref_flat.shape[2])
             ref_gram = torch.bmm(ref_flat, ref_flat.transpose(1, 2)) / n_elements  # [B, C, C]
             pred_gram = torch.bmm(pred_flat, pred_flat.transpose(1, 2)) / n_elements  # [B, C, C]
 
-            # Style loss = MSE between Gram matrices (keep same dtype)
-            style_loss = torch.nn.functional.mse_loss(pred_gram, ref_gram)
-
-            return style_loss.to(dtype=dtype)
+            style_loss = torch.nn.functional.mse_loss(pred_gram.float(), ref_gram.float())
+            return style_loss
 
         except Exception as e:
             logger.warning(f"Style loss computation failed: {e}")

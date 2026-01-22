@@ -83,6 +83,13 @@ class LtxvTrainer:
         self._training_strategy = get_training_strategy(self._config.training_strategy)
         self._cached_validation_embeddings = self._load_text_encoder_and_cache_embeddings()
         self._load_models()
+
+        # [GROK RECOMMENDED] Pass VAE decoder to OmniTransfer strategy for pixel-space losses
+        # LPIPS and style loss work much better on decoded RGB pixels than raw latents
+        if hasattr(self._training_strategy, "set_vae_decoder"):
+            self._training_strategy.set_vae_decoder(self._vae_decoder)
+            logger.info("Passed VAE decoder to training strategy for pixel-space loss computation")
+
         self._setup_accelerator()
         self._collect_trainable_params()
         self._load_checkpoint()

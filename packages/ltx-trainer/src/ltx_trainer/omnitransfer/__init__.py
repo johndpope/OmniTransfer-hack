@@ -49,6 +49,24 @@ from ltx_trainer.omnitransfer.metaquery_tma import (
     MetaQueryFeatureExtractor,
 )
 
+# Qwen VL integration for TMA (optional, requires transformers>=4.43)
+try:
+    from ltx_trainer.omnitransfer.qwen_vl_integration import (
+        QwenVLConfig,
+        QwenVLFeatureExtractor,
+        QwenVLTMAIntegration,
+        detect_qwen_model_type,
+        get_task_template,
+        TASK_TEMPLATES,
+        HAS_QWEN_VL,
+        HAS_QWEN3_VL,
+    )
+    _QWEN_VL_AVAILABLE = True
+except ImportError:
+    _QWEN_VL_AVAILABLE = False
+    HAS_QWEN_VL = False
+    HAS_QWEN3_VL = False
+
 __all__ = [
     # Core components
     "OmniTransferTask",
@@ -76,4 +94,14 @@ __all__ = [
     "MetaQueryTMA",
     "MetaQueryTMAConfig",
     "MetaQueryFeatureExtractor",
+    # Qwen VL TMA integration (optional)
+    "QwenVLConfig",
+    "QwenVLFeatureExtractor",
+    "QwenVLTMAIntegration",
+    "detect_qwen_model_type",
+    "get_task_template",
+    "TASK_TEMPLATES",
+    "HAS_QWEN_VL",
+    "HAS_QWEN3_VL",
+    "_QWEN_VL_AVAILABLE",
 ]

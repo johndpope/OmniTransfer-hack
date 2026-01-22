@@ -321,6 +321,28 @@ OmniTransfer implements unified spatio-temporal video transfer based on arXiv:26
 - **Motion transfer** - Transfer motion patterns between videos
 - **Pose reenactment** - Drive target with reference poses
 
+### CRITICAL: Training Data Requirements
+
+> **⚠️ NEVER USE THE SAME VIDEO FOR BOTH REFERENCE AND TARGET!**
+>
+> This is the #1 mistake that will waste training time and produce useless results.
+>
+> **Correct Setup:**
+> - **Reference video**: Source of motion/style/effect to TRANSFER FROM
+> - **Target video**: Content to apply the transfer TO (MUST BE DIFFERENT!)
+> - **Ground truth**: The expected output (what target should look like after transfer)
+>
+> **Examples of CORRECT pairings:**
+> - Style transfer: Reference=artistic video, Target=realistic video, GT=stylized version of target
+> - Motion transfer: Reference=dancing video, Target=standing person, GT=that person dancing
+> - I2V animation: Reference=motion source video, Target=static image, GT=animated image with that motion
+>
+> **WRONG (will train identity mapping, learns nothing):**
+> - Reference=Video A, Target=Video A, GT=Video A ❌
+> - Using first frame of same video as target with full video as reference ❌
+>
+> For cross-video training, always pair DIFFERENT videos that share the property you want to transfer.
+
 ### OmniTransfer Components
 
 1. **Task-aware Positional Bias (TPB)** - RoPE offsets distinguish reference vs target

@@ -1025,7 +1025,8 @@ class LtxvTrainer:
     ) -> None:
         """Save a debug reconstruction image (overwrites each step).
 
-        Creates a 3-image grid: Reference | Target | Prediction
+        For I2V mode creates 4-image grid: Ref Image | Ref Video | Ground Truth | Prediction
+        For non-I2V creates 3-image grid: Reference | Target | Prediction
         Saves to outputs/debug_decoded.png
         """
         try:
@@ -1041,6 +1042,10 @@ class LtxvTrainer:
             noise = model_inputs.noise
             sigmas = model_inputs.sigmas  # [B] or [B, 1, ...]
 
+            # Check for I2V mode (first_frame_latent exists)
+            first_frame_lat = getattr(model_inputs, 'first_frame_latent_raw', None)
+            is_i2v_mode = first_frame_lat is not None
+
             # Get sigma value
             if sigmas.dim() > 1:
                 sigma = sigmas.flatten()[0].item()
@@ -1053,6 +1058,11 @@ class LtxvTrainer:
             mid_f = f // 2
             ref_vis = ref_lat[0, :3, mid_f, :, :].cpu().float()  # [3, H, W]
             tgt_vis = tgt_lat[0, :3, mid_f, :, :].cpu().float()
+
+            # For I2V mode, get first frame latent visualization
+            if is_i2v_mode:
+                # first_frame_lat shape: [B, C, 1, H, W]
+                first_frame_vis = first_frame_lat[0, :3, 0, :, :].cpu().float()  # [3, H, W]
 
             # Reconstruct prediction from velocity prediction
             # v = noise - clean, so clean = noise - v
@@ -1101,8 +1111,14 @@ class LtxvTrainer:
             tgt_norm = norm(tgt_vis)
             pred_norm = norm(pred_vis)
 
-            # Create 3-image grid: ref | target | prediction
-            grid = torch.cat([ref_norm, tgt_norm, pred_norm], dim=2)  # [3, H, W*3]
+            # Create grid based on mode
+            if is_i2v_mode:
+                first_frame_norm = norm(first_frame_vis)
+                # 4-image grid: Ref Image | Ref Video | Ground Truth | Prediction
+                grid = torch.cat([first_frame_norm, ref_norm, tgt_norm, pred_norm], dim=2)
+            else:
+                # 3-image grid: ref | target | prediction
+                grid = torch.cat([ref_norm, tgt_norm, pred_norm], dim=2)
 
             # Save latent visualization
             out_path = Path(self._config.output_dir) / "debug_recon.png"
@@ -1111,8 +1127,8 @@ class LtxvTrainer:
 
             # Also save a text file with current step/sigma
             info_path = Path(self._config.output_dir) / "debug_info.txt"
-            with open(info_path, "w") as f:
-                f.write(f"Step: {step}\nSigma: {sigma:.4f}\n")
+            with open(info_path, "w") as info_file:
+                info_file.write(f"Step: {step}\nSigma: {sigma:.4f}\nI2V Mode: {is_i2v_mode}\n")
 
             # Decode actual frames every step (move VAE to GPU temporarily)
             if self._vae_decoder is not None:
@@ -1123,37 +1139,90 @@ class LtxvTrainer:
                     # Get VAE dtype for consistency
                     vae_dtype = next(self._vae_decoder.parameters()).dtype
 
-                    ref_frame_lat = ref_lat[0:1, :, mid_f:mid_f+1, :, :].to("cuda", dtype=vae_dtype)
-                    tgt_frame_lat = tgt_lat[0:1, :, mid_f:mid_f+1, :, :].to("cuda", dtype=vae_dtype)
+                    # Normalize: VAE outputs [-1, 1] -> [0, 1]
+                    def norm_decoded(x):
+                        return ((x.float() + 1) / 2).clamp(0, 1)
 
-                    # Get prediction latent for decoding
-                    try:
-                        pred_frame_lat = pred_clean[0:1, :, mid_f:mid_f+1, :, :].to("cuda", dtype=vae_dtype)
-                    except Exception:
-                        pred_frame_lat = tgt_noisy[0:1, :, mid_f:mid_f+1, :, :].to("cuda", dtype=vae_dtype)
+                    # Select 4 evenly spaced frame indices for multi-frame comparison
+                    num_display_frames = min(4, f)
+                    if num_display_frames > 1:
+                        frame_indices = [int(i * (f - 1) / (num_display_frames - 1)) for i in range(num_display_frames)]
+                    else:
+                        frame_indices = [mid_f]
+
+                    # Decode reference video middle frame
+                    ref_frame_lat = ref_lat[0:1, :, mid_f:mid_f+1, :, :].to("cuda", dtype=vae_dtype)
+
+                    # For I2V mode, decode first frame (reference image)
+                    if is_i2v_mode:
+                        first_frame_decode_lat = first_frame_lat[0:1, :, 0:1, :, :].to("cuda", dtype=vae_dtype)
+
+                    # Decode multiple GT and Pred frames
+                    gt_frames_decoded = []
+                    pred_frames_decoded = []
 
                     with torch.inference_mode():
+                        # Decode ref video frame
                         ref_decoded = self._vae_decoder(ref_frame_lat)[0, :, 0].cpu()
-                        tgt_decoded = self._vae_decoder(tgt_frame_lat)[0, :, 0].cpu()
-                        pred_decoded = self._vae_decoder(pred_frame_lat)[0, :, 0].cpu()
+
+                        # Decode first frame if I2V
+                        if is_i2v_mode:
+                            first_frame_decoded = self._vae_decoder(first_frame_decode_lat)[0, :, 0].cpu()
+
+                        # Decode multiple frames from GT and Prediction
+                        for fidx in frame_indices:
+                            # GT frame
+                            tgt_frame_lat = tgt_lat[0:1, :, fidx:fidx+1, :, :].to("cuda", dtype=vae_dtype)
+                            gt_dec = self._vae_decoder(tgt_frame_lat)[0, :, 0].cpu()
+                            gt_frames_decoded.append(norm_decoded(gt_dec))
+
+                            # Prediction frame
+                            try:
+                                pred_frame_lat = pred_clean[0:1, :, fidx:fidx+1, :, :].to("cuda", dtype=vae_dtype)
+                            except Exception:
+                                pred_frame_lat = tgt_noisy[0:1, :, fidx:fidx+1, :, :].to("cuda", dtype=vae_dtype)
+                            pred_dec = self._vae_decoder(pred_frame_lat)[0, :, 0].cpu()
+                            pred_frames_decoded.append(norm_decoded(pred_dec))
 
                     # Move VAE back to CPU
                     self._vae_decoder = self._vae_decoder.to("cpu")
                     torch.cuda.empty_cache()
 
-                    # Normalize: VAE outputs [-1, 1] -> [0, 1]
-                    def norm_decoded(x):
-                        return ((x.float() + 1) / 2).clamp(0, 1)
+                    # Create PORTRAIT grid (taller than wide) with 2 columns:
+                    # Column 1 (GT): Ref Image, then GT frames stacked vertically
+                    # Column 2 (Pred): Ref Video, then Pred frames stacked vertically
+                    # This gives aspect ratio ~1.35 portrait
 
-                    # Create 3-image decoded grid: Reference | Target | Prediction
-                    decoded_grid = torch.cat([
-                        norm_decoded(ref_decoded),
-                        norm_decoded(tgt_decoded),
-                        norm_decoded(pred_decoded)
-                    ], dim=2)
+                    if is_i2v_mode:
+                        ref_img_norm = norm_decoded(first_frame_decoded)
+                        ref_vid_norm = norm_decoded(ref_decoded)
+
+                        # Left column: Ref Image + GT frames
+                        left_col = torch.cat([ref_img_norm] + gt_frames_decoded, dim=1)
+
+                        # Right column: Ref Video + Pred frames
+                        right_col = torch.cat([ref_vid_norm] + pred_frames_decoded, dim=1)
+
+                        # Stack columns horizontally -> portrait image
+                        decoded_grid = torch.cat([left_col, right_col], dim=2)  # [3, H*(1+num_frames), W*2]
+                    else:
+                        # Non-I2V: GT column | Pred column
+                        ref_vid_norm = norm_decoded(ref_decoded)
+
+                        # Left: Ref + GT frames
+                        left_col = torch.cat([ref_vid_norm] + gt_frames_decoded, dim=1)
+
+                        # Right: Padding + Pred frames
+                        padding = torch.zeros_like(ref_vid_norm)
+                        right_col = torch.cat([padding] + pred_frames_decoded, dim=1)
+
+                        decoded_grid = torch.cat([left_col, right_col], dim=2)
+
                     save_image(decoded_grid, Path(self._config.output_dir) / "debug_decoded.png")
                 except Exception as e:
                     logger.debug(f"Decoded frame save failed: {e}")
+                    import traceback
+                    logger.debug(traceback.format_exc())
                     # Ensure VAE back on CPU even on error
                     if hasattr(self, '_vae_decoder') and self._vae_decoder is not None:
                         self._vae_decoder = self._vae_decoder.to("cpu")

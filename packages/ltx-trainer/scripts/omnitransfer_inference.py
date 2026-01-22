@@ -333,7 +333,8 @@ def main():
     # Decode latent
     logger.info("Decoding video...")
     with torch.inference_mode():
-        video = components.vae_decoder.decode(latent)
+        # VideoDecoder uses forward(), not decode()
+        video = components.vae_decoder(latent)
 
     # Save video
     save_video(

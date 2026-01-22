@@ -43,6 +43,9 @@ from ltx_trainer.omnitransfer.components import (
     OmniTransferTask,
     TaskAwarePositionalBias,
     TaskAwarePositionalBiasConfig,
+    # Dynamic Identity Anchoring (Movie Weaver CVPR 2025)
+    ConceptEmbedding,
+    ConceptEmbeddingConfig,
 )
 from ltx_trainer.omnitransfer.latent_constructor import (
     ConstructedLatents,
@@ -101,6 +104,43 @@ class OmniTransferStage(Enum):
     CONNECTOR = "connector"
     # Stage 3: Joint fine-tuning (5k steps)
     JOINT = "joint"
+
+
+# =============================================================================
+# Task Type Categories (per OmniTransfer paper Table 1)
+# =============================================================================
+# Appearance Transfer (T2V): Input = V_ref + prompt p, NO target image
+# - ID Transfer: Identity from V_ref, scene from prompt
+# - Style Transfer: Style from V_ref, content from prompt
+# - Movie Weaver: Multi-concept personalization with anchored prompts
+APPEARANCE_TASKS = {"identity_preservation", "style_transfer", "id", "style", "movie_weaver"}
+
+# Temporal Transfer (I2V): Input = V_ref + Image I
+# - Motion Transfer: Motion from V_ref, starting from image I
+# - Camera Movement: Camera motion from V_ref, starting from image I
+# - Effect Transfer: Effect from V_ref, starting from image I
+TEMPORAL_TASKS = {"motion_transfer", "camera_transfer", "effect_transfer",
+                  "motion", "camera", "effect", "pose_reenactment",
+                  "action_customization", "scene_composition"}
+
+
+def is_temporal_task(task_type: str) -> bool:
+    """Check if task requires I2V mode (image + motion reference).
+
+    Per paper Table 1:
+    - Temporal Transfer (I2V): Motion, Camera, Effect → V_ref + Image I
+    - Appearance Transfer (T2V): ID, Style → V_ref + prompt (no image)
+    """
+    return task_type.lower() in TEMPORAL_TASKS
+
+
+def is_appearance_task(task_type: str) -> bool:
+    """Check if task is T2V mode (reference + prompt only, no target image).
+
+    Per paper Table 1:
+    - Appearance Transfer (T2V): ID, Style → V_ref + prompt p
+    """
+    return task_type.lower() in APPEARANCE_TASKS
 
 
 class OmniTransferConfig(TrainingStrategyConfigBase):
@@ -195,6 +235,15 @@ class OmniTransferConfig(TrainingStrategyConfigBase):
         "latents [128, 1, H, W] representing the static image to animate.",
     )
 
+    # Self-reconstruction mode - video reconstructs itself from first frame
+    self_reconstruction_mode: bool = Field(
+        default=False,
+        description="Enable self-reconstruction training where each video reconstructs itself. "
+        "In this mode, reference_latents == latents (same video), and first_frame_latents "
+        "provides the starting image. Model learns to animate first frame to match full video. "
+        "Useful when cross-subject ground truth is unavailable.",
+    )
+
     # TPB configuration
     tpb_max_pos: list[int] = Field(
         default=[20, 2048, 2048],
@@ -250,6 +299,48 @@ class OmniTransferConfig(TrainingStrategyConfigBase):
         "Set False to fine-tune MLLM jointly (requires more VRAM).",
     )
 
+    # ==========================================================================
+    # Dynamic Identity Anchoring (Movie Weaver CVPR 2025)
+    # ==========================================================================
+    # Based on "Movie Weaver: Tuning-Free Multi-Concept Video Personalization
+    # with Anchored Prompts" (CVPR 2025) which achieved 98.2% vs 90.5% accuracy
+    # in identity separation using concept embeddings.
+    #
+    # Quote: "We apply the same concept embedding to the entire set of vision
+    # tokens from one image, rather than different embeddings per token."
+    # ==========================================================================
+
+    enable_concept_embeddings: bool = Field(
+        default=True,
+        description="Enable Movie Weaver-style concept embeddings for Dynamic Identity Anchoring. "
+        "Adds learnable embeddings to ALL tokens from reference video, helping the model "
+        "know 'these tokens all represent the same identity/concept'. Critical for ID Transfer.",
+    )
+
+    concept_embedding_dim: int = Field(
+        default=128,
+        description="Dimension of concept embeddings. Should match model hidden dimension "
+        "after patchification (128 for LTX-2 VAE latents).",
+    )
+
+    concept_embedding_task_specific: bool = Field(
+        default=True,
+        description="Use task-specific concept embeddings. Each task (identity, style, motion, etc.) "
+        "gets separate learnable embeddings for better task discrimination.",
+    )
+
+    concept_embedding_num_concepts: int = Field(
+        default=4,
+        description="Number of concept slots for multi-concept scenarios. For single-reference "
+        "training, only slot 0 is used. Increase for multi-subject/multi-reference setups.",
+    )
+
+    concept_embedding_init_scale: float = Field(
+        default=0.02,
+        description="Initialization scale for concept embeddings. Smaller values ensure "
+        "embeddings don't dominate initial training.",
+    )
+
     # Loss weighting
     target_loss_weight: float = Field(
         default=1.0,
@@ -294,6 +385,15 @@ class OmniTransferConfig(TrainingStrategyConfigBase):
         "prediction and reference. Recommended 0.1-1.0 for style transfer tasks. "
         "This is CRITICAL for style transfer - without it, the model ignores the reference.",
         ge=0.0,
+    )
+
+    # Performance optimization: Compute expensive pixel-space losses periodically
+    perceptual_loss_interval: int = Field(
+        default=1,
+        description="Compute LPIPS/style/identity losses every N steps instead of every step. "
+        "Set to 5-10 for 5-10x speedup with minimal quality impact. "
+        "Flow matching loss is still computed every step for stable training.",
+        ge=1,
     )
 
     # Grok-recommended: Use decoded pixels for perceptual losses
@@ -386,6 +486,22 @@ class OmniTransferConfig(TrainingStrategyConfigBase):
         description="Directory for local reconstruction saves",
     )
 
+    # Data Augmentation (Grok: Critical for preventing overfitting on small datasets)
+    augmentation: dict = Field(
+        default={
+            "enabled": False,
+            "horizontal_flip_p": 0.5,
+            "temporal_jitter_p": 0.3,
+            "temporal_jitter_max_frames": 1,
+            "noise_injection_p": 0.2,
+            "noise_injection_scale": 0.02,
+        },
+        description="Data augmentation settings for latent-space training. "
+        "horizontal_flip_p: probability of flipping horizontally. "
+        "temporal_jitter_p: probability of shifting frames. "
+        "noise_injection_p: probability of adding small noise.",
+    )
+
     _task_step_counter: int = 0  # For round-robin sampling
 
     @property
@@ -460,6 +576,7 @@ class OmniTransferModelInputs(ModelInputs):
     tgt_latent_noisy: Tensor | None = None    # [B, C, F, H, W] - noisy target for visualization
     noise: Tensor | None = None               # [B, C, F, H, W] - noise used for training
     sigmas: Tensor | None = None              # [B] - noise levels used
+    first_frame_latent_raw: Tensor | None = None  # [B, C, 1, H, W] - I2V target image (for 4-panel viz)
 
     # Prompts for logging
     prompts: list[str] | None = None
@@ -510,6 +627,26 @@ class OmniTransferStrategy(TrainingStrategy):
         else:
             self._tpb = None
 
+        # Initialize Concept Embeddings for Dynamic Identity Anchoring
+        # Based on Movie Weaver (CVPR 2025) which achieved 98.2% accuracy
+        # in identity separation using concept embeddings
+        if config.enable_concept_embeddings:
+            self._concept_embedding = ConceptEmbedding(
+                ConceptEmbeddingConfig(
+                    embedding_dim=config.concept_embedding_dim,
+                    num_concepts=config.concept_embedding_num_concepts,
+                    task_specific=config.concept_embedding_task_specific,
+                    num_task_types=6,  # identity, style, motion, camera, effect, scene
+                    init_scale=config.concept_embedding_init_scale,
+                )
+            )
+            logger.info(
+                f"Initialized ConceptEmbedding for Dynamic Identity Anchoring: "
+                f"dim={config.concept_embedding_dim}, task_specific={config.concept_embedding_task_specific}"
+            )
+        else:
+            self._concept_embedding = None
+
         # Log I2V mode if enabled
         i2v_status = "I2V=True (pose-free animation)" if config.i2v_mode else "I2V=False"
         logger.info(
@@ -528,6 +665,9 @@ class OmniTransferStrategy(TrainingStrategy):
         self._clip_model = None
         self._clip_preprocess = None
 
+        # Step counter for periodic perceptual loss computation
+        self._current_step = 0
+
     def set_vae_decoder(self, vae_decoder) -> None:
         """Set VAE decoder for pixel-space loss computation.
 
@@ -540,6 +680,38 @@ class OmniTransferStrategy(TrainingStrategy):
         """
         self._vae_decoder = vae_decoder
         logger.info("VAE decoder set for pixel-space loss computation (Grok recommended)")
+
+    def _get_task_enum(self, task_str: str) -> OmniTransferTask:
+        """Convert task string to OmniTransferTask enum.
+
+        Handles both full names (identity_preservation) and short names (id, identity).
+
+        Args:
+            task_str: Task name string
+
+        Returns:
+            OmniTransferTask enum value
+        """
+        # Extended mapping including short names used in multi-task configs
+        task_map = {
+            # Full names
+            "motion_transfer": OmniTransferTask.MOTION_TRANSFER,
+            "pose_reenactment": OmniTransferTask.POSE_REENACTMENT,
+            "action_customization": OmniTransferTask.ACTION_CUSTOMIZATION,
+            "style_transfer": OmniTransferTask.STYLE_TRANSFER,
+            "identity_preservation": OmniTransferTask.IDENTITY_PRESERVATION,
+            "scene_composition": OmniTransferTask.SCENE_COMPOSITION,
+            "movie_weaver": OmniTransferTask.MOVIE_WEAVER,
+            # Short names (used in website demos config)
+            "motion": OmniTransferTask.MOTION_TRANSFER,
+            "camera": OmniTransferTask.MOTION_TRANSFER,  # Camera movement is temporal
+            "effect": OmniTransferTask.MOTION_TRANSFER,  # Effect transfer is temporal
+            "id": OmniTransferTask.IDENTITY_PRESERVATION,
+            "identity": OmniTransferTask.IDENTITY_PRESERVATION,
+            "style": OmniTransferTask.STYLE_TRANSFER,
+            "weaver": OmniTransferTask.MOVIE_WEAVER,
+        }
+        return task_map.get(task_str.lower(), OmniTransferTask.MOTION_TRANSFER)
 
     def _decode_latents_to_pixels(
         self,
@@ -770,6 +942,63 @@ class OmniTransferStrategy(TrainingStrategy):
 
         return sources
 
+    def _apply_augmentations(
+        self,
+        target_latents: Tensor,
+        ref_latents: Tensor,
+        first_frame_latent: Tensor | None,
+    ) -> tuple[Tensor, Tensor, Tensor | None]:
+        """Apply data augmentations to latents for regularization.
+
+        Grok recommendation: Augmentations are critical for preventing overfitting
+        on small datasets. We apply the SAME augmentation to all related latents
+        to maintain alignment (e.g., if we flip target, we flip ref and first_frame too).
+
+        Args:
+            target_latents: Ground truth video latents [B, C, F, H, W]
+            ref_latents: Reference video latents [B, C, F, H, W]
+            first_frame_latent: Optional first frame latent [B, C, 1, H, W]
+
+        Returns:
+            Augmented (target_latents, ref_latents, first_frame_latent)
+        """
+        import random
+
+        aug_config = self.config.augmentation
+        if not aug_config.get("enabled", False):
+            return target_latents, ref_latents, first_frame_latent
+
+        # Horizontal flip (flip width dimension)
+        if random.random() < aug_config.get("horizontal_flip_p", 0.0):
+            target_latents = torch.flip(target_latents, dims=[-1])  # Flip W
+            ref_latents = torch.flip(ref_latents, dims=[-1])
+            if first_frame_latent is not None:
+                first_frame_latent = torch.flip(first_frame_latent, dims=[-1])
+
+        # Temporal jitter (shift frames for reference video only - target stays aligned with GT)
+        if random.random() < aug_config.get("temporal_jitter_p", 0.0):
+            max_shift = aug_config.get("temporal_jitter_max_frames", 1)
+            num_frames = ref_latents.shape[2]
+            if num_frames > 2 * max_shift:  # Only if enough frames
+                shift = random.randint(-max_shift, max_shift)
+                if shift != 0:
+                    # Shift reference video frames (circular)
+                    ref_latents = torch.roll(ref_latents, shifts=shift, dims=2)
+
+        # Noise injection (add small noise to all latents)
+        if random.random() < aug_config.get("noise_injection_p", 0.0):
+            noise_scale = aug_config.get("noise_injection_scale", 0.02)
+            # Add noise proportional to latent magnitude
+            target_std = target_latents.std()
+            noise_mag = noise_scale * target_std
+
+            target_latents = target_latents + noise_mag * torch.randn_like(target_latents)
+            ref_latents = ref_latents + noise_mag * torch.randn_like(ref_latents)
+            if first_frame_latent is not None:
+                first_frame_latent = first_frame_latent + noise_mag * torch.randn_like(first_frame_latent)
+
+        return target_latents, ref_latents, first_frame_latent
+
     def prepare_training_inputs(
         self,
         batch: dict[str, Any],
@@ -806,6 +1035,21 @@ class OmniTransferStrategy(TrainingStrategy):
         ref_latents_info = batch["ref_latents"]
         ref_latents = ref_latents_info["latents"]  # [B, C, F, H, W]
 
+        # CRITICAL: Assert reference and target are DIFFERENT (cross-subject transfer)
+        # UNLESS self_reconstruction_mode is enabled (where they're intentionally the same)
+        if not self.config.self_reconstruction_mode:
+            # Compare first frame of reference with first frame of target video
+            ref_first = ref_latents[:, :, 0:1, :, :]
+            tgt_first = target_latents[:, :, 0:1, :, :]
+            mean_diff = (ref_first - tgt_first).abs().mean().item()
+            assert mean_diff > 0.1, (
+                f"CRITICAL ERROR: Reference and target latents are nearly identical (diff={mean_diff:.4f})! "
+                f"This trains identity mapping, not transfer. "
+                f"Ensure your dataset has DIFFERENT videos for reference and target, "
+                f"OR enable self_reconstruction_mode in config if intentional. "
+                f"See AGENTS.md: 'NEVER USE THE SAME VIDEO FOR BOTH REFERENCE AND TARGET!'"
+            )
+
         # I2V mode: Extract first-frame latents for conditioning
         first_frame_latent = None
         if self.config.i2v_mode and "first_frame_latents" in batch:
@@ -815,6 +1059,11 @@ class OmniTransferStrategy(TrainingStrategy):
             if not hasattr(self, '_logged_i2v_shape'):
                 logger.info(f"I2V mode: Using first_frame_latent shape {first_frame_latent.shape}")
                 self._logged_i2v_shape = True
+
+        # Apply data augmentations (Grok: critical for small datasets)
+        target_latents, ref_latents, first_frame_latent = self._apply_augmentations(
+            target_latents, ref_latents, first_frame_latent
+        )
 
         # Get dimensions
         num_frames = latents_info["num_frames"][0].item()
@@ -857,22 +1106,66 @@ class OmniTransferStrategy(TrainingStrategy):
         if self.config.multi_task_mode:
             self.config._task_step_counter += 1  # Increment for round-robin
 
+        # Per paper Table 1: Determine if this task uses I2V (image+motion) or T2V (prompt only)
+        # - Temporal Transfer (I2V): Motion, Camera, Effect → V_ref + Image I
+        # - Appearance Transfer (T2V): ID, Style → V_ref + prompt p (NO image)
+        task_uses_i2v = is_temporal_task(current_task)
+        effective_first_frame = first_frame_latent if task_uses_i2v else None
+
+        if not hasattr(self, '_logged_task_mode') or current_task not in self._logged_task_mode:
+            if not hasattr(self, '_logged_task_mode'):
+                self._logged_task_mode = set()
+            mode_str = "I2V (image+motion)" if task_uses_i2v else "T2V (prompt only)"
+            logger.info(f"Task '{current_task}' uses {mode_str} mode")
+            self._logged_task_mode.add(current_task)
+
         # Construct latents using ReferenceLatentConstructor
-        # In I2V mode, pass the explicit first_frame_latent for conditioning
+        # In I2V mode (temporal tasks), pass explicit first_frame_latent for conditioning
+        # In T2V mode (appearance tasks), first_frame is None - prompt drives generation
         constructed = self._latent_constructor.construct(
             ref_video_latent=ref_latents,
             tgt_video_latent=target_latents,
             task=current_task,
             noise=noise,
             sigma=sigmas,
-            first_frame_conditioning=True,
-            first_frame_conditioning_prob=self.config.first_frame_conditioning_p,
-            first_frame_latent=first_frame_latent,  # None in standard mode, explicit in I2V mode
+            first_frame_conditioning=task_uses_i2v,  # Only condition on first frame for temporal tasks
+            first_frame_conditioning_prob=self.config.first_frame_conditioning_p if task_uses_i2v else 0.0,
+            first_frame_latent=effective_first_frame,
         )
 
         # Patchify latents: [B, C, F, H, W] -> [B, seq_len, C]
         ref_latents_patched = self._video_patchifier.patchify(constructed.ref_latent)
         tgt_latents_patched = self._video_patchifier.patchify(constructed.tgt_latent)
+
+        # =====================================================================
+        # Dynamic Identity Anchoring via Concept Embeddings (Movie Weaver CVPR 2025)
+        # =====================================================================
+        # Add the SAME concept embedding to ALL tokens from the reference video.
+        # This creates explicit "identity grouping" - the model knows that all
+        # these tokens represent the same identity/concept, enabling better
+        # cross-temporal and multi-angle identity distillation.
+        #
+        # Key insight from Movie Weaver: "We apply the same concept embedding to
+        # the entire set of vision tokens from one image" (98.2% vs 90.5% accuracy)
+        # =====================================================================
+        if self._concept_embedding is not None:
+            # Get the OmniTransferTask enum for task-specific embeddings
+            task_enum = self._get_task_enum(current_task)
+            # Apply same embedding to ALL reference tokens
+            ref_latents_patched = self._concept_embedding(
+                ref_latents_patched,
+                concept_index=0,  # Slot 0 for single-reference training
+                task=task_enum,
+            )
+            # Log once per task type
+            if not hasattr(self, '_logged_concept_emb') or current_task not in self._logged_concept_emb:
+                if not hasattr(self, '_logged_concept_emb'):
+                    self._logged_concept_emb = set()
+                logger.info(
+                    f"Applied concept embedding for identity anchoring: "
+                    f"task={current_task}, ref_tokens={ref_latents_patched.shape[1]}"
+                )
+                self._logged_concept_emb.add(current_task)
 
         ref_seq_len = ref_latents_patched.shape[1]
         tgt_seq_len = tgt_latents_patched.shape[1]
@@ -887,13 +1180,16 @@ class OmniTransferStrategy(TrainingStrategy):
         )
 
         # Create target conditioning mask (first frame if applicable)
+        # For T2V tasks (ID, Style), no first-frame conditioning - prompt drives generation
+        # For I2V tasks (Motion, Camera, Effect), use first-frame conditioning
+        effective_ff_prob = self.config.first_frame_conditioning_p if task_uses_i2v else 0.0
         target_conditioning_mask = self._create_first_frame_conditioning_mask(
             batch_size=batch_size,
             sequence_length=tgt_seq_len,
             height=height,
             width=width,
             device=device,
-            first_frame_conditioning_p=self.config.first_frame_conditioning_p,
+            first_frame_conditioning_p=effective_ff_prob,
         )
 
         tgt_timesteps = self._create_per_token_timesteps(
@@ -989,6 +1285,8 @@ class OmniTransferStrategy(TrainingStrategy):
             tgt_latent_noisy=constructed.tgt_latent.detach(),
             noise=noise.detach(),
             sigmas=sigmas.detach(),
+            # I2V mode: store first frame latent for 4-panel visualization
+            first_frame_latent_raw=first_frame_latent.detach() if first_frame_latent is not None else None,
             prompts=prompts if isinstance(prompts, list) else [prompts] * batch_size,
         )
 
@@ -1061,23 +1359,31 @@ class OmniTransferStrategy(TrainingStrategy):
             ref_loss = ref_pred.pow(2).mean()
             loss = loss + self.config.ref_preservation_loss_weight * ref_loss
 
+        # Increment step counter
+        self._current_step += 1
+
+        # Compute expensive pixel-space losses periodically for efficiency
+        # Flow matching loss (above) is still computed every step
+        compute_perceptual = (self._current_step % self.config.perceptual_loss_interval == 0)
+
         # Optional LPIPS perceptual loss
-        if self.config.lpips_weight > 0 and LPIPS_AVAILABLE:
+        if compute_perceptual and self.config.lpips_weight > 0 and LPIPS_AVAILABLE:
             lpips_loss = self._compute_lpips_loss(target_pred, inputs)
             if lpips_loss is not None:
-                loss = loss + self.config.lpips_weight * lpips_loss
+                # Scale up to compensate for periodic computation
+                loss = loss + self.config.lpips_weight * lpips_loss * self.config.perceptual_loss_interval
 
         # Optional identity embedding loss (for identity preservation task)
-        if self.config.identity_loss_weight > 0 and self.config.task_type == "identity_preservation":
+        if compute_perceptual and self.config.identity_loss_weight > 0 and self.config.task_type == "identity_preservation":
             identity_loss = self._compute_identity_loss(target_pred, inputs)
             if identity_loss is not None:
-                loss = loss + self.config.identity_loss_weight * identity_loss
+                loss = loss + self.config.identity_loss_weight * identity_loss * self.config.perceptual_loss_interval
 
         # Optional style loss (CRITICAL for style transfer)
-        if self.config.style_loss_weight > 0 and self.config.task_type == "style_transfer":
+        if compute_perceptual and self.config.style_loss_weight > 0 and self.config.task_type == "style_transfer":
             style_loss = self._compute_style_loss(target_pred, inputs)
             if style_loss is not None:
-                loss = loss + self.config.style_loss_weight * style_loss
+                loss = loss + self.config.style_loss_weight * style_loss * self.config.perceptual_loss_interval
 
         return loss
 
@@ -1449,6 +1755,7 @@ class OmniTransferStrategy(TrainingStrategy):
         ref_latents = inputs.ref_latent_raw
         tgt_latents = inputs.tgt_latent_raw
         pred_latents = predicted_clean
+        first_frame_latents = inputs.first_frame_latent_raw  # None if not I2V mode
 
         # Decode to pixel space if VAE decoder provided
         if vae_decoder is not None:
@@ -1456,6 +1763,10 @@ class OmniTransferStrategy(TrainingStrategy):
                 ref_decoded = decode_latents_for_visualization(ref_latents, vae_decoder)
                 tgt_decoded = decode_latents_for_visualization(tgt_latents, vae_decoder)
                 pred_decoded = decode_latents_for_visualization(pred_latents, vae_decoder)
+                # I2V mode: also decode first frame latent for 4-panel visualization
+                first_frame_decoded = None
+                if first_frame_latents is not None:
+                    first_frame_decoded = decode_latents_for_visualization(first_frame_latents, vae_decoder)
         else:
             # Use latents directly (less interpretable but still useful)
             # Normalize for visualization
@@ -1467,6 +1778,7 @@ class OmniTransferStrategy(TrainingStrategy):
             ref_decoded = normalize_latent(ref_latents)
             tgt_decoded = normalize_latent(tgt_latents)
             pred_decoded = normalize_latent(pred_latents)
+            first_frame_decoded = normalize_latent(first_frame_latents) if first_frame_latents is not None else None
 
         # Log batch reconstructions
         num_samples = min(self.config.max_samples_per_log, ref_decoded.shape[0])
@@ -1495,6 +1807,8 @@ class OmniTransferStrategy(TrainingStrategy):
                 task=self.config.task,
                 prompt=prompts[0] if prompts else "",
                 step=step,
+                # I2V mode: include target image for 4-panel visualization
+                target_image=first_frame_decoded[0] if first_frame_decoded is not None else None,
             )
             video_logs = visualizer.log_video_comparison(sample, prefix=prefix)
             log_dict.update(video_logs)

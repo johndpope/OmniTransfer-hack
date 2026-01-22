@@ -156,12 +156,18 @@ class ReferenceLatentConstructor(nn.Module):
         sigma: torch.Tensor | None = None,
         first_frame_conditioning: bool = True,
         first_frame_conditioning_prob: float = 0.1,
+        first_frame_latent: torch.Tensor | None = None,
     ) -> ConstructedLatents:
         """Construct reference and target latents for training.
 
         Quote: "The reference branch adopts a fixed t = 0, meaning it remains
         noise-free throughout the diffusion process. This design ensures that
         the reference information is always clean and reliable." (Section 4.3)
+
+        I2V Mode (pose-free animation):
+        When first_frame_latent is provided, it's used as the conditioning image
+        instead of extracting the first frame from tgt_video_latent. This enables
+        training where a static image is animated with motion from reference video.
 
         Args:
             ref_video_latent: Pre-encoded reference video latent [B, C, F, H, W]
@@ -171,6 +177,7 @@ class ReferenceLatentConstructor(nn.Module):
             sigma: Noise level/timestep for target [B] or [B, 1, 1, 1, 1]
             first_frame_conditioning: Whether to condition on first frame
             first_frame_conditioning_prob: Probability of first frame conditioning
+            first_frame_latent: Explicit first-frame latent for I2V [B, C, 1, H, W]
 
         Returns:
             ConstructedLatents containing all constructed tensors
@@ -199,10 +206,14 @@ class ReferenceLatentConstructor(nn.Module):
         ref_latent = ref_video_latent.clone()
         ref_clean = ref_video_latent.clone()
 
-        # Apply first frame conditioning stochastically
-        apply_first_frame = first_frame_conditioning and (
-            torch.rand(1).item() < first_frame_conditioning_prob
-        )
+        # I2V mode: If explicit first_frame_latent provided, always apply conditioning
+        # Otherwise, apply stochastically based on probability
+        if first_frame_latent is not None:
+            apply_first_frame = True
+        else:
+            apply_first_frame = first_frame_conditioning and (
+                torch.rand(1).item() < first_frame_conditioning_prob
+            )
 
         # Create conditioning mask for target
         tgt_mask = self.create_conditioning_mask(
@@ -234,7 +245,13 @@ class ReferenceLatentConstructor(nn.Module):
 
             # If first frame conditioning, keep first frame clean
             if apply_first_frame:
-                tgt_latent[:, :, 0, :, :] = tgt_video_latent[:, :, 0, :, :]
+                if first_frame_latent is not None:
+                    # I2V mode: Use explicit first-frame latent as conditioning
+                    # first_frame_latent is [B, C, 1, H, W], extract and use
+                    tgt_latent[:, :, 0, :, :] = first_frame_latent[:, :, 0, :, :]
+                else:
+                    # Standard mode: Use first frame from target video
+                    tgt_latent[:, :, 0, :, :] = tgt_video_latent[:, :, 0, :, :]
 
         return ConstructedLatents(
             ref_latent=ref_latent,

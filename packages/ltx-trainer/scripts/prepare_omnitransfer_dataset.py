@@ -380,6 +380,45 @@ def main():
 
     logger.info(f"Found {len(pairs)} video pairs to process")
 
+    # ========================================================================
+    # CRITICAL VALIDATION: Reject same-subject pairs
+    # Training on identical reference/target teaches NOTHING (identity mapping)
+    # See AGENTS.md: "NEVER USE THE SAME VIDEO FOR BOTH REFERENCE AND TARGET!"
+    # ========================================================================
+    same_subject_pairs = []
+    for i, pair in enumerate(pairs):
+        ref_path = pair["reference"]
+        tgt_path = pair["target"]
+
+        # Check if reference and target are the same file
+        if ref_path == tgt_path:
+            same_subject_pairs.append((i, ref_path, tgt_path))
+        # Also warn if stems match (might be same video with different extensions)
+        elif Path(ref_path).stem == Path(tgt_path).stem:
+            logger.warning(
+                f"⚠️  Pair {i}: reference '{ref_path}' and target '{tgt_path}' "
+                f"have identical stems - verify these are DIFFERENT videos!"
+            )
+
+    if same_subject_pairs:
+        error_msg = (
+            f"\n{'='*70}\n"
+            f"🚨 CRITICAL ERROR: Found {len(same_subject_pairs)} same-subject pairs!\n"
+            f"{'='*70}\n\n"
+            f"The following pairs have IDENTICAL reference and target videos:\n"
+        )
+        for idx, ref, tgt in same_subject_pairs:
+            error_msg += f"  Pair {idx}: {ref} == {tgt}\n"
+        error_msg += (
+            f"\nThis will train IDENTITY MAPPING (model learns to output input).\n"
+            f"This is USELESS for transfer learning!\n\n"
+            f"FIX: Ensure reference and target are DIFFERENT videos that share\n"
+            f"the property you want to transfer (motion, style, identity, etc.)\n"
+            f"\nSee AGENTS.md section: 'CRITICAL: Training Data Requirements'\n"
+            f"{'='*70}\n"
+        )
+        raise ValueError(error_msg)
+
     # STAGED PROCESSING to avoid OOM
     # Stage 1: VAE encoding (~5GB VRAM for encoder + ~10GB for video tensors)
     stage1_encode_videos(args, pairs, ref_latents_dir, tgt_latents_dir, dtype)

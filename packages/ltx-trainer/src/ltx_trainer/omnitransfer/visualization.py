@@ -37,10 +37,17 @@ from ltx_trainer.omnitransfer.components import OmniTransferTask
 class ReconstructionSample:
     """Container for a reconstruction sample with all components.
 
+    For I2V mode, we have 4 components:
+    - target_image: Static image to animate [C, 1, H, W] - the INPUT image
+    - reference: Reference video for motion/effect source [C, F, H, W]
+    - target: Ground truth output video [C, F, H, W] - what we want to produce
+    - prediction: Model prediction [C, F, H, W]
+
     Attributes:
         reference: Reference video tensor [C, F, H, W] or [F, H, W, C]
         target: Ground truth target tensor [C, F, H, W] or [F, H, W, C]
         prediction: Model prediction tensor [C, F, H, W] or [F, H, W, C]
+        target_image: Optional target image for I2V mode [C, 1, H, W]
         task: The transfer task type
         prompt: Text prompt used
         step: Training step number
@@ -52,12 +59,18 @@ class ReconstructionSample:
     task: OmniTransferTask
     prompt: str
     step: int
+    target_image: torch.Tensor | None = None  # For I2V mode
     loss: float | None = None
 
-    def to_numpy(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Convert tensors to numpy arrays in [F, H, W, C] format, range [0, 255]."""
+    def to_numpy(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
+        """Convert tensors to numpy arrays in [F, H, W, C] format, range [0, 255].
+
+        Returns:
+            Tuple of (reference, target, prediction, target_image) as numpy arrays.
+            target_image is None if not in I2V mode.
+        """
         def process(t: torch.Tensor) -> np.ndarray:
-            if t.dim() == 4 and t.shape[0] in [1, 3, 4]:
+            if t.dim() == 4 and t.shape[0] in [1, 3, 4, 128]:
                 # [C, F, H, W] -> [F, H, W, C]
                 t = rearrange(t, 'c f h w -> f h w c')
             elif t.dim() == 4 and t.shape[-1] in [1, 3, 4]:
@@ -74,7 +87,11 @@ class ReconstructionSample:
             t = t.clamp(0, 1)
             return (t.cpu().numpy() * 255).astype(np.uint8)
 
-        return process(self.reference), process(self.target), process(self.prediction)
+        target_image_np = None
+        if self.target_image is not None:
+            target_image_np = process(self.target_image)
+
+        return process(self.reference), process(self.target), process(self.prediction), target_image_np
 
 
 class OmniTransferVisualizer:
@@ -172,23 +189,37 @@ class OmniTransferVisualizer:
         target: np.ndarray,
         prediction: np.ndarray,
         frame_idx: int = 0,
+        target_image: np.ndarray | None = None,
     ) -> np.ndarray:
-        """Create a single frame comparison (ref | target | pred).
+        """Create a single frame comparison.
+
+        For I2V mode (4 panels): Target Image | Reference Video | Ground Truth | Prediction
+        For standard mode (3 panels): Reference | Target (GT) | Prediction
 
         Args:
             reference: Reference frames [F, H, W, C]
             target: Target frames [F, H, W, C]
             prediction: Prediction frames [F, H, W, C]
             frame_idx: Which frame to use
+            target_image: Optional target image for I2V mode [F=1, H, W, C]
 
         Returns:
-            Comparison image [H, W*3, C]
+            Comparison image [H, W*N, C] where N=4 for I2V, N=3 for standard
         """
-        ref_frame = self._add_label(reference[frame_idx], "Reference")
-        tgt_frame = self._add_label(target[frame_idx], "Target (GT)")
-        pred_frame = self._add_label(prediction[frame_idx], "Prediction")
-
-        return np.concatenate([ref_frame, tgt_frame, pred_frame], axis=1)
+        if target_image is not None:
+            # I2V mode: 4 panels
+            # Target image is single frame, use frame 0
+            img_frame = self._add_label(target_image[0], "Target Image")
+            ref_frame = self._add_label(reference[frame_idx], "Ref Video")
+            tgt_frame = self._add_label(target[frame_idx], "Ground Truth")
+            pred_frame = self._add_label(prediction[frame_idx], "Prediction")
+            return np.concatenate([img_frame, ref_frame, tgt_frame, pred_frame], axis=1)
+        else:
+            # Standard mode: 3 panels
+            ref_frame = self._add_label(reference[frame_idx], "Reference")
+            tgt_frame = self._add_label(target[frame_idx], "Target (GT)")
+            pred_frame = self._add_label(prediction[frame_idx], "Prediction")
+            return np.concatenate([ref_frame, tgt_frame, pred_frame], axis=1)
 
     def create_difference_map(
         self,
@@ -275,20 +306,23 @@ class OmniTransferVisualizer:
         """Log a reconstruction sample to W&B.
 
         Args:
-            sample: ReconstructionSample containing ref/target/pred
+            sample: ReconstructionSample containing ref/target/pred (and optional target_image for I2V)
             prefix: Prefix for W&B keys (e.g., "train", "val")
 
         Returns:
             Dictionary of logged metrics/images
         """
-        ref_np, tgt_np, pred_np = sample.to_numpy()
+        ref_np, tgt_np, pred_np, target_image_np = sample.to_numpy()
 
-        # Create visualizations
+        # Create visualizations (4-panel for I2V, 3-panel for standard)
         frame_grid = self.create_frame_grid(ref_np, tgt_np, pred_np)
-        single_comparison = self.create_single_frame_comparison(ref_np, tgt_np, pred_np, frame_idx=0)
+        single_comparison = self.create_single_frame_comparison(
+            ref_np, tgt_np, pred_np, frame_idx=0, target_image=target_image_np
+        )
         mid_comparison = self.create_single_frame_comparison(
             ref_np, tgt_np, pred_np,
-            frame_idx=min(ref_np.shape[0] // 2, tgt_np.shape[0] // 2)
+            frame_idx=min(ref_np.shape[0] // 2, tgt_np.shape[0] // 2),
+            target_image=target_image_np
         )
         diff_map = self.create_difference_map(tgt_np, pred_np, frame_idx=0)
 
@@ -615,10 +649,20 @@ def decode_latents_for_visualization(
     batch_size = latents.shape[0]
     decoded = []
 
+    # Get decoder device (from first parameter)
+    decoder_device = next(vae_decoder.parameters()).device
+    original_device = latents.device
+
     with torch.inference_mode():
         for i in range(0, batch_size, chunk_size):
             chunk = latents[i:i + chunk_size]
-            decoded_chunk = vae_decoder.decode(chunk)
+            # Move chunk to decoder's device
+            chunk = chunk.to(decoder_device)
+            # VideoDecoder uses forward(), not decode()
+            # Call the module directly which invokes forward()
+            decoded_chunk = vae_decoder(chunk)
+            # Move back to original device
+            decoded_chunk = decoded_chunk.to(original_device)
             decoded.append(decoded_chunk)
 
     return torch.cat(decoded, dim=0)

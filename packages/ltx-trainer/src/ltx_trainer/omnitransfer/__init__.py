@@ -24,6 +24,9 @@ from ltx_trainer.omnitransfer.components import (
     ReferenceDecoupledCausalLearning,
     TaskAdaptiveMultimodalAlignment,
     MetaQueryBank,
+    # Dynamic Identity Anchoring (Movie Weaver-style concept embeddings)
+    ConceptEmbedding,
+    ConceptEmbeddingConfig,
 )
 from ltx_trainer.omnitransfer.latent_constructor import ReferenceLatentConstructor
 from ltx_trainer.omnitransfer.strategy import (
@@ -74,6 +77,9 @@ __all__ = [
     "ReferenceDecoupledCausalLearning",
     "TaskAdaptiveMultimodalAlignment",
     "MetaQueryBank",
+    # Dynamic Identity Anchoring (Movie Weaver CVPR 2025)
+    "ConceptEmbedding",
+    "ConceptEmbeddingConfig",
     # Latent construction
     "ReferenceLatentConstructor",
     # Strategy

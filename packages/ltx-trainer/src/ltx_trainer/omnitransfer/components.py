@@ -43,6 +43,11 @@ class OmniTransferTask(Enum):
     IDENTITY_PRESERVATION = "identity_preservation"
     SCENE_COMPOSITION = "scene_composition"
 
+    # Movie Weaver task - multi-concept video personalization (CVPR 2025)
+    # Uses anchored prompts with [R1] [R2] tokens and concept embeddings
+    # Supports face+body separation and multi-subject scenarios
+    MOVIE_WEAVER = "movie_weaver"
+
     @property
     def is_temporal(self) -> bool:
         """Whether this is a temporal reference task."""
@@ -55,7 +60,17 @@ class OmniTransferTask(Enum):
     @property
     def is_appearance(self) -> bool:
         """Whether this is an appearance reference task."""
-        return not self.is_temporal
+        return self in {
+            OmniTransferTask.STYLE_TRANSFER,
+            OmniTransferTask.IDENTITY_PRESERVATION,
+            OmniTransferTask.SCENE_COMPOSITION,
+            OmniTransferTask.MOVIE_WEAVER,  # Movie Weaver is appearance-based (identity)
+        }
+
+    @property
+    def is_movie_weaver(self) -> bool:
+        """Whether this is the Movie Weaver multi-concept task."""
+        return self == OmniTransferTask.MOVIE_WEAVER
 
     @property
     def task_flag(self) -> int:
@@ -72,6 +87,8 @@ class OmniTransferTask(Enum):
             return -1
         elif self == OmniTransferTask.IDENTITY_PRESERVATION:
             return -2
+        elif self == OmniTransferTask.MOVIE_WEAVER:
+            return -2  # Movie Weaver is identity-based (multi-concept personalization)
         elif self == OmniTransferTask.STYLE_TRANSFER:
             return -3
         elif self == OmniTransferTask.SCENE_COMPOSITION:
@@ -279,6 +296,227 @@ class TaskAwarePositionalBias(nn.Module):
         k_tgt_rotated = apply_rotary_emb(k_tgt, tgt_freqs_cis, self.rope_type)
 
         return q_ref_rotated, k_ref_rotated, q_tgt_rotated, k_tgt_rotated
+
+
+# =============================================================================
+# Dynamic Identity Anchoring via Concept Embeddings
+# =============================================================================
+# Based on Movie Weaver (CVPR 2025): "Tuning-Free Multi-Concept Video
+# Personalization with Anchored Prompts"
+#
+# Quote: "We introduce concept embeddings, a novel adaptation of positional
+# encoding tailored to multi-concept personalization... Different concept
+# embeddings are added to token sets rather than individual tokens."
+#
+# This creates explicit "grouping" of tokens from the same reference,
+# helping the model know which tokens belong together for identity anchoring.
+# =============================================================================
+
+
+@dataclass
+class ConceptEmbeddingConfig:
+    """Configuration for Concept Embeddings (Dynamic Identity Anchoring).
+
+    Based on Movie Weaver (CVPR 2025) which achieved 98.2% vs 90.5% accuracy
+    in identity separation using concept embeddings vs per-token positional encoding.
+    """
+    # Embedding dimension (should match model hidden dim)
+    embedding_dim: int = 128
+    # Number of concept slots (for multi-concept support)
+    num_concepts: int = 4
+    # Whether to use task-specific embeddings
+    task_specific: bool = True
+    # Whether to learn separate embeddings for different tasks
+    num_task_types: int = 6  # identity, style, motion, camera, effect, etc.
+    # Initialization scale
+    init_scale: float = 0.02
+
+
+class ConceptEmbedding(nn.Module):
+    """Concept Embeddings for Dynamic Identity Anchoring.
+
+    Implements Movie Weaver's approach: add the SAME learnable embedding to ALL
+    tokens from a reference video. This creates an explicit "identity anchor"
+    that helps the model know which tokens belong to the same concept/identity.
+
+    Quote from Movie Weaver: "We apply the same concept embedding to the entire
+    set of vision tokens from one image, rather than different embeddings per token.
+    This achieved 98.2% accuracy in distinguishing two faces, compared to 90.5%
+    with per-token positional encoding."
+
+    For OmniTransfer, this helps with "Dynamic Identity Anchoring" by:
+    1. Marking all reference tokens with same identity embedding
+    2. Allowing cross-temporal coherence (same identity across time)
+    3. Supporting multi-angle identity cues (same identity from different views)
+    """
+
+    def __init__(self, config: ConceptEmbeddingConfig):
+        """Initialize concept embeddings.
+
+        Args:
+            config: Configuration for concept embeddings
+        """
+        super().__init__()
+        self.config = config
+
+        if config.task_specific:
+            # Task-specific concept embeddings [num_tasks, num_concepts, embedding_dim]
+            self.concept_embeddings = nn.Parameter(
+                torch.randn(config.num_task_types, config.num_concepts, config.embedding_dim)
+                * config.init_scale
+            )
+        else:
+            # Shared concept embeddings [num_concepts, embedding_dim]
+            self.concept_embeddings = nn.Parameter(
+                torch.randn(config.num_concepts, config.embedding_dim) * config.init_scale
+            )
+
+        # Optional: learnable scale for blending with original embeddings
+        self.scale = nn.Parameter(torch.ones(1))
+
+    def get_task_index(self, task: "OmniTransferTask") -> int:
+        """Map task type to embedding index."""
+        task_map = {
+            OmniTransferTask.IDENTITY_PRESERVATION: 0,
+            OmniTransferTask.MOVIE_WEAVER: 0,  # Movie Weaver uses same slot as identity
+            OmniTransferTask.STYLE_TRANSFER: 1,
+            OmniTransferTask.MOTION_TRANSFER: 2,
+            OmniTransferTask.POSE_REENACTMENT: 3,
+            OmniTransferTask.ACTION_CUSTOMIZATION: 4,
+            OmniTransferTask.SCENE_COMPOSITION: 5,
+        }
+        return task_map.get(task, 0)
+
+    def forward(
+        self,
+        reference_tokens: torch.Tensor,
+        concept_index: int = 0,
+        task: "OmniTransferTask | None" = None,
+    ) -> torch.Tensor:
+        """Add concept embedding to all reference tokens.
+
+        This is the key operation for Dynamic Identity Anchoring:
+        ALL tokens from the reference get the SAME concept embedding added,
+        creating explicit grouping that helps the model understand
+        "these tokens all represent the same identity/concept."
+
+        Args:
+            reference_tokens: Reference token embeddings [B, seq_len, dim]
+            concept_index: Which concept slot to use (for multi-concept)
+            task: Optional task type for task-specific embeddings
+
+        Returns:
+            Reference tokens with concept embedding added [B, seq_len, dim]
+        """
+        if self.config.task_specific and task is not None:
+            task_idx = self.get_task_index(task)
+            # [embedding_dim]
+            concept_emb = self.concept_embeddings[task_idx, concept_index]
+        else:
+            if self.config.task_specific:
+                # Default to identity preservation if no task specified
+                concept_emb = self.concept_embeddings[0, concept_index]
+            else:
+                concept_emb = self.concept_embeddings[concept_index]
+
+        # Add same embedding to ALL tokens (key insight from Movie Weaver)
+        # [B, seq_len, dim] + [1, 1, dim] -> [B, seq_len, dim]
+        anchored_tokens = reference_tokens + self.scale * concept_emb.unsqueeze(0).unsqueeze(0)
+
+        return anchored_tokens
+
+    def forward_multi_concept(
+        self,
+        reference_tokens_list: list[torch.Tensor],
+        task: "OmniTransferTask | None" = None,
+    ) -> list[torch.Tensor]:
+        """Add different concept embeddings to multiple reference sets.
+
+        For scenarios with multiple reference videos (e.g., multi-subject),
+        each reference gets a different concept embedding to maintain separation.
+
+        Args:
+            reference_tokens_list: List of reference token tensors
+            task: Optional task type for task-specific embeddings
+
+        Returns:
+            List of anchored reference tokens
+        """
+        anchored_list = []
+        for i, ref_tokens in enumerate(reference_tokens_list):
+            concept_idx = i % self.config.num_concepts
+            anchored = self.forward(ref_tokens, concept_index=concept_idx, task=task)
+            anchored_list.append(anchored)
+        return anchored_list
+
+    def forward_movie_weaver(
+        self,
+        reference_tokens_list: list[torch.Tensor],
+        concept_assignments: list[int],
+        task: "OmniTransferTask | None" = None,
+    ) -> list[torch.Tensor]:
+        """Apply Movie Weaver-style concept embeddings with explicit assignments.
+
+        Movie Weaver uses multiple reference images per concept:
+        - [R1]=face + [R2]=body for person 1 → both get Pos₀
+        - [R3]=face + [R4]=body for person 2 → both get Pos₁
+
+        This allows splitting face/body/animal into separate references while
+        maintaining concept identity through shared embeddings.
+
+        Args:
+            reference_tokens_list: List of reference token tensors
+                e.g., [face_tokens_1, body_tokens_1, face_tokens_2, body_tokens_2]
+            concept_assignments: Which concept each reference belongs to
+                e.g., [0, 0, 1, 1] means R1,R2 are concept 0, R3,R4 are concept 1
+            task: Optional task type for task-specific embeddings
+
+        Returns:
+            List of anchored reference tokens (same length as input)
+        """
+        if len(reference_tokens_list) != len(concept_assignments):
+            raise ValueError(
+                f"reference_tokens_list ({len(reference_tokens_list)}) and "
+                f"concept_assignments ({len(concept_assignments)}) must have same length"
+            )
+
+        anchored_list = []
+        for ref_tokens, concept_idx in zip(reference_tokens_list, concept_assignments):
+            anchored = self.forward(ref_tokens, concept_index=concept_idx, task=task)
+            anchored_list.append(anchored)
+        return anchored_list
+
+    def forward_concatenated(
+        self,
+        concatenated_tokens: torch.Tensor,
+        token_boundaries: list[tuple[int, int]],
+        concept_assignments: list[int],
+        task: "OmniTransferTask | None" = None,
+    ) -> torch.Tensor:
+        """Apply concept embeddings to concatenated tokens with boundaries.
+
+        For efficiency, reference tokens are often concatenated. This method
+        applies the correct concept embedding to each segment.
+
+        Args:
+            concatenated_tokens: All reference tokens concatenated [B, total_seq_len, dim]
+            token_boundaries: List of (start, end) indices for each reference
+                e.g., [(0, 100), (100, 200), (200, 300), (300, 400)]
+            concept_assignments: Which concept each segment belongs to
+                e.g., [0, 0, 1, 1] for face+body of person 1, face+body of person 2
+            task: Optional task type for task-specific embeddings
+
+        Returns:
+            Concatenated tokens with concept embeddings applied per segment
+        """
+        result = concatenated_tokens.clone()
+
+        for (start, end), concept_idx in zip(token_boundaries, concept_assignments):
+            segment = concatenated_tokens[:, start:end, :]
+            anchored_segment = self.forward(segment, concept_index=concept_idx, task=task)
+            result[:, start:end, :] = anchored_segment
+
+        return result
 
 
 class ReferenceDecoupledCausalLearning(nn.Module):

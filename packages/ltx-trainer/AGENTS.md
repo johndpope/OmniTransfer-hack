@@ -489,3 +489,53 @@ packages/ltx-core/src/ltx_core/
     ├── single_gpu_model_builder.py  # SingleGPUModelBuilder
     └── sd_ops.py                    # Key remapping (SDOps)
 ```
+
+## Grok MCP Integration
+
+When asking Grok for help with training issues, always provide comprehensive context:
+
+### Required Context for Training Issues
+
+1. **Visual Context** (always include when available):
+   - Debug images showing: Source (style/reference) | Target | Prediction
+   - Loss curves from W&B
+   - Any error screenshots
+
+2. **Configuration Context**:
+   - Task type (identity_preservation, style_transfer, motion_transfer)
+   - Training strategy settings (TPB, RCL, TMA enabled/disabled)
+   - Dataset size and composition
+   - Latent shapes and dimensions
+
+3. **Training State**:
+   - Current step number
+   - Loss values and trends
+   - GPU memory usage
+   - Any error messages
+
+### Example Grok Query Format
+
+```
+I'm training OmniTransfer for [TASK_TYPE] with:
+- Dataset: [N] pairs ([description])
+- Latent shape: [C, F, H, W]
+- Components: TPB=[yes/no], RCL=[yes/no], TMA=[yes/no]
+- Current step: [N], Loss: [value]
+- GPU: [usage]GB
+
+[Include debug image showing: Reference | Target | Prediction]
+
+Question: [specific question about training behavior]
+```
+
+### Debug Image Format for Style Transfer
+
+The debug visualization should show 3 images side-by-side:
+1. **Reference (Style Source)**: The style video to transfer FROM
+2. **Target (Content)**: The video to apply style TO
+3. **Prediction**: Model output showing style applied to target
+
+This helps diagnose:
+- Style extraction quality
+- Identity/content preservation
+- Artifacts or mode collapse

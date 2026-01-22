@@ -1018,8 +1018,8 @@ class LtxvTrainer:
     ) -> None:
         """Save a debug reconstruction image (overwrites each step).
 
-        Creates a simple grid showing latent channels as grayscale.
-        Saves to outputs/debug_recon.png
+        Creates a 3-image grid: Reference | Target | Prediction
+        Saves to outputs/debug_decoded.png
         """
         try:
             from ltx_trainer.omnitransfer.strategy import OmniTransferModelInputs
@@ -1030,6 +1030,8 @@ class LtxvTrainer:
             # Get raw latents
             ref_lat = model_inputs.ref_latent_raw  # [B, C, F, H, W]
             tgt_lat = model_inputs.tgt_latent_raw
+            tgt_noisy = model_inputs.tgt_latent_noisy
+            noise = model_inputs.noise
             sigmas = model_inputs.sigmas  # [B] or [B, 1, ...]
 
             # Get sigma value
@@ -1045,6 +1047,43 @@ class LtxvTrainer:
             ref_vis = ref_lat[0, :3, mid_f, :, :].cpu().float()  # [3, H, W]
             tgt_vis = tgt_lat[0, :3, mid_f, :, :].cpu().float()
 
+            # Reconstruct prediction from velocity prediction
+            # v = noise - clean, so clean = noise - v
+            # But we have noisy = clean + sigma * noise
+            # So pred_clean = noisy - sigma * pred_v (approximately)
+            try:
+                from ltx_core.types import VideoLatentShape
+
+                # Get prediction for target only (skip reference tokens)
+                ref_seq_len = model_inputs.ref_seq_len
+                tgt_pred_patched = video_pred[:, ref_seq_len:, :]  # [B, tgt_seq_len, C]
+
+                # Create proper VideoLatentShape for unpatchify
+                output_shape = VideoLatentShape(
+                    batch=b,
+                    channels=c,
+                    frames=f,
+                    height=h,
+                    width=w
+                )
+
+                # Unpatchify to get back latent shape
+                tgt_pred_latent = self._training_strategy._video_patchifier.unpatchify(
+                    tgt_pred_patched,
+                    output_shape=output_shape
+                )  # [B, C, F, H, W]
+
+                # Reconstruct clean from noisy using velocity
+                # pred_clean = tgt_noisy - sigma * tgt_pred_latent
+                sigma_view = sigmas.view(b, 1, 1, 1, 1)
+                pred_clean = tgt_noisy - sigma_view * tgt_pred_latent
+
+                pred_vis = pred_clean[0, :3, mid_f, :, :].cpu().float()
+            except Exception as e:
+                logger.debug(f"Prediction reconstruction failed: {e}")
+                # Fallback: use noisy target
+                pred_vis = tgt_noisy[0, :3, mid_f, :, :].cpu().float()
+
             # Normalize to [0, 1]
             def norm(x):
                 x = x - x.min()
@@ -1053,11 +1092,12 @@ class LtxvTrainer:
 
             ref_norm = norm(ref_vis)
             tgt_norm = norm(tgt_vis)
+            pred_norm = norm(pred_vis)
 
-            # Create grid: ref | target with sigma annotation
-            grid = torch.cat([ref_norm, tgt_norm], dim=2)  # [3, H, W*2]
+            # Create 3-image grid: ref | target | prediction
+            grid = torch.cat([ref_norm, tgt_norm, pred_norm], dim=2)  # [3, H, W*3]
 
-            # Save with step info in filename
+            # Save latent visualization
             out_path = Path(self._config.output_dir) / "debug_recon.png"
             out_path.parent.mkdir(parents=True, exist_ok=True)
             save_image(grid, out_path)
@@ -1073,12 +1113,22 @@ class LtxvTrainer:
                     # Move VAE to GPU, decode, move back
                     self._vae_decoder = self._vae_decoder.to("cuda")
 
-                    ref_frame_lat = ref_lat[0:1, :, mid_f:mid_f+1, :, :]
-                    tgt_frame_lat = tgt_lat[0:1, :, mid_f:mid_f+1, :, :]
+                    # Get VAE dtype for consistency
+                    vae_dtype = next(self._vae_decoder.parameters()).dtype
+
+                    ref_frame_lat = ref_lat[0:1, :, mid_f:mid_f+1, :, :].to("cuda", dtype=vae_dtype)
+                    tgt_frame_lat = tgt_lat[0:1, :, mid_f:mid_f+1, :, :].to("cuda", dtype=vae_dtype)
+
+                    # Get prediction latent for decoding
+                    try:
+                        pred_frame_lat = pred_clean[0:1, :, mid_f:mid_f+1, :, :].to("cuda", dtype=vae_dtype)
+                    except Exception:
+                        pred_frame_lat = tgt_noisy[0:1, :, mid_f:mid_f+1, :, :].to("cuda", dtype=vae_dtype)
 
                     with torch.inference_mode():
                         ref_decoded = self._vae_decoder(ref_frame_lat)[0, :, 0].cpu()
                         tgt_decoded = self._vae_decoder(tgt_frame_lat)[0, :, 0].cpu()
+                        pred_decoded = self._vae_decoder(pred_frame_lat)[0, :, 0].cpu()
 
                     # Move VAE back to CPU
                     self._vae_decoder = self._vae_decoder.to("cpu")
@@ -1088,7 +1138,12 @@ class LtxvTrainer:
                     def norm_decoded(x):
                         return ((x.float() + 1) / 2).clamp(0, 1)
 
-                    decoded_grid = torch.cat([norm_decoded(ref_decoded), norm_decoded(tgt_decoded)], dim=2)
+                    # Create 3-image decoded grid: Reference | Target | Prediction
+                    decoded_grid = torch.cat([
+                        norm_decoded(ref_decoded),
+                        norm_decoded(tgt_decoded),
+                        norm_decoded(pred_decoded)
+                    ], dim=2)
                     save_image(decoded_grid, Path(self._config.output_dir) / "debug_decoded.png")
                 except Exception as e:
                     logger.debug(f"Decoded frame save failed: {e}")

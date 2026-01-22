@@ -255,6 +255,14 @@ class OmniTransferConfig(TrainingStrategyConfigBase):
         "for face identity, CLIP for general identity.",
     )
 
+    style_loss_weight: float = Field(
+        default=0.0,
+        description="Weight for Gram matrix style loss. Compares style features between "
+        "prediction and reference. Recommended 0.1-1.0 for style transfer tasks. "
+        "This is CRITICAL for style transfer - without it, the model ignores the reference.",
+        ge=0.0,
+    )
+
     # W&B Visualization configuration
     log_reconstructions: bool = Field(
         default=True,
@@ -722,6 +730,12 @@ class OmniTransferStrategy(TrainingStrategy):
             if identity_loss is not None:
                 loss = loss + self.config.identity_loss_weight * identity_loss
 
+        # Optional style loss (CRITICAL for style transfer)
+        if self.config.style_loss_weight > 0 and self.config.task_type == "style_transfer":
+            style_loss = self._compute_style_loss(target_pred, inputs)
+            if style_loss is not None:
+                loss = loss + self.config.style_loss_weight * style_loss
+
         return loss
 
     def _compute_lpips_loss(
@@ -840,6 +854,66 @@ class OmniTransferStrategy(TrainingStrategy):
 
         except Exception as e:
             logger.warning(f"Identity loss computation failed: {e}")
+            return None
+
+    def _compute_style_loss(
+        self,
+        target_pred: Tensor,
+        inputs: OmniTransferModelInputs,
+    ) -> Tensor | None:
+        """Compute Gram matrix style loss between prediction and reference.
+
+        This is CRITICAL for style transfer - without it, the model ignores the
+        reference and just reconstructs the target. The Gram matrix captures
+        feature correlations that represent artistic style (textures, colors,
+        patterns) independent of content structure.
+
+        Args:
+            target_pred: Predicted target latents [B, seq_len, C]
+            inputs: Model inputs containing reference latents
+
+        Returns:
+            Style loss (MSE between Gram matrices) or None if computation fails
+        """
+        try:
+            # Get reference latent (style source)
+            ref_latent = inputs.ref_latent_raw  # [B, C, F, H, W]
+            device = ref_latent.device
+            dtype = ref_latent.dtype
+
+            # Compute predicted clean from velocity
+            # Ensure sigmas is same dtype
+            sigmas = inputs.sigmas.to(dtype=dtype).view(-1, 1, 1)
+            tgt_pred_5d = inputs.tgt_latent_noisy - sigmas * target_pred.view_as(inputs.tgt_latent_noisy)
+
+            # Sample a few frames for efficiency
+            num_frames = ref_latent.shape[2]
+            sample_frames = min(3, num_frames)
+            frame_indices = torch.linspace(0, num_frames - 1, sample_frames, device=device).long()
+
+            # Get sampled frames [B, C, sample_frames, H, W]
+            ref_frames = ref_latent[:, :, frame_indices, :, :].to(dtype=dtype)
+            pred_frames = tgt_pred_5d[:, :, frame_indices, :, :].to(dtype=dtype)
+
+            # Compute Gram matrices for style comparison
+            # Reshape to [B, C, N] where N = F*H*W
+            b, c = ref_frames.shape[:2]
+            ref_flat = ref_frames.reshape(b, c, -1)  # [B, C, N]
+            pred_flat = pred_frames.reshape(b, c, -1)  # [B, C, N]
+
+            # Gram matrix: G = F @ F^T, captures feature correlations
+            # Normalize by number of elements for numerical stability
+            n_elements = float(ref_flat.shape[2])
+            ref_gram = torch.bmm(ref_flat, ref_flat.transpose(1, 2)) / n_elements  # [B, C, C]
+            pred_gram = torch.bmm(pred_flat, pred_flat.transpose(1, 2)) / n_elements  # [B, C, C]
+
+            # Style loss = MSE between Gram matrices (keep same dtype)
+            style_loss = torch.nn.functional.mse_loss(pred_gram, ref_gram)
+
+            return style_loss.to(dtype=dtype)
+
+        except Exception as e:
+            logger.warning(f"Style loss computation failed: {e}")
             return None
 
     def compute_predicted_clean_latent(

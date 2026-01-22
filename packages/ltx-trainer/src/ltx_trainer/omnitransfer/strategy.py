@@ -101,6 +101,31 @@ class OmniTransferConfig(TrainingStrategyConfigBase):
         "action_customization, style_transfer, identity_preservation, scene_composition",
     )
 
+    # Multi-task training configuration
+    multi_task_mode: bool = Field(
+        default=False,
+        description="Enable multi-task training for unified OmniTransfer model. "
+        "When enabled, samples tasks from task_types list each batch.",
+    )
+
+    task_types: list[str] = Field(
+        default=["identity_preservation"],
+        description="List of task types to train on in multi-task mode. "
+        "Each task should have corresponding data in preprocessed_data_root/<task_type>/",
+    )
+
+    task_sampling: str = Field(
+        default="uniform",
+        description="Task sampling strategy: 'uniform' (equal probability), "
+        "'weighted' (use task_weights), 'round_robin' (cycle through tasks)",
+    )
+
+    task_weights: dict[str, float] = Field(
+        default={},
+        description="Optional weights for weighted task sampling. "
+        "Tasks not specified default to 1.0. Example: {'identity_preservation': 2.0}",
+    )
+
     # Component enables
     enable_tpb: bool = Field(
         default=True,
@@ -271,9 +296,16 @@ class OmniTransferConfig(TrainingStrategyConfigBase):
         description="Directory for local reconstruction saves",
     )
 
+    _task_step_counter: int = 0  # For round-robin sampling
+
     @property
     def task(self) -> OmniTransferTask:
         """Get the OmniTransferTask enum from string config."""
+        return self._str_to_task(self.task_type)
+
+    @staticmethod
+    def _str_to_task(task_str: str) -> OmniTransferTask:
+        """Convert task string to OmniTransferTask enum."""
         task_map = {
             "motion_transfer": OmniTransferTask.MOTION_TRANSFER,
             "pose_reenactment": OmniTransferTask.POSE_REENACTMENT,
@@ -282,7 +314,32 @@ class OmniTransferConfig(TrainingStrategyConfigBase):
             "identity_preservation": OmniTransferTask.IDENTITY_PRESERVATION,
             "scene_composition": OmniTransferTask.SCENE_COMPOSITION,
         }
-        return task_map.get(self.task_type, OmniTransferTask.MOTION_TRANSFER)
+        return task_map.get(task_str, OmniTransferTask.MOTION_TRANSFER)
+
+    def sample_task(self) -> OmniTransferTask:
+        """Sample a task for multi-task training.
+
+        Returns the configured task_type if multi_task_mode is False,
+        otherwise samples according to the task_sampling strategy.
+        """
+        import random
+
+        if not self.multi_task_mode or len(self.task_types) <= 1:
+            return self.task
+
+        if self.task_sampling == "round_robin":
+            task_str = self.task_types[self._task_step_counter % len(self.task_types)]
+            # Note: This counter needs to be incremented externally
+            return self._str_to_task(task_str)
+
+        elif self.task_sampling == "weighted":
+            weights = [self.task_weights.get(t, 1.0) for t in self.task_types]
+            task_str = random.choices(self.task_types, weights=weights, k=1)[0]
+            return self._str_to_task(task_str)
+
+        else:  # uniform
+            task_str = random.choice(self.task_types)
+            return self._str_to_task(task_str)
 
 
 @dataclass
@@ -446,11 +503,16 @@ class OmniTransferStrategy(TrainingStrategy):
         sigmas = timestep_sampler.sample(batch_size, seq_length, device=device)
         noise = torch.randn_like(target_latents)
 
+        # Sample task for this batch (uses multi-task sampling if enabled)
+        current_task = self.config.sample_task()
+        if self.config.multi_task_mode:
+            self.config._task_step_counter += 1  # Increment for round-robin
+
         # Construct latents using ReferenceLatentConstructor
         constructed = self._latent_constructor.construct(
             ref_video_latent=ref_latents,
             tgt_video_latent=target_latents,
-            task=self.config.task,
+            task=current_task,
             noise=noise,
             sigma=sigmas,
             first_frame_conditioning=True,
@@ -520,7 +582,7 @@ class OmniTransferStrategy(TrainingStrategy):
         if self._tpb is not None:
             biased_ref_positions = self._tpb.apply_task_bias(
                 ref_positions=ref_positions,
-                task=self.config.task,
+                task=current_task,
                 target_width=width,
                 target_frames=num_frames,
             )
@@ -564,7 +626,7 @@ class OmniTransferStrategy(TrainingStrategy):
             video_loss_mask=video_loss_mask,
             audio_loss_mask=None,
             ref_seq_len=ref_seq_len,
-            task=self.config.task,
+            task=current_task,
             ref_positions=ref_positions,
             tgt_positions=tgt_positions,
             target_width=width,

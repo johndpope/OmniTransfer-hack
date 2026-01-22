@@ -166,7 +166,25 @@ class LtxvTrainer:
                     if is_optimization_step:
                         self._global_step += 1
 
-                    loss = self._training_step(batch)
+                    # Check if we should log reconstructions this step
+                    should_log_recon = (
+                        is_optimization_step
+                        and IS_MAIN_PROCESS
+                        and hasattr(self._training_strategy, "log_reconstructions_to_wandb")
+                        and hasattr(self._training_strategy, "config")
+                        and getattr(self._training_strategy.config, "log_reconstructions", False)
+                        and self._global_step > 0
+                        and self._global_step % getattr(
+                            self._training_strategy.config, "reconstruction_log_interval", 500
+                        ) == 0
+                    )
+
+                    if should_log_recon:
+                        loss, video_pred, model_inputs = self._training_step(batch, return_for_logging=True)
+                    else:
+                        loss = self._training_step(batch)
+                        video_pred, model_inputs = None, None
+
                     self._accelerator.backward(loss)
 
                     if self._accelerator.sync_gradients and cfg.optimization.max_grad_norm > 0:
@@ -238,6 +256,20 @@ class LtxvTrainer:
                             }
                         )
 
+                        # Log reconstructions if this is a logging step
+                        if should_log_recon and video_pred is not None and model_inputs is not None:
+                            try:
+                                recon_metrics = self._training_strategy.log_reconstructions_to_wandb(
+                                    video_pred=video_pred.detach(),
+                                    inputs=model_inputs,
+                                    step=self._global_step,
+                                    vae_decoder=self._vae_decoder,
+                                )
+                                if recon_metrics:
+                                    self._log_metrics(recon_metrics)
+                            except Exception as e:
+                                logger.warning(f"Failed to log reconstructions: {e}")
+
                     # Fallback logging when progress bars are disabled
                     if disable_progress_bars and IS_MAIN_PROCESS and self._global_step % 20 == 0:
                         elapsed = time.time() - train_start_time
@@ -305,8 +337,18 @@ class LtxvTrainer:
 
         return saved_path, stats
 
-    def _training_step(self, batch: dict[str, dict[str, Tensor]]) -> Tensor:
-        """Perform a single training step using the configured strategy."""
+    def _training_step(
+        self, batch: dict[str, dict[str, Tensor]], return_for_logging: bool = False
+    ) -> Tensor | tuple[Tensor, Tensor, Any]:
+        """Perform a single training step using the configured strategy.
+
+        Args:
+            batch: Training batch
+            return_for_logging: If True, also return predictions and inputs for logging
+
+        Returns:
+            Loss tensor, or (loss, video_pred, model_inputs) if return_for_logging=True
+        """
         # Apply embedding connectors to transform pre-computed text embeddings
         conditions = batch["conditions"]
         video_embeds, audio_embeds, attention_mask = self._text_encoder._run_connectors(
@@ -329,6 +371,8 @@ class LtxvTrainer:
         # Use strategy to compute loss
         loss = self._training_strategy.compute_loss(video_pred, audio_pred, model_inputs)
 
+        if return_for_logging:
+            return loss, video_pred, model_inputs
         return loss
 
     @free_gpu_memory_context(after=True)

@@ -429,6 +429,10 @@ Training video models requires significant GPU compute. If you find this work us
 
 **Send Vast.ai credits to:** `jp@bellgeorge.com`
 
+```bash
+vastai transfer credit jp@bellgeorge.com <AMOUNT>
+```
+
 | Tier | Suggested Amount | What It Helps With |
 |------|------------------|-------------------|
 | **Buy Me a Coffee** | $5-10 | Quick experiments, bug fixes |

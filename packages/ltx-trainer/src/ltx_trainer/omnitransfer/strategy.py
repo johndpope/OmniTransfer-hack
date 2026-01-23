@@ -721,7 +721,7 @@ class OmniTransferStrategy(TrainingStrategy):
 
             self._tma = TaskAdaptiveMultimodalAlignment(
                 mllm_hidden_dim=config.tma_mllm_hidden_dim,
-                output_dim=4096,  # LTX-2 cross-attention dimension
+                output_dim=3840,  # Match Gemma dimension - model does final projection
                 num_connector_layers=config.tma_connector_layers,
                 num_queries_per_task=config.tma_num_queries,
                 dropout=0.1,
@@ -1293,6 +1293,12 @@ class OmniTransferStrategy(TrainingStrategy):
                     self._tma_task_to_idx.get(t, 0) for t in task_types
                 ], device=device)
 
+                # Ensure TMA module is on the correct device (do this once)
+                if not hasattr(self, '_tma_device_set'):
+                    self._tma.to(device=device, dtype=dtype)
+                    self._tma_device_set = True
+                    logger.info(f"TMA module moved to {device} with dtype {dtype}")
+
                 # Run TMA forward: MetaQuery cross-attention + Connector MLP
                 # Output: [B, num_queries, output_dim=4096]
                 tma_context = self._tma(qwen_features, task_indices)
@@ -1310,7 +1316,9 @@ class OmniTransferStrategy(TrainingStrategy):
 
         # If TMA context available, prepend to prompt embeddings for cross-attention
         if tma_context is not None:
-            # Prepend TMA context: [B, tma_len, 4096] + [B, prompt_len, 4096]
+            # TMA outputs at 3840 dim to match Gemma embeddings
+            # Model's caption_projection will project both together to 4096
+            # Prepend TMA context: [B, tma_len, 3840] + [B, prompt_len, 3840]
             prompt_embeds = torch.cat([tma_context, prompt_embeds], dim=1)
 
             # Update attention mask: [B, tma_len + prompt_len]
@@ -1338,7 +1346,8 @@ class OmniTransferStrategy(TrainingStrategy):
         # Per paper Table 1: Determine if this task uses I2V (image+motion) or T2V (prompt only)
         # - Temporal Transfer (I2V): Motion, Camera, Effect → V_ref + Image I
         # - Appearance Transfer (T2V): ID, Style → V_ref + prompt p (NO image)
-        task_uses_i2v = is_temporal_task(current_task)
+        # Note: current_task is an OmniTransferTask enum, use .value to get string
+        task_uses_i2v = is_temporal_task(current_task.value)
         effective_first_frame = first_frame_latent if task_uses_i2v else None
 
         if not hasattr(self, '_logged_task_mode') or current_task not in self._logged_task_mode:
@@ -1378,8 +1387,14 @@ class OmniTransferStrategy(TrainingStrategy):
         # the entire set of vision tokens from one image" (98.2% vs 90.5% accuracy)
         # =====================================================================
         if self._concept_embedding is not None:
-            # Get the OmniTransferTask enum for task-specific embeddings
-            task_enum = self._get_task_enum(current_task)
+            # Move ConceptEmbedding to device (once)
+            if not hasattr(self, '_concept_emb_device_set'):
+                self._concept_embedding.to(device=device, dtype=dtype)
+                self._concept_emb_device_set = True
+                logger.info(f"ConceptEmbedding moved to {device}")
+
+            # current_task is already an OmniTransferTask enum from sample_task()
+            task_enum = current_task
             # Apply same embedding to ALL reference tokens
             ref_latents_patched = self._concept_embedding(
                 ref_latents_patched,

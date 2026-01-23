@@ -231,6 +231,10 @@ class PrecomputedDataset(Dataset):
                 if "latent" in dir_name.lower():
                     data = self._normalize_video_latents(data)
 
+                # Normalize Qwen VL features for TMA
+                if "qwen_vl" in dir_name.lower() or "qwen_vl" in output_key.lower():
+                    data = self._normalize_qwen_features(data)
+
                 result[output_key] = data
             except Exception as e:
                 raise RuntimeError(f"Failed to load {output_key} from {file_path}: {e}") from e
@@ -266,5 +270,37 @@ class PrecomputedDataset(Dataset):
             # Update the data dict with unpatchified latents
             data = data.copy()
             data["latents"] = latents
+
+        return data
+
+    @staticmethod
+    def _normalize_qwen_features(data: dict) -> dict:
+        """
+        Normalize Qwen VL features for TMA (Task-adaptive Multimodal Alignment).
+
+        The data should contain:
+        - qwen_features: [seq_len, hidden_dim] - MLLM hidden states
+        - task_type: str - Transfer task type
+        - caption: str - Video caption
+        - num_ref_frames: int - Number of reference frames used
+        - model_name: str - Qwen VL model used
+        - hidden_dim: int - Hidden dimension
+
+        This method ensures consistent tensor formatting and adds metadata validation.
+        """
+        # Ensure qwen_features is a tensor with correct dimensions
+        if "qwen_features" in data:
+            features = data["qwen_features"]
+            if features.dim() == 1:
+                # Single token, add sequence dimension
+                data = data.copy()
+                data["qwen_features"] = features.unsqueeze(0)
+            elif features.dim() > 2:
+                # Unexpected shape, flatten extra dimensions
+                logger.warning(
+                    f"Unexpected qwen_features shape: {features.shape}, flattening to 2D"
+                )
+                data = data.copy()
+                data["qwen_features"] = features.view(-1, features.shape[-1])
 
         return data

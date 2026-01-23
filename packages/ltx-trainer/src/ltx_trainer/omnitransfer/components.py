@@ -723,18 +723,42 @@ class MetaQueryBank(nn.Module):
         idx = self._task_to_idx.get(task, 0)
         return self.meta_queries[idx]
 
-    def forward(self, task: OmniTransferTask, batch_size: int) -> torch.Tensor:
+    def get_queries_by_index(self, task_indices: torch.Tensor) -> torch.Tensor:
+        """Get MetaQueries for batch of tasks specified by indices.
+
+        This allows per-sample task types in a batch, useful for cached TMA features
+        where different samples might have different task types.
+
+        Args:
+            task_indices: Tensor of task indices [B]
+
+        Returns:
+            MetaQueries tensor [B, num_queries_per_task, query_dim]
+        """
+        # Index into meta_queries using task indices
+        # meta_queries: [num_tasks, num_queries_per_task, query_dim]
+        # task_indices: [B]
+        # Output: [B, num_queries_per_task, query_dim]
+        return self.meta_queries[task_indices]
+
+    def forward(self, task: OmniTransferTask | torch.Tensor, batch_size: int = 1) -> torch.Tensor:
         """Get batched MetaQueries for a task.
 
         Args:
-            task: The transfer task type
-            batch_size: Batch size
+            task: Either an OmniTransferTask enum (same task for all samples)
+                  or a tensor of task indices [B] (per-sample tasks)
+            batch_size: Batch size (used when task is an enum)
 
         Returns:
             MetaQueries tensor [batch_size, num_queries_per_task, query_dim]
         """
-        queries = self.get_queries(task)
-        return queries.unsqueeze(0).expand(batch_size, -1, -1)
+        if isinstance(task, torch.Tensor):
+            # Per-sample task indices
+            return self.get_queries_by_index(task)
+        else:
+            # Single task for entire batch
+            queries = self.get_queries(task)
+            return queries.unsqueeze(0).expand(batch_size, -1, -1)
 
 
 class TaskAdaptiveMultimodalAlignment(nn.Module):
@@ -807,7 +831,7 @@ class TaskAdaptiveMultimodalAlignment(nn.Module):
     def forward(
         self,
         mllm_features: torch.Tensor,
-        task: OmniTransferTask,
+        task: OmniTransferTask | torch.Tensor,
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Compute task-adaptive aligned features.
@@ -819,7 +843,8 @@ class TaskAdaptiveMultimodalAlignment(nn.Module):
 
         Args:
             mllm_features: MLLM output features [B, seq_len, mllm_hidden_dim]
-            task: The transfer task type
+            task: Either an OmniTransferTask enum (same task for all samples)
+                  or a tensor of task indices [B] (per-sample tasks from cached features)
             attention_mask: Optional attention mask [B, seq_len]
 
         Returns:
@@ -831,6 +856,7 @@ class TaskAdaptiveMultimodalAlignment(nn.Module):
         mllm_features = self.input_norm(mllm_features)
 
         # Get task-specific MetaQueries
+        # MetaQueryBank handles both enum and tensor inputs
         meta_queries = self.meta_query_bank(task, batch_size)
 
         # Aggregate MLLM features using MetaQueries through cross-attention

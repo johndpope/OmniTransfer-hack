@@ -274,6 +274,52 @@ class OmniTransferConfig(TrainingStrategyConfigBase):
         "Quote: 'projected through a three-layer MLP connector' (Section 4.4)",
     )
 
+    # ==========================================================================
+    # Cached TMA Features (for VRAM-efficient training)
+    # ==========================================================================
+    # Pre-compute Qwen VL features to avoid loading the ~14GB MLLM during training.
+    # Run scripts/compute_qwen_vl_features.py first to generate the cached features.
+    # ==========================================================================
+
+    use_cached_tma_features: bool = Field(
+        default=False,
+        description="Use pre-computed Qwen VL features from qwen_vl_features/. "
+        "When True, skips loading Qwen VL model entirely, saving ~14GB VRAM. "
+        "Requires running scripts/compute_qwen_vl_features.py first.",
+    )
+
+    tma_features_dir: str = Field(
+        default="qwen_vl_features",
+        description="Directory name for cached TMA features (relative to preprocessed_data_root). "
+        "Each file should contain: qwen_features [seq_len, hidden_dim], task_type, caption.",
+    )
+
+    tma_mllm_hidden_dim: int = Field(
+        default=3584,
+        description="Hidden dimension of the MLLM used for TMA features. "
+        "Qwen 2B: 1536, Qwen2.5-3B: 2048, Qwen 7B: 3584, Qwen 14B/32B: 5120, Qwen 72B: 8192. "
+        "Must match the model used in compute_qwen_vl_features.py.",
+    )
+
+    # ==========================================================================
+    # 3-Stage Training (per OmniTransfer paper Section 5.1)
+    # ==========================================================================
+    # Quote: "The training process is divided into three sequential stages:
+    # Stage 1: Train DiT blocks with TPB and RCL for 10,000 steps
+    # Stage 2: Freeze DiT blocks and train only TMA connector for 2,000 steps
+    # Stage 3: Jointly fine-tune all components for 5,000 steps"
+    # ==========================================================================
+
+    training_stage: int = Field(
+        default=1,
+        description="Training stage (1-3). "
+        "Stage 1: Train DiT + TPB + RCL (10k steps, TMA disabled). "
+        "Stage 2: Freeze DiT, train TMA connector only (2k steps). "
+        "Stage 3: Joint fine-tuning of all components (5k steps).",
+        ge=1,
+        le=3,
+    )
+
     # MetaQuery MLLM configuration (Facebook Research integration)
     use_metaquery_mllm: bool = Field(
         default=False,
@@ -647,11 +693,66 @@ class OmniTransferStrategy(TrainingStrategy):
         else:
             self._concept_embedding = None
 
+        # ==========================================================================
+        # Initialize TMA (Task-adaptive Multimodal Alignment) for Stages 2 and 3
+        # ==========================================================================
+        # TMA uses pre-computed Qwen VL features and a connector MLP to inject
+        # semantic guidance into the target branch's cross-attention.
+        # Stage 1: TMA disabled (train DiT + TPB + RCL only)
+        # Stage 2: TMA enabled, freeze DiT, train connector only
+        # Stage 3: TMA enabled, joint fine-tuning of all components
+        # ==========================================================================
+        self._tma = None
+        self._tma_features_dir = None
+
+        if config.enable_tma and config.training_stage >= 2:
+            from ltx_trainer.omnitransfer.components import TaskAdaptiveMultimodalAlignment
+
+            # Task type mapping for MetaQuery bank
+            # These must match the task types used in the dataset
+            task_types = [
+                "motion_transfer",
+                "pose_reenactment",
+                "action_customization",
+                "style_transfer",
+                "identity_preservation",
+                "scene_composition",
+            ]
+
+            self._tma = TaskAdaptiveMultimodalAlignment(
+                mllm_hidden_dim=config.tma_mllm_hidden_dim,
+                output_dim=4096,  # LTX-2 cross-attention dimension
+                num_connector_layers=config.tma_connector_layers,
+                num_queries_per_task=config.tma_num_queries,
+                dropout=0.1,
+            )
+
+            # Build task type to index mapping for runtime lookup
+            self._tma_task_to_idx = {t: i for i, t in enumerate(task_types)}
+
+            if config.use_cached_tma_features:
+                logger.info(
+                    f"TMA enabled with cached features (stage {config.training_stage}): "
+                    f"hidden_dim={config.tma_mllm_hidden_dim}, "
+                    f"num_queries={config.tma_num_queries}"
+                )
+            else:
+                logger.info(
+                    f"TMA enabled (stage {config.training_stage}): will compute features online"
+                )
+        elif config.enable_tma:
+            logger.info(
+                f"TMA configured but disabled for stage {config.training_stage} "
+                "(TMA only used in stages 2-3)"
+            )
+
         # Log I2V mode if enabled
         i2v_status = "I2V=True (pose-free animation)" if config.i2v_mode else "I2V=False"
+        stage_info = f"Stage={config.training_stage}"
         logger.info(
             f"Initialized OmniTransfer strategy: task={config.task_type}, "
-            f"TPB={config.enable_tpb}, RCL={config.enable_rcl}, TMA={config.enable_tma}, {i2v_status}"
+            f"TPB={config.enable_tpb}, RCL={config.enable_rcl}, TMA={config.enable_tma}, "
+            f"{stage_info}, {i2v_status}"
         )
 
         # VAE decoder for Grok-recommended pixel-space losses
@@ -680,6 +781,70 @@ class OmniTransferStrategy(TrainingStrategy):
         """
         self._vae_decoder = vae_decoder
         logger.info("VAE decoder set for pixel-space loss computation (Grok recommended)")
+
+    def get_trainable_parameters(self) -> list:
+        """Get trainable parameters for OmniTransfer components based on training stage.
+
+        This method returns parameters that should be trained according to the
+        3-stage training protocol from the OmniTransfer paper (Section 5.1):
+
+        Stage 1: Train DiT + TPB + RCL (ConceptEmbedding)
+            - LoRA parameters (from trainer)
+            - TPB parameters (positional bias)
+            - ConceptEmbedding parameters (identity anchoring)
+            - TMA is NOT trained
+
+        Stage 2: Freeze DiT, train TMA connector only
+            - TMA connector MLP parameters only
+            - MetaQueries are frozen (learned task-specific queries)
+
+        Stage 3: Joint fine-tuning of all components
+            - All parameters from stages 1 + 2
+
+        Returns:
+            List of trainable parameter groups for the optimizer
+        """
+        params = []
+        stage = self.config.training_stage
+
+        # Stage 1 and 3: TPB parameters
+        if stage in [1, 3] and self._tpb is not None:
+            tpb_params = list(self._tpb.parameters())
+            if tpb_params:
+                params.extend(tpb_params)
+                logger.debug(f"Added {len(tpb_params)} TPB parameters")
+
+        # Stage 1 and 3: ConceptEmbedding parameters
+        if stage in [1, 3] and self._concept_embedding is not None:
+            ce_params = list(self._concept_embedding.parameters())
+            if ce_params:
+                params.extend(ce_params)
+                logger.debug(f"Added {len(ce_params)} ConceptEmbedding parameters")
+
+        # Stage 2: TMA connector only (not MetaQueries)
+        # Stage 3: All TMA parameters
+        if self._tma is not None:
+            if stage == 2:
+                # Only connector MLP parameters
+                connector_params = list(self._tma.connector.parameters())
+                if connector_params:
+                    params.extend(connector_params)
+                    logger.debug(f"Added {len(connector_params)} TMA connector parameters (stage 2)")
+            elif stage == 3:
+                # All TMA parameters including MetaQueries
+                tma_params = list(self._tma.parameters())
+                if tma_params:
+                    params.extend(tma_params)
+                    logger.debug(f"Added {len(tma_params)} TMA parameters (stage 3)")
+
+        total_params = sum(p.numel() for p in params)
+        logger.info(
+            f"OmniTransfer trainable params (stage {stage}): {total_params:,} "
+            f"(TPB: {self._tpb is not None}, CE: {self._concept_embedding is not None}, "
+            f"TMA: {self._tma is not None})"
+        )
+
+        return params
 
     def _get_task_enum(self, task_str: str) -> OmniTransferTask:
         """Convert task string to OmniTransferTask enum.
@@ -926,6 +1091,7 @@ class OmniTransferStrategy(TrainingStrategy):
         """OmniTransfer requires latents, conditions, and reference latents.
 
         In I2V mode, also requires first_frame_latents for static image conditioning.
+        With TMA enabled (stages 2-3), requires qwen_vl_features for semantic guidance.
 
         Returns:
             Dictionary mapping data directory names to output keys
@@ -939,6 +1105,10 @@ class OmniTransferStrategy(TrainingStrategy):
         # I2V mode requires first-frame latents for static image conditioning
         if self.config.i2v_mode:
             sources[self.config.first_frame_latents_dir] = "first_frame_latents"
+
+        # TMA requires pre-computed Qwen VL features (stages 2-3)
+        if self.config.enable_tma and self.config.use_cached_tma_features and self.config.training_stage >= 2:
+            sources[self.config.tma_features_dir] = "qwen_vl_features"
 
         return sources
 
@@ -1090,6 +1260,59 @@ class OmniTransferStrategy(TrainingStrategy):
         batch_size = target_latents.shape[0]
         device = target_latents.device
         dtype = target_latents.dtype
+
+        # ==========================================================================
+        # Process TMA (Task-adaptive Multimodal Alignment) features if available
+        # ==========================================================================
+        # TMA injects semantic guidance from Qwen VL into the cross-attention context.
+        # The features are pre-computed via scripts/compute_qwen_vl_features.py
+        # and processed through the TMA connector to match DiT's hidden dimension.
+        # ==========================================================================
+        tma_context = None
+        if self._tma is not None and "qwen_vl_features" in batch:
+            try:
+                # Load cached Qwen VL features [B, seq_len, mllm_dim]
+                qwen_data = batch["qwen_vl_features"]
+                qwen_features = qwen_data["qwen_features"].to(device=device, dtype=dtype)
+
+                # Get task indices for MetaQuery lookup
+                task_types = qwen_data.get("task_type", [self.config.task_type] * batch_size)
+                if isinstance(task_types, str):
+                    task_types = [task_types] * batch_size
+                elif hasattr(task_types, 'tolist'):
+                    task_types = task_types.tolist()
+
+                # Map task strings to indices
+                task_indices = torch.tensor([
+                    self._tma_task_to_idx.get(t, 0) for t in task_types
+                ], device=device)
+
+                # Run TMA forward: MetaQuery cross-attention + Connector MLP
+                # Output: [B, num_queries, output_dim=4096]
+                tma_context = self._tma(qwen_features, task_indices)
+
+                if not hasattr(self, '_logged_tma_shape'):
+                    logger.info(
+                        f"TMA context computed: {tma_context.shape} "
+                        f"(prepended to prompt_embeds for cross-attention)"
+                    )
+                    self._logged_tma_shape = True
+
+            except Exception as e:
+                logger.warning(f"TMA feature processing failed: {e}")
+                tma_context = None
+
+        # If TMA context available, prepend to prompt embeddings for cross-attention
+        if tma_context is not None:
+            # Prepend TMA context: [B, tma_len, 4096] + [B, prompt_len, 4096]
+            prompt_embeds = torch.cat([tma_context, prompt_embeds], dim=1)
+
+            # Update attention mask: [B, tma_len + prompt_len]
+            tma_mask = torch.ones(
+                batch_size, tma_context.shape[1],
+                dtype=prompt_attention_mask.dtype, device=device
+            )
+            prompt_attention_mask = torch.cat([tma_mask, prompt_attention_mask], dim=1)
 
         # Sample timestep/sigma for target
         # Reference uses fixed t=0 per RCL design
@@ -1278,7 +1501,8 @@ class OmniTransferStrategy(TrainingStrategy):
             tgt_positions=tgt_positions,
             target_width=width,
             target_frames=num_frames,
-            tma_features=None,  # TMA features computed in model forward
+            # TMA context is already prepended to prompt_embeds in the Modality
+            tma_features=tma_context.detach() if tma_context is not None else None,
             # Store raw latents for W&B reconstruction visualization
             ref_latent_raw=constructed.ref_latent.detach(),
             tgt_latent_raw=constructed.tgt_clean.detach(),

@@ -191,6 +191,18 @@ class DataConfig(ConfigBaseModel):
         ge=0,
     )
 
+    use_cached_final_embeddings: bool = Field(
+        default=False,
+        description="Use pre-computed final embeddings (post-connector) from conditions_final/. "
+        "When True, skips loading text encoder entirely, saving ~28GB VRAM. "
+        "Requires running compute_final_embeddings.py first.",
+    )
+
+    final_embeddings_dir: str = Field(
+        default="conditions_final",
+        description="Directory name for cached final embeddings (relative to preprocessed_data_root)",
+    )
+
 
 class ValidationConfig(ConfigBaseModel):
     """Configuration for validation during training"""

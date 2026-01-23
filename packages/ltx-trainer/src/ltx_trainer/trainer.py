@@ -81,7 +81,23 @@ class LtxvTrainer:
         if IS_MAIN_PROCESS:
             print_config(trainer_config)
         self._training_strategy = get_training_strategy(self._config.training_strategy)
-        self._cached_validation_embeddings = self._load_text_encoder_and_cache_embeddings()
+
+        # Check if using cached final embeddings (skip loading text encoder entirely)
+        self._use_cached_final_embeddings = self._config.data.use_cached_final_embeddings
+        if self._use_cached_final_embeddings:
+            logger.info("🚀 Using cached final embeddings - skipping text encoder load (~28GB VRAM saved)")
+            self._text_encoder = None
+            self._cached_validation_embeddings = None
+            # Warn if validation is configured - it won't work without text encoder
+            if self._config.validation.prompts and self._config.validation.interval:
+                logger.warning(
+                    "⚠️ Validation is configured but text encoder is not loaded. "
+                    "Validation will be SKIPPED. To enable validation with cached embeddings, "
+                    "either set validation.interval to null, or disable use_cached_final_embeddings."
+                )
+        else:
+            self._cached_validation_embeddings = self._load_text_encoder_and_cache_embeddings()
+
         self._load_models()
 
         # [GROK RECOMMENDED] Pass VAE decoder to OmniTransfer strategy for pixel-space losses
@@ -364,14 +380,22 @@ class LtxvTrainer:
         Returns:
             Loss tensor, or (loss, video_pred, model_inputs) if return_for_logging=True
         """
-        # Apply embedding connectors to transform pre-computed text embeddings
         conditions = batch["conditions"]
-        video_embeds, audio_embeds, attention_mask = self._text_encoder._run_connectors(
-            conditions["prompt_embeds"], conditions["prompt_attention_mask"]
-        )
-        conditions["video_prompt_embeds"] = video_embeds
-        conditions["audio_prompt_embeds"] = audio_embeds
-        conditions["prompt_attention_mask"] = attention_mask
+
+        if self._use_cached_final_embeddings:
+            # Use pre-computed final embeddings directly (no connector call needed)
+            # Format from conditions_final/*.pt: video_prompt_embeds, audio_prompt_embeds, prompt_attention_mask
+            # These are already in final form [seq_len, 4096]
+            pass  # conditions already has video_prompt_embeds, audio_prompt_embeds, prompt_attention_mask
+        else:
+            # Apply embedding connectors to transform raw pre-computed text embeddings
+            # Format from conditions/*.pt: prompt_embeds [1024, 3840], prompt_attention_mask [1024]
+            video_embeds, audio_embeds, attention_mask = self._text_encoder._run_connectors(
+                conditions["prompt_embeds"], conditions["prompt_attention_mask"]
+            )
+            conditions["video_prompt_embeds"] = video_embeds
+            conditions["audio_prompt_embeds"] = audio_embeds
+            conditions["prompt_attention_mask"] = attention_mask
 
         # Use strategy to prepare training inputs (returns ModelInputs with Modality objects)
         model_inputs = self._training_strategy.prepare_training_inputs(batch, self._timestep_sampler)
@@ -502,18 +526,68 @@ class LtxvTrainer:
             self._vocoder.requires_grad_(False)
 
     def _collect_trainable_params(self) -> None:
-        """Collect trainable parameters based on training mode."""
+        """Collect trainable parameters based on training mode and stage.
+
+        For OmniTransfer 3-stage training (Section 5.1):
+        - Stage 1: Train DiT (LoRA) + TPB + ConceptEmbedding
+        - Stage 2: Freeze DiT, train TMA connector only
+        - Stage 3: Joint fine-tuning of all components
+        """
+        # Check if this is OmniTransfer with stage-based training
+        training_stage = self._get_omnitransfer_training_stage()
+
         if self._config.model.training_mode == "lora":
             # For LoRA training, first set up LoRA layers
             self._setup_lora()
+
+            # Stage 2: Freeze LoRA parameters (only train TMA)
+            if training_stage == 2:
+                logger.info("Stage 2: Freezing DiT/LoRA parameters (training TMA only)")
+                for param in self._transformer.parameters():
+                    param.requires_grad = False
+
         elif self._config.model.training_mode == "full":
             # For full training, unfreeze all transformer parameters
-            self._transformer.requires_grad_(True)
+            if training_stage == 2:
+                # Stage 2: Freeze transformer (only train TMA)
+                logger.info("Stage 2: Freezing transformer (training TMA only)")
+                self._transformer.requires_grad_(False)
+            else:
+                self._transformer.requires_grad_(True)
         else:
             raise ValueError(f"Unknown training mode: {self._config.model.training_mode}")
 
+        # Collect transformer parameters (if not frozen)
         self._trainable_params = [p for p in self._transformer.parameters() if p.requires_grad]
-        logger.debug(f"Trainable params count: {sum(p.numel() for p in self._trainable_params):,}")
+
+        # Add strategy-specific trainable parameters (TPB, ConceptEmbedding, TMA)
+        strategy_params = self._get_strategy_trainable_params()
+        if strategy_params:
+            self._trainable_params.extend(strategy_params)
+            logger.info(
+                f"Added {len(strategy_params)} strategy parameters "
+                f"({sum(p.numel() for p in strategy_params):,} total)"
+            )
+
+        total_params = sum(p.numel() for p in self._trainable_params)
+        logger.info(f"Total trainable params: {total_params:,} (stage {training_stage or 'N/A'})")
+
+    def _get_omnitransfer_training_stage(self) -> int | None:
+        """Get the OmniTransfer training stage from config, if applicable."""
+        strategy_config = self._config.training_strategy
+        if hasattr(strategy_config, "training_stage"):
+            return strategy_config.training_stage
+        return None
+
+    def _get_strategy_trainable_params(self) -> list:
+        """Get trainable parameters from the training strategy.
+
+        This allows strategies like OmniTransfer to add their own trainable
+        parameters (TPB, ConceptEmbedding, TMA) to the optimizer.
+        """
+        if hasattr(self._training_strategy, "get_trainable_parameters"):
+            return self._training_strategy.get_trainable_parameters()
+        return []
 
     def _init_timestep_sampler(self) -> None:
         """Initialize the timestep sampler based on the config."""
@@ -640,6 +714,22 @@ class LtxvTrainer:
         if self._dataset is None:
             # Get data sources from the training strategy
             data_sources = self._training_strategy.get_data_sources()
+
+            # Override conditions directory if using cached final embeddings
+            if self._use_cached_final_embeddings:
+                final_dir = self._config.data.final_embeddings_dir
+                # Replace 'conditions' with final embeddings directory in data_sources
+                if isinstance(data_sources, dict):
+                    data_sources = {
+                        (final_dir if k == "conditions" else k): v
+                        for k, v in data_sources.items()
+                    }
+                elif isinstance(data_sources, list):
+                    data_sources = [
+                        final_dir if s == "conditions" else s
+                        for s in data_sources
+                    ]
+                logger.info(f"Using cached final embeddings from: {final_dir}/")
 
             self._dataset = PrecomputedDataset(self._config.data.preprocessed_data_root, data_sources=data_sources)
             logger.debug(f"Loaded dataset with {len(self._dataset):,} samples from sources: {list(data_sources)}")
@@ -784,6 +874,11 @@ class LtxvTrainer:
     @free_gpu_memory_context(after=True)
     def _sample_videos(self, progress: TrainingProgress) -> list[Path] | None:
         """Run validation by generating videos from validation prompts."""
+        # Skip validation if using cached final embeddings without cached validation embeddings
+        if self._use_cached_final_embeddings and self._cached_validation_embeddings is None:
+            logger.debug("Skipping validation - no cached validation embeddings available")
+            return None
+
         use_images = self._config.validation.images is not None
         use_reference_videos = self._config.validation.reference_videos is not None
         generate_audio = self._config.validation.generate_audio

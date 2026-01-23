@@ -730,6 +730,12 @@ class OmniTransferStrategy(TrainingStrategy):
             # Build task type to index mapping for runtime lookup
             self._tma_task_to_idx = {t: i for i, t in enumerate(task_types)}
 
+            # Stage 2: Freeze MetaQuery params (only train connector)
+            # This saves memory/compute by not calculating unused gradients
+            if config.training_stage == 2:
+                self._tma.meta_query_bank.requires_grad_(False)
+                logger.info("Stage 2: Froze MetaQueryBank parameters (only training connector)")
+
             if config.use_cached_tma_features:
                 logger.info(
                     f"TMA enabled with cached features (stage {config.training_stage}): "

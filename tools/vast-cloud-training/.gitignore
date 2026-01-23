@@ -17,3 +17,7 @@ terraform.tfvars
 
 # AWS config
 .aws/
+terraform.tfvars
+*.tfvars
+.instance_id
+.terraform

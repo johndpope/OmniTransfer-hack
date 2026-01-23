@@ -41,7 +41,7 @@ variable "aws_secret_access_key" {
 variable "s3_bucket" {
   description = "S3 bucket name for training data and checkpoints"
   type        = string
-  default     = "omnitransfer-training"
+  default     = "imf-infinity-latents"
 }
 
 variable "s3_region" {
@@ -66,8 +66,8 @@ variable "wandb_project" {
 variable "gpu_query" {
   description = "Vast.ai search query for GPU offers"
   type        = string
-  # A100 80GB optimal for OmniTransfer training with INT8 quantization
-  default = "gpu_ram>=80 num_gpus>=1 inet_down>=200 disk_space>=200 reliability>=0.95 rentable=true"
+  # 48GB+ GPUs (RTX A6000, A100 40GB, L40) are cost-effective for OmniTransfer with INT8
+  default = "gpu_ram>=48 num_gpus>=1 inet_down>=100 disk_space>=150 reliability>=0.90 rentable=true dph_total<1.0"
 }
 
 variable "preferred_gpu" {
@@ -104,7 +104,7 @@ variable "image" {
 variable "max_price_per_hour" {
   description = "Maximum price per hour in USD"
   type        = number
-  default     = 2.50
+  default     = 1.00
 }
 
 variable "instance_label" {
@@ -128,7 +128,7 @@ variable "training_steps" {
 variable "max_runtime_hours" {
   description = "Auto-shutdown after X hours (0 to disable)"
   type        = number
-  default     = 24
+  default     = 3
 }
 
 variable "checkpoint_interval" {
@@ -140,7 +140,7 @@ variable "checkpoint_interval" {
 variable "s3_data_prefix" {
   description = "S3 prefix for training data"
   type        = string
-  default     = "processed/omnitransfer_unified_5task"
+  default     = "omnitransfer/training_data"
 }
 
 variable "github_repo" {

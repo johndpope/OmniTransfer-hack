@@ -1,0 +1,134 @@
+# =============================================================================
+# LTX-2 OmniTransfer Stage 1 Configuration - A100 40GB Optimized
+# =============================================================================
+#
+# Stage 1: Train DiT (LoRA) + TPB + ConceptEmbedding
+# Quote: "We train the diffusion model, including the base DiT and concept embedding"
+#
+# This config is OPTIMIZED for A100 40GB:
+# - Batch size 2 with gradient accumulation
+# - No INT8 quantization (full bf16 precision)
+# - VAE decoding enabled for visual monitoring
+# - LPIPS loss enabled for perceptual quality
+#
+# Expected trainable params:
+# - LoRA adapters: ~18M params (rank 32)
+# - TPB: ~24M params
+# - ConceptEmbedding: ~2.5M params
+# - Total: ~44.5M params
+#
+# Estimated VRAM: ~35GB (with VAE decoder for visualization)
+# =============================================================================
+
+model:
+  model_path: "/data/models/ltx-2-19b-dev.safetensors"
+  text_encoder_path: "/data/models/gemma"
+  training_mode: "lora"
+  load_checkpoint: null
+
+lora:
+  rank: 32  # Standard rank for 40GB
+  alpha: 32
+  dropout: 0.0
+  target_modules:
+    - "to_k"
+    - "to_q"
+    - "to_v"
+    - "to_out.0"
+
+training_strategy:
+  name: "omnitransfer"
+
+  # Multi-task mode (all 5 tasks)
+  multi_task_mode: true
+  task_types:
+    - effect
+    - motion
+    - camera
+    - id
+    - style
+  task_sampling: uniform
+  task_type: "style_transfer"
+
+  # ==========================================================================
+  # STAGE 1 SPECIFIC SETTINGS
+  # ==========================================================================
+  training_stage: 1  # Stage 1: Train DiT + TPB + ConceptEmbedding
+
+  # Stage 1 Components: TPB + RCL enabled, TMA disabled
+  enable_tpb: true
+  enable_rcl: true
+  enable_tma: false  # TMA is trained in Stage 2
+  # ==========================================================================
+
+  # I2V mode for website demos
+  i2v_mode: true
+  first_frame_latents_dir: "target_image_latents"
+  reference_latents_dir: "reference_latents"
+  first_frame_conditioning_p: 0.1
+
+  # TPB configuration
+  tpb_max_pos: [20, 2048, 2048]
+  tpb_theta: 10000.0
+
+  # RCL configuration
+  rcl_ref_timestep: 0.0
+
+  # Loss weighting - ENABLE LPIPS for visual quality
+  target_loss_weight: 1.0
+  ref_preservation_loss_weight: 0.1  # Preserve reference
+  min_snr_gamma: 5.0
+  lpips_weight: 0.0  # ENABLED - perceptual loss
+  identity_loss_weight: 0.0
+
+  # Visualization - ENABLED for monitoring
+  log_reconstructions: false
+  reconstruction_log_interval: 250  # Log every 250 steps
+  num_frames_to_visualize: 8
+  log_video_comparisons: false
+  video_log_interval: 1000  # Full video comparison every 1k steps
+
+optimization:
+  learning_rate: 1e-4
+  steps: 10000  # Full training run
+  batch_size: 1  # Moderate batch for 40GB
+  gradient_accumulation_steps: 8  # Effective batch = 8
+  max_grad_norm: 1.0
+  optimizer_type: "adamw"
+  scheduler_type: "cosine"
+  scheduler_params: {}
+  weight_decay: 0.0001
+  enable_gradient_checkpointing: true
+
+acceleration:
+  mixed_precision_mode: "bf16"
+  quantization: "int8-quanto"  # NO quantization - full precision
+  load_text_encoder_in_8bit: false
+
+data:
+  preprocessed_data_root: "/data/omnitransfer_training"
+  use_cached_final_embeddings: true
+  num_dataloader_workers: 4
+
+validation:
+  prompts: []
+  interval: null  # Validate every 2k steps
+
+checkpoints:
+  interval: 500
+  keep_last_n: 5
+
+flow_matching:
+  timestep_sampling_mode: "shifted_logit_normal"
+  timestep_sampling_params: {}
+
+hub:
+  push_to_hub: false
+
+wandb:
+  enabled: false
+  project: "omnitransfer-stage1"
+  tags: ["stage1", "a100-40gb", "tpb", "rcl", "lora", "lpips"]
+
+seed: 42
+output_dir: "/workspace/outputs/ltx2_omnitransfer_stage1_a100"

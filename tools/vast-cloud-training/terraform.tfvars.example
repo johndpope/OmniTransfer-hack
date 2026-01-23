@@ -1,53 +1,33 @@
-# =============================================================================
-# Vast.ai OmniTransfer Training Configuration
-# =============================================================================
-# Copy to terraform.tfvars and fill in your values
-# terraform.tfvars is git-ignored for security
-# =============================================================================
+# Vast.ai OmniTransfer Training - Configuration
+# Copy this to terraform.tfvars and fill in your credentials
+# NEVER commit terraform.tfvars to git!
 
-# Required: Vast.ai API key
-# Get from: https://cloud.vast.ai/cli/
-vast_api_key = "your-vast-api-key-here"
+# Required: Your API keys
+vast_api_key          = "YOUR_VASTAI_API_KEY"
+aws_access_key_id     = "YOUR_AWS_ACCESS_KEY"
+aws_secret_access_key = "YOUR_AWS_SECRET_KEY"
 
-# Required: AWS credentials for S3 (training data + checkpoints)
-aws_access_key_id     = "AKIA..."
-aws_secret_access_key = "your-secret-key"
-s3_bucket            = "omnitransfer-training"
-s3_region            = "us-east-1"
+# Optional: Model download and experiment tracking
+hf_token              = "YOUR_HF_TOKEN"
+wandb_api_key         = "YOUR_WANDB_KEY"
+wandb_project         = "omnitransfer-unified"
 
-# Optional: HuggingFace token (for private models)
-hf_token = ""
+# S3 Configuration (match your upload destination)
+s3_bucket             = "imf-infinity-latents"
+s3_region             = "us-east-1"
+s3_data_prefix        = "omnitransfer/training_data"
 
-# Optional: Weights & Biases for experiment tracking
-wandb_api_key = ""
-wandb_project = "omnitransfer-unified"
+# GPU Selection (48GB+ at <$1/hr for OmniTransfer)
+# Options: A6000 (48GB), A100-40GB, L40 (48GB), L40S (48GB)
+preferred_gpu         = ""  # Leave empty for cheapest 48GB+ option
 
-# GPU configuration
-# A100 80GB recommended for LTX-2 19B training
-preferred_gpu      = "A100"
-num_gpus          = 1
-gpu_query         = "gpu_ram>=80 num_gpus>=1 inet_down>=200 disk_space>=200 reliability>=0.95 rentable=true"
+# Instance Configuration
+num_gpus              = 1
+disk_gb               = 150
+interruptible         = false  # Set true for spot pricing
 
-# Instance configuration
-interruptible      = false   # false = on-demand (stable), true = spot (cheaper)
-disk_gb           = 200      # Need space for model (~40GB) + data + checkpoints
-max_price_per_hour = 2.50
-
-# Training configuration
-training_config    = "ltx2_omnitransfer_unified_5task.yaml"
-training_steps     = 10000
-checkpoint_interval = 500
-max_runtime_hours  = 24      # Auto-shutdown after X hours (0 to disable)
-
-# S3 data paths
-s3_data_prefix = "processed/omnitransfer_unified_5task"
-
-# GitHub repo
-github_repo   = "johndpope/ltx2-omnitransfer"
-github_branch = "main"
-
-# Instance label
-instance_label = "omnitransfer-training"
-
-# Docker image - NGC PyTorch with flash-attn pre-installed
-image = "nvcr.io/nvidia/pytorch:24.01-py3"
+# Training Configuration
+training_config       = "ltx2_omnitransfer_unified_5task.yaml"
+training_steps        = 5000
+max_runtime_hours     = 3     # Auto-shutdown after 3 hours
+checkpoint_interval   = 500

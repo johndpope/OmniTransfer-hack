@@ -39,3 +39,8 @@ tmp
 *.png
 *.wav
 *.webp
+packages/ltx-trainer/credentials.env
+*.env
+
+# Log files
+*.log

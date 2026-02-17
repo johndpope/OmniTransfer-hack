@@ -290,6 +290,13 @@ class LtxvTrainer:
                         # Log reconstructions to W&B if this is a logging step
                         if should_log_recon and video_pred is not None and model_inputs is not None:
                             try:
+                                # Move VAE decoder to GPU temporarily for fast decoding
+                                # (single-GPU mode keeps it on CPU to save VRAM)
+                                hw_devices = self._config.hardware.devices
+                                is_multi_gpu = hw_devices.transformer != hw_devices.vae_decoder
+                                if not is_multi_gpu and self._vae_decoder is not None:
+                                    self._vae_decoder = self._vae_decoder.to(hw_devices.vae_decoder)
+
                                 recon_metrics = self._training_strategy.log_reconstructions_to_wandb(
                                     video_pred=video_pred.detach(),
                                     inputs=model_inputs,
@@ -298,8 +305,16 @@ class LtxvTrainer:
                                 )
                                 if recon_metrics:
                                     self._log_metrics(recon_metrics)
+
+                                # Move VAE decoder back to CPU (single-GPU only)
+                                if not is_multi_gpu and self._vae_decoder is not None:
+                                    self._vae_decoder = self._vae_decoder.to("cpu")
+                                    torch.cuda.empty_cache()
                             except Exception as e:
                                 logger.warning(f"Failed to log reconstructions: {e}")
+                                # Ensure VAE back on CPU even on error
+                                if not is_multi_gpu and self._vae_decoder is not None:
+                                    self._vae_decoder = self._vae_decoder.to("cpu")
 
                     # Fallback logging when progress bars are disabled
                     if disable_progress_bars and IS_MAIN_PROCESS and self._global_step % 20 == 0:

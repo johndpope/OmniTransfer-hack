@@ -656,13 +656,14 @@ def decode_latents_for_visualization(
     with torch.inference_mode():
         for i in range(0, batch_size, chunk_size):
             chunk = latents[i:i + chunk_size]
-            # Move chunk to decoder's device
-            chunk = chunk.to(decoder_device)
+            # Move chunk to decoder's device and match dtype
+            decoder_dtype = next(vae_decoder.parameters()).dtype
+            chunk = chunk.to(device=decoder_device, dtype=decoder_dtype)
             # VideoDecoder uses forward(), not decode()
             # Call the module directly which invokes forward()
             decoded_chunk = vae_decoder(chunk)
-            # Move back to original device
-            decoded_chunk = decoded_chunk.to(original_device)
+            # Convert to float32 for visualization (PIL/torchvision need float32)
+            decoded_chunk = decoded_chunk.to(device=original_device, dtype=torch.float32)
             decoded.append(decoded_chunk)
 
     return torch.cat(decoded, dim=0)

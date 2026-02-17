@@ -2342,6 +2342,13 @@ class OmniTransferStrategy(TrainingStrategy):
             pred_decoded = normalize_latent(pred_latents)
             first_frame_decoded = normalize_latent(first_frame_latents) if first_frame_latents is not None else None
 
+        # Ensure float32 for visualization (PIL/torchvision require float32 or uint8)
+        ref_decoded = ref_decoded.float()
+        tgt_decoded = tgt_decoded.float()
+        pred_decoded = pred_decoded.float()
+        if first_frame_decoded is not None:
+            first_frame_decoded = first_frame_decoded.float()
+
         # Log batch reconstructions
         num_samples = min(self.config.max_samples_per_log, ref_decoded.shape[0])
         tasks = [self.config.task] * num_samples

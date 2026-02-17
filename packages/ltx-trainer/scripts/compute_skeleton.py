@@ -1,359 +1,478 @@
 #!/usr/bin/env python3
 """Compute SMPL/MANO skeleton pseudo-GT from videos for 3DiMo geometric supervision.
 
-This script extracts body pose (SMPL) and hand joints (MANO) from driving videos
-using 4DHumans + HaMeR, saving the results as .pt files for training supervision.
+Extracts body pose (SMPL) and hand joints (MANO) from driving videos using
+4DHumans (HMR2.0) + HaMeR. Falls back to MediaPipe if those aren't installed.
+Output matches the format expected by geometric_decoder.py for auxiliary
+supervision during 3DiMo training.
 
-Output format per sample (matching IMTalker skeleton_dataset.py format):
-    body_pose: [T, 23, 3, 3]       - SMPL rotation matrices (no global orient)
-    hand_joints_3d: [T, 21, 3]     - MANO 3D hand joints (right hand)
-    body_joints_3d: [T, 44, 3]     - Full 3D body joints
-    body_confidence: [T, 44]        - Per-joint confidence scores
+Output format per sample (.pt file):
+    body_pose:       [T, 23, 3, 3]   SMPL rotation matrices (no global orient)
+    hand_joints_3d:  [T, 21, 3]      MANO 3D hand joints
+    body_joints_3d:  [T, 44, 3]      Full SMPL 3D body joints
+    body_confidence: [T, 44]          Per-joint confidence scores
+    fps:             float            Video frame rate
+    num_frames:      int              Number of frames processed
 
 Usage:
-    python scripts/compute_skeleton.py \
-        --video-dir /path/to/raw_videos \
-        --output-dir /path/to/dataset/skeleton \
-        --batch-size 16
+    # Using 4DHumans + HaMeR (best quality)
+    python scripts/compute_skeleton.py \\
+        --video-dir /path/to/raw_videos \\
+        --output-dir /path/to/dataset/skeleton
 
-Requirements:
-    pip install 4dhuman hamer  # Or install from source
-    # See: https://github.com/shubham-goel/4D-Humans
-    # See: https://github.com/geopavlakos/hamer
+    # Using MediaPipe fallback (no special install needed)
+    python scripts/compute_skeleton.py \\
+        --video-dir /path/to/raw_videos \\
+        --output-dir /path/to/dataset/skeleton \\
+        --backend mediapipe
+
+    # Match output filenames to dataset latent names
+    python scripts/compute_skeleton.py \\
+        --video-dir /path/to/raw_videos \\
+        --output-dir /media/2TB/omnitransfer_effect_motion/skeleton \\
+        --match-latents /media/2TB/omnitransfer_effect_motion/latents
+
+Installation (for 4DHumans + HaMeR backend):
+    git clone https://github.com/shubham-goel/4D-Humans.git
+    cd 4D-Humans && pip install -e .
+    cd ..
+    git clone https://github.com/geopavlakos/hamer.git
+    cd hamer && pip install -e . && bash fetch_demo_data.sh
+
+References:
+    - 3DiMo (arXiv:2602.03796v2) Section 3.3
+    - 4DHumans: https://github.com/shubham-goel/4D-Humans
+    - HaMeR: https://github.com/geopavlakos/hamer
+    - DreamActorExtractor pattern: /media/2TB/IMTalker/dreamactor_extractor.py
 """
 
 import argparse
 import sys
 from pathlib import Path
 
-import torch
+import cv2
 import numpy as np
+import torch
+from tqdm import tqdm
 
-from ltx_trainer import logger
+
+# ─── Rotation utilities ─────────────────────────────────────────────────────
+
+def axis_angle_to_rotation_matrix(axis_angle: np.ndarray) -> np.ndarray:
+    """Convert axis-angle [3] to rotation matrix [3, 3] via Rodrigues formula."""
+    angle = np.linalg.norm(axis_angle)
+    if angle < 1e-6:
+        return np.eye(3, dtype=np.float32)
+    axis = axis_angle / angle
+    K = np.array([
+        [0, -axis[2], axis[1]],
+        [axis[2], 0, -axis[0]],
+        [-axis[1], axis[0], 0],
+    ], dtype=np.float32)
+    return np.eye(3, dtype=np.float32) + np.sin(angle) * K + (1 - np.cos(angle)) * (K @ K)
 
 
-def extract_skeleton_4dhumans(
-    video_path: Path,
-    device: torch.device,
-    batch_size: int = 16,
-) -> dict[str, torch.Tensor] | None:
-    """Extract SMPL body pose from video using 4DHumans.
+def batch_axis_angle_to_rotmat(body_pose: np.ndarray) -> np.ndarray:
+    """Convert body_pose [T, 23, 3] axis-angle to [T, 23, 3, 3] rotation matrices."""
+    T, J, _ = body_pose.shape
+    rotmats = np.zeros((T, J, 3, 3), dtype=np.float32)
+    for t in range(T):
+        for j in range(J):
+            rotmats[t, j] = axis_angle_to_rotation_matrix(body_pose[t, j])
+    return rotmats
 
-    Args:
-        video_path: Path to input video
-        device: Device for inference
-        batch_size: Batch size for frame processing
 
-    Returns:
-        Dictionary with body_pose, body_joints_3d, body_confidence, or None if failed
+# ─── 4DHumans + HaMeR Backend ───────────────────────────────────────────────
+
+class HMR2Backend:
+    """Skeleton extraction using 4DHumans (HMR2.0) + HaMeR.
+
+    Based on the DreamActorExtractor pattern from IMTalker:
+    - 4DHumans extracts SMPL body pose (23 joints) + 3D body joints (44 joints)
+    - HaMeR extracts MANO hand joints (21 joints per hand)
+    - Uses weak-perspective camera for 2D projection & confidence estimation
     """
-    try:
-        from hmr2.models import download_models, load_hmr2
+
+    def __init__(self, device: str = "cuda", hmr2_path: str | None = None, hamer_path: str | None = None):
+        self.device = device
+        self.hmr2_model = None
+        self.hmr2_cfg = None
+        self.hamer_model = None
+        self.hamer_cfg = None
+
+        # Add repos to path if provided
+        if hmr2_path:
+            sys.path.insert(0, str(hmr2_path))
+        else:
+            # Search common locations
+            for p in [Path.home() / "4D-Humans", Path("/media/12TB/4D-Humans")]:
+                if p.exists():
+                    sys.path.insert(0, str(p))
+                    break
+
+        if hamer_path:
+            sys.path.insert(0, str(hamer_path))
+        else:
+            for p in [Path.home() / "hamer", Path("/media/12TB/hamer")]:
+                if p.exists():
+                    sys.path.insert(0, str(p))
+                    break
+
+        self._load_hmr2()
+        self._load_hamer()
+
+    def _load_hmr2(self) -> None:
+        """Load 4DHumans (HMR2.0) model for body pose estimation."""
+        try:
+            from hmr2.models import load_hmr2, DEFAULT_CHECKPOINT
+            print(f"Loading 4DHumans from {DEFAULT_CHECKPOINT}")
+            self.hmr2_model, self.hmr2_cfg = load_hmr2(DEFAULT_CHECKPOINT)
+            self.hmr2_model = self.hmr2_model.to(self.device)
+            self.hmr2_model.eval()
+            print("4DHumans loaded successfully")
+        except Exception as e:
+            print(f"Warning: Could not load 4DHumans: {e}")
+            print("Install: git clone https://github.com/shubham-goel/4D-Humans.git && cd 4D-Humans && pip install -e .")
+
+    def _load_hamer(self) -> None:
+        """Load HaMeR model for hand mesh recovery."""
+        try:
+            from hamer.models import load_hamer, DEFAULT_CHECKPOINT as HAMER_CKPT
+            ckpt = Path(HAMER_CKPT)
+            # Search common checkpoint locations
+            if not ckpt.exists():
+                for candidate in [
+                    Path.home() / "hamer" / "_DATA" / "hamer_ckpts" / "checkpoints" / "hamer.ckpt",
+                    Path("/media/12TB/hamer/_DATA/hamer_ckpts/checkpoints/hamer.ckpt"),
+                ]:
+                    if candidate.exists():
+                        ckpt = candidate
+                        break
+            if ckpt.exists():
+                print(f"Loading HaMeR from {ckpt}")
+                self.hamer_model, self.hamer_cfg = load_hamer(str(ckpt))
+                self.hamer_model = self.hamer_model.to(self.device)
+                self.hamer_model.eval()
+                print("HaMeR loaded successfully")
+            else:
+                print(f"HaMeR checkpoint not found. Run: cd hamer && bash fetch_demo_data.sh")
+        except Exception as e:
+            print(f"Warning: Could not load HaMeR: {e}")
+
+    @torch.inference_mode()
+    def _extract_body_frame(self, frame: np.ndarray) -> dict | None:
+        """Extract SMPL body from a single BGR frame (DreamActorExtractor pattern)."""
+        if self.hmr2_model is None:
+            return None
+
         from hmr2.utils import recursive_to
-        from hmr2.datasets.vitdet_dataset import ViTDetDataset, DEFAULT_MEAN, DEFAULT_STD
-    except ImportError:
-        logger.error(
-            "4DHumans (hmr2) not installed. Install from: "
-            "https://github.com/shubham-goel/4D-Humans"
+        from hmr2.datasets.vitdet_dataset import ViTDetDataset
+
+        img_h, img_w = frame.shape[:2]
+        bbox = np.array([[0, 0, img_w, img_h]])
+
+        dataset = ViTDetDataset(self.hmr2_cfg, frame, bbox)
+        loader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
+
+        for batch in loader:
+            batch = recursive_to(batch, self.device)
+            out = self.hmr2_model(batch)
+
+            joints_3d = out["pred_keypoints_3d"][0].cpu().numpy()  # [44, 3]
+            body_pose = out["pred_smpl_params"]["body_pose"][0].cpu().numpy()  # [23, 3]
+            global_orient = out["pred_smpl_params"]["global_orient"][0].cpu().numpy()  # [1, 3]
+            pred_cam = out["pred_cam"][0].cpu().numpy()
+
+            # Weak-perspective 2D projection for confidence estimation
+            kp_2d = joints_3d[:, :2].copy()
+            kp_2d = kp_2d * pred_cam[0]
+            kp_2d[:, 0] += pred_cam[1]
+            kp_2d[:, 1] += pred_cam[2]
+            box_center = batch["box_center"][0].cpu().numpy()
+            box_size = batch["box_size"][0].cpu().numpy()
+            kp_2d = kp_2d * box_size / 2 + box_center
+
+            # Confidence: in-frame joints get 0.8, out-of-frame get 0
+            in_frame = (kp_2d[:, 0] >= 0) & (kp_2d[:, 0] < img_w) & \
+                       (kp_2d[:, 1] >= 0) & (kp_2d[:, 1] < img_h)
+            confidence = np.where(in_frame, 0.8, 0.0).astype(np.float32)
+
+            return {
+                "joints_3d": joints_3d,
+                "body_pose": body_pose,       # [23, 3] axis-angle
+                "global_orient": global_orient,
+                "confidence": confidence,     # [44]
+            }
+        return None
+
+    @torch.inference_mode()
+    def _extract_hands_frame(self, frame: np.ndarray) -> dict | None:
+        """Extract MANO hand joints from a single BGR frame."""
+        if self.hamer_model is None:
+            return None
+
+        from hamer.datasets.vitdet_dataset import DEFAULT_MEAN, DEFAULT_STD
+
+        img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img_h, img_w = img_rgb.shape[:2]
+
+        img_tensor = torch.from_numpy(img_rgb.astype(np.float32)).permute(2, 0, 1) / 255.0
+        img_tensor = torch.nn.functional.interpolate(
+            img_tensor.unsqueeze(0), size=(256, 256), mode="bilinear", align_corners=False,
         )
-        return None
+        mean = torch.tensor(DEFAULT_MEAN, dtype=torch.float32).view(1, 3, 1, 1)
+        std = torch.tensor(DEFAULT_STD, dtype=torch.float32).view(1, 3, 1, 1)
+        img_tensor = (img_tensor - mean) / std
 
-    try:
-        import cv2
-    except ImportError:
-        logger.error("OpenCV required: pip install opencv-python")
-        return None
+        batch = {
+            "img": img_tensor.to(self.device),
+            "img_size": torch.tensor([[img_w, img_h]], dtype=torch.float32).to(self.device),
+            "center": torch.tensor([[img_w / 2, img_h / 2]], dtype=torch.float32).to(self.device),
+            "scale": torch.tensor([[max(img_h, img_w) / 200.0]], dtype=torch.float32).to(self.device),
+        }
 
-    # Load video frames
-    cap = cv2.VideoCapture(str(video_path))
-    frames = []
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-    cap.release()
+        out = self.hamer_model(batch)
+        hand_joints_3d = out["pred_keypoints_3d"][0].cpu().numpy()  # [21, 3]
 
-    if not frames:
-        logger.warning(f"No frames extracted from {video_path}")
-        return None
+        return {"joints_3d": hand_joints_3d}
 
-    logger.info(f"Extracted {len(frames)} frames from {video_path.name}")
+    def process_video(self, video_path: str, max_frames: int | None = None) -> dict:
+        """Process a video and return skeleton data tensors."""
+        cap = cv2.VideoCapture(video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if max_frames:
+            total = min(total, max_frames)
 
-    # Load HMR2 model
-    model, model_cfg = load_hmr2()
-    model = model.to(device)
-    model.eval()
+        body_joints_3d_list = []
+        body_pose_list = []
+        body_confidence_list = []
+        hand_joints_3d_list = []
 
-    all_body_pose = []
-    all_body_joints = []
-    all_confidence = []
+        video_name = Path(video_path).stem
 
-    # Process frames in batches
-    for i in range(0, len(frames), batch_size):
-        batch_frames = frames[i:i + batch_size]
+        for i in tqdm(range(total), desc=f"  {video_name}", leave=False):
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-        # Create dataset for batch
-        dataset = ViTDetDataset(model_cfg, batch_frames)
+            body = self._extract_body_frame(frame)
+            hands = self._extract_hands_frame(frame)
 
-        with torch.inference_mode():
-            for j in range(len(batch_frames)):
-                sample = dataset[j]
-                batch_input = recursive_to({k: v.unsqueeze(0) for k, v in sample.items()}, device)
+            if body is not None:
+                body_joints_3d_list.append(body["joints_3d"])
+                body_pose_list.append(body["body_pose"])
+                body_confidence_list.append(body["confidence"])
+            else:
+                body_joints_3d_list.append(np.zeros((44, 3), dtype=np.float32))
+                body_pose_list.append(np.zeros((23, 3), dtype=np.float32))
+                body_confidence_list.append(np.zeros(44, dtype=np.float32))
 
-                output = model(batch_input)
+            if hands is not None:
+                hand_joints_3d_list.append(hands["joints_3d"])
+            else:
+                hand_joints_3d_list.append(np.zeros((21, 3), dtype=np.float32))
 
-                # Extract SMPL body pose (excluding global orient)
-                # body_pose: [1, 23, 3, 3] rotation matrices
-                if "body_pose" in output:
-                    body_pose = output["body_pose"][0].cpu()  # [23, 3, 3]
-                    all_body_pose.append(body_pose)
+        cap.release()
 
-                # Extract 3D body joints
-                if "joints" in output:
-                    joints_3d = output["joints"][0].cpu()  # [44, 3]
-                    all_body_joints.append(joints_3d)
+        # Convert body_pose from axis-angle [T, 23, 3] to rotation matrices [T, 23, 3, 3]
+        body_pose_aa = np.stack(body_pose_list)
+        body_pose_rm = batch_axis_angle_to_rotmat(body_pose_aa)
 
-                # Extract confidence (from detection score)
-                confidence = torch.ones(44)  # Default full confidence
-                if "scores" in sample:
-                    confidence = confidence * sample["scores"].item()
-                all_confidence.append(confidence)
-
-    if not all_body_pose:
-        logger.warning(f"No body poses extracted from {video_path}")
-        return None
-
-    result = {
-        "body_pose": torch.stack(all_body_pose),           # [T, 23, 3, 3]
-        "body_joints_3d": torch.stack(all_body_joints) if all_body_joints else None,  # [T, 44, 3]
-        "body_confidence": torch.stack(all_confidence),     # [T, 44]
-    }
-
-    return result
+        return {
+            "body_pose": torch.from_numpy(body_pose_rm).float(),                    # [T, 23, 3, 3]
+            "hand_joints_3d": torch.from_numpy(np.stack(hand_joints_3d_list)).float(),  # [T, 21, 3]
+            "body_joints_3d": torch.from_numpy(np.stack(body_joints_3d_list)).float(),  # [T, 44, 3]
+            "body_confidence": torch.from_numpy(np.stack(body_confidence_list)).float(),  # [T, 44]
+            "fps": fps,
+            "num_frames": len(body_pose_list),
+            "video_path": str(video_path),
+        }
 
 
-def extract_hand_joints_hamer(
-    video_path: Path,
-    device: torch.device,
-    batch_size: int = 16,
-) -> torch.Tensor | None:
-    """Extract MANO hand joints from video using HaMeR.
+# ─── MediaPipe Fallback Backend ─────────────────────────────────────────────
 
-    Args:
-        video_path: Path to input video
-        device: Device for inference
-        batch_size: Batch size for frame processing
+class MediaPipeBackend:
+    """Lightweight skeleton extraction using MediaPipe Pose + Hands.
 
-    Returns:
-        hand_joints_3d: [T, 21, 3] or None if failed
+    Produces approximate SMPL-format output. Less accurate than 4DHumans+HaMeR
+    but requires only: pip install mediapipe opencv-python
     """
-    try:
-        from hamer.models import download_models, load_hamer
-        from hamer.utils import recursive_to
-    except ImportError:
-        logger.warning(
-            "HaMeR not installed. Hand joints will be skipped. "
-            "Install from: https://github.com/geopavlakos/hamer"
+
+    def __init__(self, device: str = "cpu"):
+        import mediapipe as mp
+        self.mp_pose = mp.solutions.pose.Pose(
+            static_image_mode=False,
+            model_complexity=2,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
         )
-        return None
+        self.mp_hands = mp.solutions.hands.Hands(
+            static_image_mode=False,
+            max_num_hands=2,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
 
-    try:
-        import cv2
-    except ImportError:
-        return None
+    def process_video(self, video_path: str, max_frames: int | None = None) -> dict:
+        """Process video with MediaPipe and convert to SMPL-compatible format."""
+        cap = cv2.VideoCapture(video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if max_frames:
+            total = min(total, max_frames)
 
-    # Load video frames
-    cap = cv2.VideoCapture(str(video_path))
-    frames = []
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-    cap.release()
+        body_joints_3d_list = []
+        body_confidence_list = []
+        hand_joints_3d_list = []
 
-    if not frames:
-        return None
+        video_name = Path(video_path).stem
 
-    # Load HaMeR model
-    model, model_cfg = load_hamer()
-    model = model.to(device)
-    model.eval()
+        for i in tqdm(range(total), desc=f"  {video_name}", leave=False):
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-    all_hand_joints = []
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-    for i in range(0, len(frames), batch_size):
-        batch_frames = frames[i:i + batch_size]
+            # Body pose (33 MediaPipe landmarks -> pad to 44 SMPL joints)
+            pose_result = self.mp_pose.process(rgb)
+            if pose_result.pose_world_landmarks:
+                landmarks = pose_result.pose_world_landmarks.landmark
+                joints = np.array([[lm.x, lm.y, lm.z] for lm in landmarks], dtype=np.float32)
+                conf = np.array([lm.visibility for lm in landmarks], dtype=np.float32)
+                joints_44 = np.zeros((44, 3), dtype=np.float32)
+                conf_44 = np.zeros(44, dtype=np.float32)
+                n = min(33, 44)
+                joints_44[:n] = joints[:n]
+                conf_44[:n] = conf[:n]
+                body_joints_3d_list.append(joints_44)
+                body_confidence_list.append(conf_44)
+            else:
+                body_joints_3d_list.append(np.zeros((44, 3), dtype=np.float32))
+                body_confidence_list.append(np.zeros(44, dtype=np.float32))
 
-        with torch.inference_mode():
-            for frame in batch_frames:
-                # HaMeR expects single frame input
-                # Process and extract hand joints
-                try:
-                    output = model.predict(frame)
-                    if "hand_joints_3d" in output and len(output["hand_joints_3d"]) > 0:
-                        joints = output["hand_joints_3d"][0].cpu()  # [21, 3]
-                        all_hand_joints.append(joints)
-                    else:
-                        # No hand detected - use zeros
-                        all_hand_joints.append(torch.zeros(21, 3))
-                except Exception:
-                    all_hand_joints.append(torch.zeros(21, 3))
+            # Hand pose (21 landmarks per hand)
+            hand_result = self.mp_hands.process(rgb)
+            if hand_result.multi_hand_world_landmarks:
+                hand_lm = hand_result.multi_hand_world_landmarks[0].landmark
+                joints = np.array([[lm.x, lm.y, lm.z] for lm in hand_lm], dtype=np.float32)
+                hand_joints_3d_list.append(joints)
+            else:
+                hand_joints_3d_list.append(np.zeros((21, 3), dtype=np.float32))
 
-    if not all_hand_joints:
-        return None
+        cap.release()
 
-    return torch.stack(all_hand_joints)  # [T, 21, 3]
+        # MediaPipe doesn't provide SMPL rotation matrices - use identity
+        T = len(body_joints_3d_list)
+        body_pose_rm = np.tile(np.eye(3, dtype=np.float32), (T, 23, 1, 1))
+
+        return {
+            "body_pose": torch.from_numpy(body_pose_rm).float(),
+            "hand_joints_3d": torch.from_numpy(np.stack(hand_joints_3d_list)).float(),
+            "body_joints_3d": torch.from_numpy(np.stack(body_joints_3d_list)).float(),
+            "body_confidence": torch.from_numpy(np.stack(body_confidence_list)).float(),
+            "fps": fps,
+            "num_frames": T,
+            "video_path": str(video_path),
+        }
 
 
-def process_video(
-    video_path: Path,
-    output_path: Path,
-    device: torch.device,
-    batch_size: int = 16,
-    skip_hands: bool = False,
-) -> bool:
-    """Process a single video and save skeleton .pt file.
+# ─── Processing logic ───────────────────────────────────────────────────────
 
-    Args:
-        video_path: Input video path
-        output_path: Output .pt file path
-        device: Device for inference
-        batch_size: Batch size
-        skip_hands: Skip hand joint extraction
+def process_directory(
+    video_dir: Path,
+    output_dir: Path,
+    backend,
+    max_frames: int | None = None,
+    match_latents: Path | None = None,
+) -> None:
+    """Process all videos in a directory."""
+    video_exts = {".mp4", ".avi", ".mov", ".webm", ".mkv"}
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    Returns:
-        True if successful
-    """
-    logger.info(f"Processing: {video_path.name}")
+    video_files = sorted([p for p in video_dir.iterdir() if p.suffix.lower() in video_exts])
 
-    # Extract body pose with 4DHumans
-    body_data = extract_skeleton_4dhumans(video_path, device, batch_size)
-    if body_data is None:
-        logger.warning(f"Skipping {video_path.name}: body extraction failed")
-        return False
+    if not video_files:
+        print(f"No videos found in {video_dir}")
+        return
 
-    # Extract hand joints with HaMeR (optional)
-    hand_joints = None
-    if not skip_hands:
-        hand_joints = extract_hand_joints_hamer(video_path, device, batch_size)
+    # If matching to latents, use latent filenames for output
+    if match_latents:
+        latent_files = sorted(match_latents.glob("*.pt"))
+        print(f"Matching {len(video_files)} videos to {len(latent_files)} latent samples")
+        n = min(len(video_files), len(latent_files))
+        video_files = video_files[:n]
+        output_names = [lf.stem for lf in latent_files[:n]]
+    else:
+        output_names = [vf.stem for vf in video_files]
 
-    # Combine into output format
-    result = {
-        "body_pose": body_data["body_pose"],             # [T, 23, 3, 3]
-        "hand_joints_3d": hand_joints,                    # [T, 21, 3] or None
-        "body_joints_3d": body_data.get("body_joints_3d"),  # [T, 44, 3] or None
-        "body_confidence": body_data.get("body_confidence"),  # [T, 44] or None
-    }
+    print(f"Processing {len(video_files)} videos -> {output_dir}")
 
-    # Save
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(result, output_path)
-    logger.info(
-        f"Saved skeleton: {output_path.name} "
-        f"(body_pose={result['body_pose'].shape}, "
-        f"hands={'yes' if hand_joints is not None else 'no'})"
-    )
+    success = 0
+    for video_path, out_name in tqdm(list(zip(video_files, output_names)), desc="Videos"):
+        output_path = output_dir / f"{out_name}.pt"
+        if output_path.exists():
+            print(f"  Skipping {video_path.name}: already processed")
+            success += 1
+            continue
 
-    return True
+        try:
+            result = backend.process_video(str(video_path), max_frames=max_frames)
+            torch.save(result, output_path)
+
+            T = result["num_frames"]
+            conf = result["body_confidence"]
+            avg_valid = (conf > 0.5).sum(dim=1).float().mean().item()
+            print(f"  {video_path.name} -> {out_name}.pt: {T} frames, avg valid: {avg_valid:.1f}/44")
+            success += 1
+        except Exception as e:
+            print(f"  Error: {video_path.name}: {e}")
+            import traceback
+            traceback.print_exc()
+
+    print(f"\nDone: {success}/{len(video_files)} processed. Output: {output_dir}")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Extract SMPL/MANO skeleton pseudo-GT from videos for 3DiMo training"
+        description="Compute SMPL/MANO skeleton pseudo-GT for 3DiMo geometric supervision"
     )
-    parser.add_argument(
-        "--video-dir", type=str, required=True,
-        help="Directory containing raw driving videos"
-    )
-    parser.add_argument(
-        "--output-dir", type=str, required=True,
-        help="Output directory for skeleton .pt files (e.g., dataset/skeleton/)"
-    )
-    parser.add_argument(
-        "--batch-size", type=int, default=16,
-        help="Batch size for frame processing"
-    )
-    parser.add_argument(
-        "--device", type=str, default="cuda",
-        help="Device for inference (cuda or cpu)"
-    )
-    parser.add_argument(
-        "--skip-hands", action="store_true",
-        help="Skip hand joint extraction (faster, no HaMeR needed)"
-    )
-    parser.add_argument(
-        "--video-extensions", type=str, nargs="+",
-        default=[".mp4", ".avi", ".mov", ".mkv", ".webm"],
-        help="Video file extensions to process"
-    )
-    parser.add_argument(
-        "--match-latents", type=str, default=None,
-        help="If provided, only process videos matching filenames in this latents/ directory "
-        "(ensures skeleton files match dataset sample indices)"
-    )
+    parser.add_argument("--video-dir", type=str, required=True, help="Directory with source videos")
+    parser.add_argument("--output-dir", type=str, required=True, help="Output dir for skeleton .pt files")
+    parser.add_argument("--backend", type=str, default="hmr2", choices=["hmr2", "mediapipe"],
+                        help="Extraction backend: hmr2 (4DHumans+HaMeR) or mediapipe (lightweight)")
+    parser.add_argument("--device", type=str, default="cuda", help="Device for inference")
+    parser.add_argument("--max-frames", type=int, default=None, help="Max frames per video")
+    parser.add_argument("--hmr2-path", type=str, default=None, help="Path to 4D-Humans repo")
+    parser.add_argument("--hamer-path", type=str, default=None, help="Path to hamer repo")
+    parser.add_argument("--match-latents", type=str, default=None,
+                        help="Match output filenames to latent files in this directory")
 
     args = parser.parse_args()
-
     video_dir = Path(args.video_dir)
-    output_dir = Path(args.output_dir)
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
     if not video_dir.exists():
-        logger.error(f"Video directory not found: {video_dir}")
+        print(f"Error: Video directory not found: {video_dir}")
         sys.exit(1)
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # Create backend
+    if args.backend == "hmr2":
+        print("Using 4DHumans (HMR2.0) + HaMeR backend")
+        backend = HMR2Backend(
+            device=args.device, hmr2_path=args.hmr2_path, hamer_path=args.hamer_path,
+        )
+    else:
+        print("Using MediaPipe fallback backend (pip install mediapipe)")
+        backend = MediaPipeBackend(device=args.device)
 
-    # Find video files
-    video_files = []
-    for ext in args.video_extensions:
-        video_files.extend(video_dir.glob(f"*{ext}"))
-    video_files = sorted(video_files)
-
-    if not video_files:
-        logger.error(f"No video files found in {video_dir}")
-        sys.exit(1)
-
-    # If matching to latents directory, filter and rename
-    if args.match_latents:
-        latents_dir = Path(args.match_latents)
-        latent_files = sorted(latents_dir.glob("*.pt"))
-        if len(latent_files) != len(video_files):
-            logger.warning(
-                f"Latent count ({len(latent_files)}) != video count ({len(video_files)}). "
-                f"Processing min({len(latent_files)}, {len(video_files)}) files."
-            )
-        video_files = video_files[:len(latent_files)]
-
-    logger.info(f"Found {len(video_files)} videos to process")
-
-    success_count = 0
-    for i, video_path in enumerate(video_files):
-        # Use numeric naming to match dataset convention (0.pt, 1.pt, ...)
-        output_path = output_dir / f"{i}.pt"
-
-        if output_path.exists():
-            logger.info(f"Skipping {video_path.name}: output exists")
-            success_count += 1
-            continue
-
-        try:
-            if process_video(
-                video_path, output_path, device,
-                batch_size=args.batch_size,
-                skip_hands=args.skip_hands,
-            ):
-                success_count += 1
-        except Exception as e:
-            logger.error(f"Failed to process {video_path.name}: {e}")
-
-        if (i + 1) % 10 == 0:
-            logger.info(f"Progress: {i + 1}/{len(video_files)} ({success_count} successful)")
-
-    logger.info(f"Done: {success_count}/{len(video_files)} videos processed successfully")
-    logger.info(f"Skeleton files saved to: {output_dir}")
+    process_directory(
+        video_dir=video_dir,
+        output_dir=Path(args.output_dir),
+        backend=backend,
+        max_frames=args.max_frames,
+        match_latents=Path(args.match_latents) if args.match_latents else None,
+    )
 
 
 if __name__ == "__main__":

@@ -51,6 +51,15 @@ from ltx_trainer.omnitransfer.metaquery_tma import (
     MetaQueryTMAConfig,
     MetaQueryFeatureExtractor,
 )
+from ltx_trainer.omnitransfer.motion_encoder import (
+    MotionEncoder,
+    DualScaleMotionEncoder,
+    MotionAugmenter,
+)
+from ltx_trainer.omnitransfer.geometric_decoder import (
+    GeometricDecoder,
+    compute_geometric_loss,
+)
 
 # Qwen VL integration for TMA (optional, requires transformers>=4.43)
 try:
@@ -100,6 +109,12 @@ __all__ = [
     "MetaQueryTMA",
     "MetaQueryTMAConfig",
     "MetaQueryFeatureExtractor",
+    # 3DiMo Motion Encoder (arXiv:2602.03796v2)
+    "MotionEncoder",
+    "DualScaleMotionEncoder",
+    "MotionAugmenter",
+    "GeometricDecoder",
+    "compute_geometric_loss",
     # Qwen VL TMA integration (optional)
     "QwenVLConfig",
     "QwenVLFeatureExtractor",

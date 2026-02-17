@@ -51,6 +51,15 @@ from ltx_trainer.omnitransfer.latent_constructor import (
     ConstructedLatents,
     ReferenceLatentConstructor,
 )
+from ltx_trainer.omnitransfer.motion_encoder import (
+    MotionEncoder,
+    DualScaleMotionEncoder,
+    MotionAugmenter,
+)
+from ltx_trainer.omnitransfer.geometric_decoder import (
+    GeometricDecoder,
+    compute_geometric_loss,
+)
 
 try:
     import wandb
@@ -548,6 +557,123 @@ class OmniTransferConfig(TrainingStrategyConfigBase):
         "noise_injection_p: probability of adding small noise.",
     )
 
+    # ==========================================================================
+    # 3DiMo Implicit Motion Encoder (arXiv:2602.03796v2)
+    # ==========================================================================
+    # Compresses driving video into compact view-agnostic motion tokens injected
+    # via cross-attention. Augmentations on driving video prevent identity leakage.
+    # Geometric supervision (annealed) provides auxiliary training signal.
+    #
+    # Quote: "We introduce an implicit motion encoder that compresses the driving
+    # video into compact view-agnostic tokens." (Section 3.1)
+    # ==========================================================================
+
+    enable_motion_encoder: bool = Field(
+        default=False,
+        description="Enable 3DiMo implicit motion encoder. Compresses driving video into "
+        "K compact motion tokens injected via cross-attention alongside text tokens.",
+    )
+
+    motion_encoder_num_tokens: int = Field(
+        default=5,
+        description="Number of motion query tokens K (paper uses 5 for body).",
+        ge=1,
+    )
+
+    motion_encoder_hidden_dim: int = Field(
+        default=512,
+        description="Internal hidden dimension of motion encoder transformer.",
+    )
+
+    motion_encoder_num_layers: int = Field(
+        default=4,
+        description="Number of transformer encoder layers in motion encoder.",
+        ge=1,
+    )
+
+    motion_encoder_dual_scale: bool = Field(
+        default=False,
+        description="Use dual-scale body+hand motion encoders (Section 3.2). "
+        "Adds a separate hand encoder for fine-grained finger dynamics.",
+    )
+
+    motion_encoder_hand_tokens: int = Field(
+        default=3,
+        description="Number of hand motion tokens for dual-scale encoder.",
+        ge=1,
+    )
+
+    # Augmentations applied to driving video BEFORE motion encoding
+    motion_augmentation: dict = Field(
+        default={
+            "enabled": True,
+            "channel_jitter_scale": 0.05,
+            "spatial_crop_ratio_min": 0.7,
+            "spatial_crop_ratio_max": 1.0,
+            "temporal_subsample_ratio": 0.8,
+        },
+        description="Augmentations applied to driving video ONLY before motion encoding. "
+        "Prevents identity leakage from driving signal. "
+        "Quote: 'augmentations... prevent identity leakage' (Section 3.2)",
+    )
+
+    # Geometric supervision with SMPL/MANO (annealed)
+    enable_geometric_supervision: bool = Field(
+        default=False,
+        description="Enable auxiliary geometric loss using SMPL body pose and MANO hand joints. "
+        "Requires precomputed skeleton/ data from 4DHumans+HaMeR.",
+    )
+
+    geometric_loss_initial_weight: float = Field(
+        default=0.1,
+        description="Initial weight lambda_0 for geometric loss. Linearly annealed to 0.",
+        ge=0.0,
+    )
+
+    geometric_loss_anneal_steps: int = Field(
+        default=12000,
+        description="Number of steps over which geometric loss is annealed to 0.",
+        ge=1,
+    )
+
+    geometric_pseudo_gt_dir: str = Field(
+        default="skeleton",
+        description="Directory name for precomputed SMPL/MANO pseudo-GT .pt files.",
+    )
+
+    # Self-reconstruction mode for 3DiMo Phase 1
+    motion_self_reconstruction: bool = Field(
+        default=False,
+        description="3DiMo Phase 1: Self-reconstruction where target == driving video. "
+        "First frame is used as reference image. Model learns to reconstruct "
+        "the driving video from its own first frame + motion tokens.",
+    )
+
+    # Cross-view training for 3DiMo Phase 2-3
+    motion_cross_view: bool = Field(
+        default=False,
+        description="Enable cross-view training where driving and target are different views. "
+        "Used in 3DiMo Phases 2-3 for view-independent motion transfer.",
+    )
+
+    motion_cross_view_ratio: float = Field(
+        default=0.5,
+        description="Ratio of cross-view samples vs self-reconstruction during mixed training.",
+        ge=0.0,
+        le=1.0,
+    )
+
+    # 3DiMo training phase
+    motion_training_phase: int = Field(
+        default=1,
+        description="3DiMo training phase: "
+        "Phase 1: Self-reconstruction + geo supervision (10K steps). "
+        "Phase 2: Mixed self-recon + cross-view, geo annealing (15K steps). "
+        "Phase 3: Cross-view only, no geo loss (5K steps).",
+        ge=1,
+        le=3,
+    )
+
     _task_step_counter: int = 0  # For round-robin sampling
 
     @property
@@ -626,6 +752,10 @@ class OmniTransferModelInputs(ModelInputs):
 
     # Prompts for logging
     prompts: list[str] | None = None
+
+    # 3DiMo motion encoder outputs (for geometric decoder loss)
+    motion_hidden: Tensor | None = None        # [B, K, 512] hidden states for geometric decoder
+    geometric_pseudo_gt: dict | None = None    # Precomputed SMPL/MANO from skeleton cache
 
 
 class OmniTransferStrategy(TrainingStrategy):
@@ -752,13 +882,72 @@ class OmniTransferStrategy(TrainingStrategy):
                 "(TMA only used in stages 2-3)"
             )
 
+        # ==========================================================================
+        # Initialize 3DiMo Motion Encoder (arXiv:2602.03796v2)
+        # ==========================================================================
+        # Compresses driving video into compact view-agnostic motion tokens
+        # injected via cross-attention alongside text/TMA tokens.
+        # ==========================================================================
+        self._motion_encoder = None
+        self._motion_augmenter = None
+        self._geometric_decoder = None
+
+        if config.enable_motion_encoder:
+            if config.motion_encoder_dual_scale:
+                self._motion_encoder = DualScaleMotionEncoder(
+                    latent_channels=128,
+                    hidden_dim=config.motion_encoder_hidden_dim,
+                    output_dim=3840,  # Match Gemma embedding dim
+                    body_tokens=config.motion_encoder_num_tokens,
+                    hand_tokens=config.motion_encoder_hand_tokens,
+                    num_layers=config.motion_encoder_num_layers,
+                )
+                total_tokens = config.motion_encoder_num_tokens + config.motion_encoder_hand_tokens
+            else:
+                self._motion_encoder = MotionEncoder(
+                    latent_channels=128,
+                    hidden_dim=config.motion_encoder_hidden_dim,
+                    output_dim=3840,  # Match Gemma embedding dim
+                    num_tokens=config.motion_encoder_num_tokens,
+                    num_layers=config.motion_encoder_num_layers,
+                )
+                total_tokens = config.motion_encoder_num_tokens
+
+            # Motion augmenter for identity leakage prevention
+            aug_cfg = config.motion_augmentation
+            if aug_cfg.get("enabled", True):
+                self._motion_augmenter = MotionAugmenter(
+                    channel_jitter_scale=aug_cfg.get("channel_jitter_scale", 0.05),
+                    spatial_crop_ratio_min=aug_cfg.get("spatial_crop_ratio_min", 0.7),
+                    spatial_crop_ratio_max=aug_cfg.get("spatial_crop_ratio_max", 1.0),
+                    temporal_subsample_ratio=aug_cfg.get("temporal_subsample_ratio", 0.8),
+                )
+
+            # Geometric decoder for auxiliary SMPL/MANO supervision
+            if config.enable_geometric_supervision:
+                self._geometric_decoder = GeometricDecoder(
+                    hidden_dim=config.motion_encoder_hidden_dim,
+                    num_tokens=total_tokens,
+                )
+
+            param_count = sum(p.numel() for p in self._motion_encoder.parameters())
+            geo_info = f", GeometricDecoder" if self._geometric_decoder else ""
+            aug_info = ", augmented" if self._motion_augmenter else ""
+            logger.info(
+                f"Initialized 3DiMo MotionEncoder: "
+                f"tokens={total_tokens}, hidden={config.motion_encoder_hidden_dim}, "
+                f"layers={config.motion_encoder_num_layers}, params={param_count:,}"
+                f"{aug_info}{geo_info}"
+            )
+
         # Log I2V mode if enabled
         i2v_status = "I2V=True (pose-free animation)" if config.i2v_mode else "I2V=False"
         stage_info = f"Stage={config.training_stage}"
+        motion_info = f", 3DiMo={config.enable_motion_encoder}" if config.enable_motion_encoder else ""
         logger.info(
             f"Initialized OmniTransfer strategy: task={config.task_type}, "
             f"TPB={config.enable_tpb}, RCL={config.enable_rcl}, TMA={config.enable_tma}, "
-            f"{stage_info}, {i2v_status}"
+            f"{stage_info}, {i2v_status}{motion_info}"
         )
 
         # VAE decoder for Grok-recommended pixel-space losses
@@ -843,11 +1032,25 @@ class OmniTransferStrategy(TrainingStrategy):
                     params.extend(tma_params)
                     logger.debug(f"Added {len(tma_params)} TMA parameters (stage 3)")
 
+        # 3DiMo Motion Encoder parameters (all stages when enabled)
+        if self._motion_encoder is not None:
+            me_params = list(self._motion_encoder.parameters())
+            if me_params:
+                params.extend(me_params)
+                logger.debug(f"Added {len(me_params)} MotionEncoder parameters")
+
+        # 3DiMo Geometric Decoder parameters (annealed, but trained in stages 1-2)
+        if self._geometric_decoder is not None:
+            gd_params = list(self._geometric_decoder.parameters())
+            if gd_params:
+                params.extend(gd_params)
+                logger.debug(f"Added {len(gd_params)} GeometricDecoder parameters")
+
         total_params = sum(p.numel() for p in params)
         logger.info(
             f"OmniTransfer trainable params (stage {stage}): {total_params:,} "
             f"(TPB: {self._tpb is not None}, CE: {self._concept_embedding is not None}, "
-            f"TMA: {self._tma is not None})"
+            f"TMA: {self._tma is not None}, 3DiMo: {self._motion_encoder is not None})"
         )
 
         return params
@@ -1116,6 +1319,10 @@ class OmniTransferStrategy(TrainingStrategy):
         if self.config.enable_tma and self.config.use_cached_tma_features and self.config.training_stage >= 2:
             sources[self.config.tma_features_dir] = "qwen_vl_features"
 
+        # 3DiMo geometric supervision requires skeleton pseudo-GT
+        if self.config.enable_motion_encoder and self.config.enable_geometric_supervision:
+            sources[self.config.geometric_pseudo_gt_dir] = "skeleton"
+
         return sources
 
     def _apply_augmentations(
@@ -1328,6 +1535,86 @@ class OmniTransferStrategy(TrainingStrategy):
             )
             prompt_attention_mask = torch.cat([tma_mask, prompt_attention_mask], dim=1)
 
+        # ==========================================================================
+        # 3DiMo Motion Encoding (arXiv:2602.03796v2)
+        # ==========================================================================
+        # Compress driving video into compact motion tokens via implicit encoder.
+        # Tokens are prepended to prompt_embeds for cross-attention injection.
+        # Augmentations on driving video prevent identity leakage.
+        # ==========================================================================
+        motion_hidden = None
+        geometric_pseudo_gt = None
+
+        if self._motion_encoder is not None:
+            # Use reference latents as driving video for motion encoding
+            driving_latents = ref_latents.clone()
+
+            # Apply motion augmentations to driving video ONLY (not target)
+            # This prevents identity leakage from driving signal
+            if self._motion_augmenter is not None:
+                driving_latents = self._motion_augmenter(driving_latents)
+
+            # Move motion encoder to device (once)
+            if not hasattr(self, '_motion_encoder_device_set'):
+                self._motion_encoder.to(device=device, dtype=dtype)
+                self._motion_encoder_device_set = True
+                if self._geometric_decoder is not None:
+                    self._geometric_decoder.to(device=device, dtype=dtype)
+                logger.info(f"3DiMo MotionEncoder moved to {device}")
+
+            # Encode driving video -> motion tokens
+            motion_tokens, motion_hidden = self._motion_encoder(driving_latents)
+            # motion_tokens: [B, K, 3840] - same dim as Gemma embeddings
+            # motion_hidden: [B, K, hidden_dim] - for geometric decoder
+
+            if not hasattr(self, '_logged_motion_shape'):
+                logger.info(
+                    f"3DiMo motion tokens: {motion_tokens.shape} "
+                    f"(prepended to prompt_embeds for cross-attention)"
+                )
+                self._logged_motion_shape = True
+
+            # Prepend motion tokens to prompt_embeds
+            # Final order: [motion_tokens, tma_tokens, text_tokens]
+            prompt_embeds = torch.cat([motion_tokens, prompt_embeds], dim=1)
+
+            # Update attention mask
+            motion_mask = torch.ones(
+                batch_size, motion_tokens.shape[1],
+                dtype=prompt_attention_mask.dtype, device=device
+            )
+            prompt_attention_mask = torch.cat([motion_mask, prompt_attention_mask], dim=1)
+
+            # Load skeleton pseudo-GT if geometric supervision is enabled
+            if self._geometric_decoder is not None and "skeleton" in batch:
+                try:
+                    skeleton_data = batch["skeleton"]
+                    geometric_pseudo_gt = {
+                        k: v.to(device=device, dtype=dtype) if isinstance(v, Tensor) else v
+                        for k, v in skeleton_data.items()
+                        if k in ("body_pose", "hand_joints_3d", "body_joints_3d", "body_confidence")
+                    }
+                except Exception as e:
+                    logger.warning(f"Failed to load skeleton pseudo-GT: {e}")
+                    geometric_pseudo_gt = None
+
+        # 3DiMo self-reconstruction mode: target == driving video
+        if self.config.motion_self_reconstruction and self._motion_encoder is not None:
+            import random as _random
+            # In self-reconstruction, the model reconstructs the driving video from:
+            # - First frame as reference image (ref_latents = first frame expanded)
+            # - Motion tokens from the full driving video
+            # This teaches the motion encoder to capture full video dynamics
+            target_latents = ref_latents.clone()  # Target IS the driving video
+            # Use first frame as the reference for latent construction
+            first_frame_latent = ref_latents[:, :, 0:1, :, :]
+
+            # In Phase 2, mix with cross-view samples
+            if self.config.motion_cross_view and _random.random() < self.config.motion_cross_view_ratio:
+                # Use original target (cross-view) instead of self-reconstruction
+                target_latents = batch["latents"]["latents"]
+                first_frame_latent = batch.get("first_frame_latents", {}).get("latents", None)
+
         # Sample timestep/sigma for target
         # Reference uses fixed t=0 per RCL design
         # Note: Use sample() directly since latents are unpatchified [B, C, F, H, W]
@@ -1533,6 +1820,9 @@ class OmniTransferStrategy(TrainingStrategy):
             # I2V mode: store first frame latent for 4-panel visualization
             first_frame_latent_raw=first_frame_latent.detach() if first_frame_latent is not None else None,
             prompts=prompts if isinstance(prompts, list) else [prompts] * batch_size,
+            # 3DiMo motion encoder outputs (NOT detached - geometric loss needs gradients)
+            motion_hidden=motion_hidden if motion_hidden is not None else None,
+            geometric_pseudo_gt=geometric_pseudo_gt,
         )
 
     def compute_loss(
@@ -1629,6 +1919,33 @@ class OmniTransferStrategy(TrainingStrategy):
             style_loss = self._compute_style_loss(target_pred, inputs)
             if style_loss is not None:
                 loss = loss + self.config.style_loss_weight * style_loss * self.config.perceptual_loss_interval
+
+        # 3DiMo geometric supervision loss (annealed)
+        # Auxiliary SMPL/MANO loss from geometric decoder, linearly annealed to 0
+        if (
+            self._geometric_decoder is not None
+            and inputs.motion_hidden is not None
+            and inputs.geometric_pseudo_gt is not None
+        ):
+            geo_preds = self._geometric_decoder(inputs.motion_hidden.to(device=loss.device))
+            geo_loss = compute_geometric_loss(
+                preds=geo_preds,
+                pseudo_gt=inputs.geometric_pseudo_gt,
+                step=self._current_step,
+                initial_weight=self.config.geometric_loss_initial_weight,
+                anneal_steps=self.config.geometric_loss_anneal_steps,
+            )
+            if geo_loss is not None:
+                loss = loss + geo_loss
+                # Log geometric loss weight periodically
+                if self._current_step % 500 == 0:
+                    weight = max(0.0, self.config.geometric_loss_initial_weight * (
+                        1.0 - self._current_step / self.config.geometric_loss_anneal_steps
+                    ))
+                    logger.info(
+                        f"3DiMo geometric loss: {geo_loss.item():.4f} "
+                        f"(weight={weight:.4f}, step={self._current_step})"
+                    )
 
         return loss
 

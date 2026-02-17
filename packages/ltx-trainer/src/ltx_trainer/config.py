@@ -437,6 +437,58 @@ class FlowMatchingConfig(ConfigBaseModel):
     )
 
 
+class HardwareDevicesConfig(ConfigBaseModel):
+    """Device assignments for multi-GPU setups.
+
+    Example for RTX 4000 (24GB) + RTX 5090 (32GB):
+        text_encoder: "cuda:0"    # RTX 4000 - Gemma (~13GB in 8-bit)
+        vae_encoder: "cuda:0"     # RTX 4000 - VAE encoding
+        vae_decoder: "cuda:0"     # RTX 4000 - VAE decoding
+        transformer: "cuda:1"     # RTX 5090 - 19B transformer training
+        audio_vae: "cuda:0"       # RTX 4000 - Audio components
+        vocoder: "cuda:0"
+    """
+
+    text_encoder: str = Field(
+        default="cuda:0",
+        description="Device for text encoder (Gemma)",
+    )
+    vae_encoder: str = Field(
+        default="cuda:0",
+        description="Device for VAE encoder",
+    )
+    vae_decoder: str = Field(
+        default="cuda:0",
+        description="Device for VAE decoder",
+    )
+    transformer: str = Field(
+        default="cuda:0",
+        description="Device for transformer (training)",
+    )
+    audio_vae: str = Field(
+        default="cuda:0",
+        description="Device for audio VAE",
+    )
+    vocoder: str = Field(
+        default="cuda:0",
+        description="Device for vocoder",
+    )
+
+
+class HardwareConfig(ConfigBaseModel):
+    """Hardware profile configuration for multi-GPU setups.
+
+    Use this to split model components across multiple GPUs:
+    - Put memory-hungry frozen models (text encoder, VAE) on one GPU
+    - Put the training transformer on the larger GPU
+    """
+
+    devices: HardwareDevicesConfig = Field(
+        default_factory=HardwareDevicesConfig,
+        description="Device assignments for each model component",
+    )
+
+
 class LtxTrainerConfig(ConfigBaseModel):
     """Unified configuration for LTXV training"""
 
@@ -455,6 +507,7 @@ class LtxTrainerConfig(ConfigBaseModel):
     hub: HubConfig = Field(default_factory=HubConfig)
     flow_matching: FlowMatchingConfig = Field(default_factory=FlowMatchingConfig)
     wandb: WandbConfig = Field(default_factory=WandbConfig)
+    hardware: HardwareConfig = Field(default_factory=HardwareConfig)
 
     # General configuration
     seed: int = Field(

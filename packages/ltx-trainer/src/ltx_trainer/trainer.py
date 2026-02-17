@@ -368,6 +368,29 @@ class LtxvTrainer:
 
         return saved_path, stats
 
+    def _move_batch_to_device(self, batch: dict[str, dict[str, Tensor]], device: str) -> dict[str, dict[str, Tensor]]:
+        """Move all tensors in a batch to the specified device.
+
+        Args:
+            batch: Nested dict of tensors from the dataloader
+            device: Target device (e.g., "cuda:0", "cuda:1")
+
+        Returns:
+            Batch with all tensors moved to the device
+        """
+        moved_batch = {}
+        for key, value in batch.items():
+            if isinstance(value, dict):
+                moved_batch[key] = {
+                    k: v.to(device) if isinstance(v, Tensor) else v
+                    for k, v in value.items()
+                }
+            elif isinstance(value, Tensor):
+                moved_batch[key] = value.to(device)
+            else:
+                moved_batch[key] = value
+        return moved_batch
+
     def _training_step(
         self, batch: dict[str, dict[str, Tensor]], return_for_logging: bool = False
     ) -> Tensor | tuple[Tensor, Tensor, Any]:
@@ -380,6 +403,11 @@ class LtxvTrainer:
         Returns:
             Loss tensor, or (loss, video_pred, model_inputs) if return_for_logging=True
         """
+        # Accelerate's dataloader places data on accelerator.device (cuda:0)
+        # but connectors and transformer may be on cuda:1
+        transformer_device = self._config.hardware.devices.transformer
+        batch = self._move_batch_to_device(batch, transformer_device)
+
         conditions = batch["conditions"]
 
         if self._use_cached_final_embeddings:
@@ -425,13 +453,14 @@ class LtxvTrainer:
         #   The text encoder is kept (as self._text_encoder) but with model/tokenizer/feature_extractor
         #   set to None. Only the embedding connectors remain for use during training.
 
-        # Load text encoder on GPU
-        logger.debug("Loading text encoder...")
+        # Load text encoder on configured device (supports multi-GPU)
+        text_encoder_device = self._config.hardware.devices.text_encoder
+        logger.debug(f"Loading text encoder on {text_encoder_device}...")
 
         self._text_encoder = load_text_encoder(
             checkpoint_path=self._config.model.model_path,
             gemma_model_path=self._config.model.text_encoder_path,
-            device="cuda",
+            device=text_encoder_device,
             dtype=torch.bfloat16,
             load_in_8bit=self._config.acceleration.load_text_encoder_in_8bit,
         )
@@ -475,6 +504,15 @@ class LtxvTrainer:
             self._config.validation.images is not None or self._config.validation.reference_videos is not None
         )
 
+        # Get hardware device config for multi-GPU support
+        hw_devices = self._config.hardware.devices
+        is_multi_gpu = hw_devices.transformer != hw_devices.vae_decoder
+
+        # Always load transformer to CPU first - the bf16 model is ~38GB which
+        # won't fit on most GPUs. We'll quantize it on CPU, then move to GPU.
+        # VAE and other components will be moved to their target devices after loading.
+        logger.debug("Loading transformer to CPU (will quantize then move to GPU)")
+
         # Load all model components (except text encoder - already handled)
         components = load_ltx_model(
             checkpoint_path=self._config.model.model_path,
@@ -487,16 +525,34 @@ class LtxvTrainer:
             with_text_encoder=False,  # Text encoder handled separately
         )
 
-        # Extract components
+        # Extract components and move to configured devices (supports multi-GPU)
+        # Note: hw_devices was already set above for transformer loading
         self._transformer = components.transformer
-        self._vae_decoder = components.video_vae_decoder.to(dtype=torch.bfloat16)
+        self._scheduler = components.scheduler
+
+        # VAE decoder on configured device
+        self._vae_decoder = components.video_vae_decoder.to(device=hw_devices.vae_decoder, dtype=torch.bfloat16)
+
+        # VAE encoder on configured device
         self._vae_encoder = components.video_vae_encoder
         if self._vae_encoder is not None:
-            self._vae_encoder = self._vae_encoder.to(dtype=torch.bfloat16)
-        self._scheduler = components.scheduler
+            self._vae_encoder = self._vae_encoder.to(device=hw_devices.vae_encoder, dtype=torch.bfloat16)
+
+        # Audio components on configured device
         self._audio_vae = components.audio_vae_decoder
+        if self._audio_vae is not None:
+            self._audio_vae = self._audio_vae.to(device=hw_devices.audio_vae)
         self._vocoder = components.vocoder
+        if self._vocoder is not None:
+            self._vocoder = self._vocoder.to(device=hw_devices.vocoder)
+
         # Note: self._text_encoder was set in _load_text_encoder_and_cache_embeddings
+        # Note: transformer device is handled by Accelerate, but we track the target device
+        self._transformer_device = hw_devices.transformer
+
+        # Log multi-GPU configuration if not default (devices are different)
+        if hw_devices.transformer != hw_devices.vae_decoder:
+            logger.info(f"Multi-GPU config: transformer→{hw_devices.transformer}, VAE→{hw_devices.vae_decoder}")
 
         # Determine initial dtype based on training mode.
         # Note: For FSDP + LoRA, we'll cast to FP32 later in _prepare_models_for_training()
@@ -504,6 +560,7 @@ class LtxvTrainer:
         transformer_dtype = torch.bfloat16 if self._config.model.training_mode == "lora" else torch.float32
         self._transformer = self._transformer.to(dtype=transformer_dtype)
 
+        # Quantize on CPU first (the full bf16 model is ~38GB, won't fit on most GPUs)
         if self._config.acceleration.quantization is not None:
             if self._config.model.training_mode == "full":
                 raise ValueError("Quantization is not supported in full training mode.")
@@ -513,6 +570,13 @@ class LtxvTrainer:
                 self._transformer,
                 precision=self._config.acceleration.quantization,
             )
+
+        # After quantization (or if no quantization), move transformer to target device
+        # INT8 quantized model is ~12GB, bf16 LoRA model is ~20GB (with frozen base)
+        if is_multi_gpu:
+            model_size = "quantized" if self._config.acceleration.quantization else "bf16"
+            logger.info(f"Moving {model_size} transformer to {hw_devices.transformer}...")
+            self._transformer = self._transformer.to(hw_devices.transformer)
 
         # Freeze all models. We later unfreeze the transformer based on training mode.
         # Note: embedding_connectors are already frozen (they come from the frozen text encoder)
@@ -665,10 +729,38 @@ class LtxvTrainer:
 
         transformer.set_gradient_checkpointing(self._config.optimization.enable_gradient_checkpointing)
 
-        # Keep frozen models on CPU for memory efficiency
-        self._vae_decoder = self._vae_decoder.to("cpu")
-        if self._vae_encoder is not None:
-            self._vae_encoder = self._vae_encoder.to("cpu")
+        # Handle device placement based on hardware config
+        hw_devices = self._config.hardware.devices
+        is_multi_gpu = hw_devices.transformer != hw_devices.vae_decoder
+
+        if is_multi_gpu:
+            # Multi-GPU: Keep VAE on its assigned device (e.g., cuda:0)
+            # VAE was already placed on correct device in _load_models
+            logger.debug(f"Multi-GPU: VAE staying on {hw_devices.vae_decoder}")
+        else:
+            # Single-GPU: Keep frozen models on CPU for memory efficiency
+            self._vae_decoder = self._vae_decoder.to("cpu")
+            if self._vae_encoder is not None:
+                self._vae_encoder = self._vae_encoder.to("cpu")
+
+        # Move transformer to target device before Accelerate prepares it
+        # (In multi-GPU mode, transformer was already moved in _load_models before quantization)
+        if is_multi_gpu:
+            # Verify transformer is on correct device (should already be there)
+            logger.debug(f"Transformer should already be on {hw_devices.transformer} (moved before quantization)")
+
+            # Move text encoder connectors to transformer device for training
+            # (they need to be on the same device as the transformer for the forward pass)
+            if hasattr(self, '_text_encoder') and self._text_encoder is not None:
+                if hasattr(self._text_encoder, "embeddings_connector"):
+                    self._text_encoder.embeddings_connector = self._text_encoder.embeddings_connector.to(
+                        hw_devices.transformer
+                    )
+                if hasattr(self._text_encoder, "audio_embeddings_connector"):
+                    self._text_encoder.audio_embeddings_connector = self._text_encoder.audio_embeddings_connector.to(
+                        hw_devices.transformer
+                    )
+                logger.debug(f"Text encoder connectors moved to {hw_devices.transformer}")
 
         # Embedding connectors are already on GPU from _load_text_encoder_and_cache_embeddings
 
@@ -1225,11 +1317,17 @@ class LtxvTrainer:
             with open(info_path, "w") as info_file:
                 info_file.write(f"Step: {step}\nSigma: {sigma:.4f}\nI2V Mode: {is_i2v_mode}\n")
 
-            # Decode actual frames every step (move VAE to GPU temporarily)
+            # Decode actual frames every step (move VAE to configured device temporarily)
             if self._vae_decoder is not None:
                 try:
-                    # Move VAE to GPU, decode, move back
-                    self._vae_decoder = self._vae_decoder.to("cuda")
+                    # Get VAE device from config (multi-GPU support)
+                    hw_devices = self._config.hardware.devices
+                    is_multi_gpu = hw_devices.transformer != hw_devices.vae_decoder
+                    vae_device = hw_devices.vae_decoder
+
+                    # Only move VAE if single-GPU (it stays on its device in multi-GPU)
+                    if not is_multi_gpu:
+                        self._vae_decoder = self._vae_decoder.to(vae_device)
 
                     # Get VAE dtype for consistency
                     vae_dtype = next(self._vae_decoder.parameters()).dtype
@@ -1246,11 +1344,11 @@ class LtxvTrainer:
                         frame_indices = [mid_f]
 
                     # Decode reference video middle frame
-                    ref_frame_lat = ref_lat[0:1, :, mid_f:mid_f+1, :, :].to("cuda", dtype=vae_dtype)
+                    ref_frame_lat = ref_lat[0:1, :, mid_f:mid_f+1, :, :].to(vae_device, dtype=vae_dtype)
 
                     # For I2V mode, decode first frame (reference image)
                     if is_i2v_mode:
-                        first_frame_decode_lat = first_frame_lat[0:1, :, 0:1, :, :].to("cuda", dtype=vae_dtype)
+                        first_frame_decode_lat = first_frame_lat[0:1, :, 0:1, :, :].to(vae_device, dtype=vae_dtype)
 
                     # Decode multiple GT and Pred frames
                     gt_frames_decoded = []
@@ -1267,20 +1365,21 @@ class LtxvTrainer:
                         # Decode multiple frames from GT and Prediction
                         for fidx in frame_indices:
                             # GT frame
-                            tgt_frame_lat = tgt_lat[0:1, :, fidx:fidx+1, :, :].to("cuda", dtype=vae_dtype)
+                            tgt_frame_lat = tgt_lat[0:1, :, fidx:fidx+1, :, :].to(vae_device, dtype=vae_dtype)
                             gt_dec = self._vae_decoder(tgt_frame_lat)[0, :, 0].cpu()
                             gt_frames_decoded.append(norm_decoded(gt_dec))
 
                             # Prediction frame
                             try:
-                                pred_frame_lat = pred_clean[0:1, :, fidx:fidx+1, :, :].to("cuda", dtype=vae_dtype)
+                                pred_frame_lat = pred_clean[0:1, :, fidx:fidx+1, :, :].to(vae_device, dtype=vae_dtype)
                             except Exception:
-                                pred_frame_lat = tgt_noisy[0:1, :, fidx:fidx+1, :, :].to("cuda", dtype=vae_dtype)
+                                pred_frame_lat = tgt_noisy[0:1, :, fidx:fidx+1, :, :].to(vae_device, dtype=vae_dtype)
                             pred_dec = self._vae_decoder(pred_frame_lat)[0, :, 0].cpu()
                             pred_frames_decoded.append(norm_decoded(pred_dec))
 
-                    # Move VAE back to CPU
-                    self._vae_decoder = self._vae_decoder.to("cpu")
+                    # Move VAE back to CPU only in single-GPU mode
+                    if not is_multi_gpu:
+                        self._vae_decoder = self._vae_decoder.to("cpu")
                     torch.cuda.empty_cache()
 
                     # Create PORTRAIT grid (taller than wide) with 2 columns:
@@ -1318,9 +1417,11 @@ class LtxvTrainer:
                     logger.debug(f"Decoded frame save failed: {e}")
                     import traceback
                     logger.debug(traceback.format_exc())
-                    # Ensure VAE back on CPU even on error
+                    # Ensure VAE back on CPU even on error (only in single-GPU mode)
                     if hasattr(self, '_vae_decoder') and self._vae_decoder is not None:
-                        self._vae_decoder = self._vae_decoder.to("cpu")
+                        hw_devices = self._config.hardware.devices
+                        if hw_devices.transformer == hw_devices.vae_decoder:
+                            self._vae_decoder = self._vae_decoder.to("cpu")
 
         except Exception as e:
             # Silent fail - debug only

@@ -215,6 +215,14 @@ class LtxvTrainer:
                     self._accelerator.backward(loss)
 
                     if self._accelerator.sync_gradients and cfg.optimization.max_grad_norm > 0:
+                        # Cast any FP8 gradients to bf16 before clipping — PyTorch's
+                        # foreach_norm doesn't support FP8 dtypes (pre-quantized models)
+                        for p in self._trainable_params:
+                            if p.grad is not None and p.grad.dtype in (
+                                torch.float8_e4m3fn, torch.float8_e5m2,
+                            ):
+                                p.grad = p.grad.to(torch.bfloat16)
+
                         self._accelerator.clip_grad_norm_(
                             self._trainable_params,
                             cfg.optimization.max_grad_norm,
@@ -574,16 +582,7 @@ class LtxvTrainer:
         # after the accelerator is set up, and we can detect FSDP.
         transformer_dtype = torch.bfloat16 if self._config.model.training_mode == "lora" else torch.float32
 
-        # Check if the checkpoint already contains FP8 weights (pre-quantized).
-        # If so, skip the blanket dtype cast which would upcast FP8→bf16 and double memory.
-        has_fp8_weights = any(
-            p.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-            for p in self._transformer.parameters()
-        )
-        if has_fp8_weights:
-            logger.info("Detected pre-quantized FP8 weights — skipping dtype cast to preserve FP8")
-        else:
-            self._transformer = self._transformer.to(dtype=transformer_dtype)
+        self._transformer = self._transformer.to(dtype=transformer_dtype)
 
         # Quantize on CPU first (the full bf16 model is ~38GB, won't fit on most GPUs)
         if self._config.acceleration.quantization is not None:
@@ -594,10 +593,15 @@ class LtxvTrainer:
             self._transformer = quantize_model(
                 self._transformer,
                 precision=self._config.acceleration.quantization,
+                device=hw_devices.transformer,
             )
 
+        # Free any GPU memory cached during blockwise quantization
+        if self._config.acceleration.quantization is not None:
+            torch.cuda.empty_cache()
+
         # After quantization (or if no quantization), move transformer to target device
-        # INT8 quantized model is ~12GB, bf16 LoRA model is ~20GB (with frozen base)
+        # INT8 quantized model is ~12GB, FP8 pre-quantized ~25GB, bf16 LoRA model is ~38GB
         if is_multi_gpu:
             model_size = "quantized" if self._config.acceleration.quantization else "bf16"
             logger.info(f"Moving {model_size} transformer to {hw_devices.transformer}...")

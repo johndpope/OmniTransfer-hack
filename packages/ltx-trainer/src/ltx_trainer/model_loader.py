@@ -54,7 +54,8 @@ def load_transformer(
     Args:
         checkpoint_path: Path to the safetensors checkpoint file
         device: Device to load model on
-        dtype: Data type for model weights
+        dtype: Data type for model weights. If the checkpoint contains FP8 weights,
+               dtype is set to None to preserve native dtypes and avoid upcasting.
     Returns:
         Loaded LTXModel transformer
     """
@@ -64,11 +65,32 @@ def load_transformer(
         LTXModelConfigurator,
     )
 
+    # Detect pre-quantized FP8 safetensors — pass dtype=None to preserve FP8 weights.
+    # Casting FP8→bf16 would double memory usage and defeat the purpose of pre-quantization.
+    effective_dtype = dtype
+    if dtype is not None:
+        import safetensors.torch
+
+        try:
+            with safetensors.torch.safe_open(str(checkpoint_path), framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    if "transformer_blocks" in key and "weight" in key:
+                        t = f.get_tensor(key)
+                        if t.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                            logger.info(
+                                f"Detected pre-quantized FP8 checkpoint ({t.dtype}) — "
+                                "loading with dtype=None to preserve FP8 weights"
+                            )
+                            effective_dtype = None
+                        break
+        except Exception:
+            pass  # If detection fails, use the specified dtype
+
     return SingleGPUModelBuilder(
         model_path=str(checkpoint_path),
         model_class_configurator=LTXModelConfigurator,
         model_sd_ops=LTXV_MODEL_COMFY_RENAMING_MAP,
-    ).build(device=_to_torch_device(device), dtype=dtype)
+    ).build(device=_to_torch_device(device), dtype=effective_dtype)
 
 
 def load_video_vae_encoder(

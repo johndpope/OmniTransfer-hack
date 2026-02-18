@@ -137,15 +137,17 @@ def _quantize_blockwise(
         task = progress.add_task("Quantizing transformer blocks", total=len(transformer_blocks))
 
         for block in transformer_blocks:
-            # Move block to GPU
-            block.to(device, dtype=original_dtype, non_blocking=True)
+            # Move block to GPU (synchronous to avoid memory pileup)
+            block.to(device, dtype=original_dtype)
 
             # Quantize on GPU
             quantize(block, weights=weight_quant, activations=activations_quant, exclude=EXCLUDE_PATTERNS)
             freeze(block)
 
-            # Move back to CPU to free up VRAM for next block
-            block.to("cpu", non_blocking=True)
+            # Move back to CPU — synchronous + cache flush to fully release GPU memory
+            block.to("cpu")
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
             progress.advance(task)
 
@@ -162,10 +164,14 @@ def _quantize_blockwise(
             continue  # Don't quantize these modules
 
         # Move to device, quantize, freeze, move back
-        module.to(device, dtype=original_dtype, non_blocking=True)
+        module.to(device, dtype=original_dtype)
         quantize(module, weights=weight_quant, activations=activations_quant, exclude=EXCLUDE_PATTERNS)
         freeze(module)
-        module.to("cpu", non_blocking=True)
+        module.to("cpu")
+
+    # Final cache flush after all quantization
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
 
 def _get_quanto_dtype(precision: QuantizationOptions) -> torch.dtype:

@@ -2,6 +2,14 @@
 
 This file provides guidance to AI coding assistants (Claude, Cursor, etc.) when working with code in this repository.
 
+## ⚠️ Killing Stale Processes
+
+> To kill all stale Python processes (e.g., competing training runs), use:
+> ```bash
+> ~/killer.sh python
+> ```
+> Run this before launching GPU-intensive training to ensure no competing processes on the GPU.
+
 ## ⚠️ CRITICAL: Private Branch Policy
 
 > **NEVER push `private/*` branches to the public repository!**
@@ -41,37 +49,32 @@ This file provides guidance to AI coding assistants (Claude, Cursor, etc.) when 
 
 ---
 
-## ⚠️ CRITICAL: Model Loading — NO Runtime Quantization
+## ⚠️ CRITICAL: Model Quantization for Training
 
-> **NEVER use models that require runtime quantization (`int8-quanto`, `fp8-quanto`, etc.)!**
+> **Pre-quantized FP8 checkpoints (`ltx-2-19b-dev-fp8.safetensors`) DO NOT work for LoRA training!**
 >
-> Runtime quantization of the 19B parameter transformer takes **20+ minutes** on every load
-> and may hang indefinitely on Blackwell (sm_120) GPUs. This is unacceptable.
+> PyTorch autograd doesn't support `float8_e4m3fn` tensors — backward pass fails with
+> `NotImplementedError: "ufunc_add_CUDA" not implemented for 'Float8_e4m3fn'`.
+> The FP8 file is only useful for **inference** (no gradients needed).
 >
-> **ALWAYS use pre-quantized model checkpoints:**
+> **For training, use the bf16 model + quanto runtime quantization:**
 >
 > | Model File | Size | Use For |
 > |-----------|------|---------|
-> | `ltx-2-19b-dev-fp8.safetensors` | 26 GB | **Training (preferred)** — native FP8 tensor cores on Blackwell |
-> | `ltx-2-19b-dev.safetensors` | 43 GB | **DO NOT USE for training** — too large, requires runtime quantization |
-> | `ltx-2-19b-dev-fp4.safetensors` | 20 GB | **DO NOT USE** — no LoRA fusion kernel support in ltx-core |
+> | `ltx-2-19b-dev.safetensors` | 43 GB | **Training** — bf16 weights, quantized at runtime by quanto |
+> | `ltx-2-19b-dev-fp8.safetensors` | 26 GB | **Inference ONLY** — no autograd support |
+> | `ltx-2-19b-dev-fp4.safetensors` | 20 GB | **DO NOT USE** — no LoRA fusion kernel in ltx-core |
 >
-> **Config must ALWAYS be:**
+> **Config for training:**
 > ```yaml
 > model:
->   model_path: "/media/2TB/ltx-models/ltx2/ltx-2-19b-dev-fp8.safetensors"
+>   model_path: "/media/2TB/ltx-models/ltx2/ltx-2-19b-dev.safetensors"
 > acceleration:
->   quantization: null  # NEVER set to "int8-quanto" or "fp8-quanto"
+>   quantization: "fp8-quanto"  # Runtime quantization (~20 min first time)
 > ```
 >
-> **If the FP8 file is missing**, download it first:
-> ```bash
-> wget -c "https://huggingface.co/Lightricks/LTX-2/resolve/main/ltx-2-19b-dev-fp8.safetensors" \
->     -O /media/2TB/ltx-models/ltx2/ltx-2-19b-dev-fp8.safetensors
-> ```
->
-> **Never set `quantization` to anything other than `null`.** The pre-quantized FP8 checkpoint
-> loads instantly with zero quantization overhead.
+> **Note:** quanto quantization takes ~20 minutes on first load. A future improvement would
+> be to cache the quantized state dict so subsequent loads are instant.
 
 ---
 

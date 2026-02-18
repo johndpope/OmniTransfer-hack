@@ -44,3 +44,4 @@ packages/ltx-trainer/credentials.env
 
 # Log files
 *.log
+wandb/*

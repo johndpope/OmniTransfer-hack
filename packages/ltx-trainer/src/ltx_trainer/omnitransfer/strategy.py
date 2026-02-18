@@ -977,6 +977,28 @@ class OmniTransferStrategy(TrainingStrategy):
         self._vae_decoder = vae_decoder
         logger.info("VAE decoder set for pixel-space loss computation (Grok recommended)")
 
+        # Diagnostic probe: verify decoder output shape with dummy input
+        try:
+            param = next(vae_decoder.parameters())
+            dev, dt = param.device, param.dtype
+            with torch.no_grad(), torch.amp.autocast(device_type=dev.type, enabled=False):
+                dummy = torch.randn(1, 128, 1, 14, 26, device=dev, dtype=dt)
+                out = vae_decoder(dummy)
+            logger.info(
+                f"VAE decoder probe: input={dummy.shape} → output={out.shape}, "
+                f"patch_size={getattr(vae_decoder, 'patch_size', '?')}, "
+                f"type={type(vae_decoder).__name__}"
+            )
+            if out.shape[1] != 3:
+                logger.error(
+                    f"VAE decoder probe FAILED: expected 3 channels, got {out.shape[1]}! "
+                    f"Pixel-space VGG style loss will fall back to latent-space."
+                )
+            del dummy, out
+            torch.cuda.empty_cache()
+        except Exception as e:
+            logger.warning(f"VAE decoder probe failed: {e}")
+
     def get_trainable_parameters(self) -> list:
         """Get trainable parameters for OmniTransfer components based on training stage.
 
@@ -1097,6 +1119,10 @@ class OmniTransferStrategy(TrainingStrategy):
         [GROK RECOMMENDED] LPIPS expects RGB images in [-1, 1], not latent vectors.
         VGG features are meaningless on latents - they need proper image pixels.
 
+        IMPORTANT: This function preserves gradient flow so that style/perceptual
+        losses can backpropagate through the VAE decoder to the predicted latents
+        and ultimately train the model. DO NOT use detach() or inference_mode().
+
         Args:
             latents: Video latents [B, C, F, H, W]
             sample_frames: Number of frames to decode (for efficiency)
@@ -1105,11 +1131,13 @@ class OmniTransferStrategy(TrainingStrategy):
             Decoded RGB frames [B*sample_frames, 3, H, W] in [-1, 1] or None if decoder unavailable
         """
         if self._vae_decoder is None:
-            if self.config.use_decoded_pixels_for_lpips or self.config.use_decoded_pixels_for_style:
-                logger.warning(
-                    "VAE decoder not set but use_decoded_pixels enabled. "
-                    "Call set_vae_decoder() from trainer. Falling back to latent-space loss."
-                )
+            if not getattr(self, '_vae_decode_warned', False):
+                if self.config.use_decoded_pixels_for_lpips or self.config.use_decoded_pixels_for_style:
+                    logger.warning(
+                        "VAE decoder not set but use_decoded_pixels enabled. "
+                        "Call set_vae_decoder() from trainer. Falling back to latent-space loss."
+                    )
+                self._vae_decode_warned = True
             return None
 
         try:
@@ -1125,31 +1153,70 @@ class OmniTransferStrategy(TrainingStrategy):
             # Extract sampled frames [B, C, sample_frames, H, W]
             sampled = latents[:, :, frame_indices, :, :]
 
-            # Decode with VAE (expects [B, C, F, H, W])
-            with torch.inference_mode():
-                # VideoDecoder expects [B, C, F, H, W] and returns [B, C, F, H, W]
-                decoded = self._vae_decoder(sampled.to(self._vae_decoder.parameters().__next__().device))
+            # Detach + clone to avoid keeping the decoder's computation graph in
+            # memory (saves ~2GB VRAM on 32GB GPUs). This means decoded pixels are
+            # gradient-disconnected — pixel-space losses won't backpropagate.
+            # For gradient-connected style loss, use latent-space Gram matrices
+            # by setting use_decoded_pixels_for_style=false in config.
+            vae_param = next(self._vae_decoder.parameters())
+            vae_device = vae_param.device
+            vae_dtype = vae_param.dtype
+            sampled_vae = sampled.detach().clone().to(device=vae_device, dtype=vae_dtype)
+
+            # Disable autocast to prevent mixed-precision context from
+            # interfering with the decoder's internal operations.
+            with torch.amp.autocast(device_type=vae_device.type, enabled=False):
+                decoded = self._vae_decoder(sampled_vae)
+
+            # Log shape on first call
+            if not getattr(self, '_vae_decode_logged', False):
+                logger.debug(
+                    f"VAE decode: input={sampled_vae.shape}, output={decoded.shape}, "
+                    f"dtype={decoded.dtype}"
+                )
+                self._vae_decode_logged = True
 
             # Reshape to [B*F, C, H, W] for LPIPS/VGG
-            decoded = decoded.to(device=device, dtype=dtype)
-            decoded = decoded.permute(0, 2, 1, 3, 4)  # [B, F, C, H, W]
-            decoded = decoded.reshape(-1, *decoded.shape[2:])  # [B*F, C, H, W]
+            # Decoder outputs [B, 3, F, H, W]. Permute to [B, F, 3, H, W] then flatten.
+            # Keep decoded on VAE device (cuda:1) to avoid VRAM pressure on training GPU.
+            # VGG + Gram matrices compute on VAE device; only scalar loss moves back.
+            if decoded.dim() == 5:
+                decoded = decoded.permute(0, 2, 1, 3, 4)  # [B, F, C, H, W]
+                decoded = decoded.reshape(-1, *decoded.shape[2:])  # [B*F, C, H, W]
 
-            # Ensure 3 channels (RGB)
+            # Verify 3 RGB channels (decoder with unpatchify should produce exactly 3)
             if decoded.shape[1] != 3:
-                if decoded.shape[1] > 3:
-                    decoded = decoded[:, :3]
+                # Try manual unpatchify if decoder returned pre-unpatchify output
+                patch_size = getattr(self._vae_decoder, 'patch_size', 4)
+                expected_pre_unpatchify = 3 * patch_size * patch_size
+                if decoded.shape[1] == expected_pre_unpatchify and decoded.dim() == 4:
+                    from ltx_core.model.video_vae.ops import unpatchify
+                    logger.warning(
+                        f"VAE decoder returned {decoded.shape[1]} channels (pre-unpatchify). "
+                        f"Applying manual unpatchify with patch_size={patch_size}."
+                    )
+                    # unpatchify expects 5D: add temporal dim
+                    decoded = decoded.unsqueeze(2)  # [B*F, C, 1, H, W]
+                    decoded = unpatchify(decoded, patch_size_hw=patch_size, patch_size_t=1)
+                    decoded = decoded.squeeze(2)  # [B*F, 3, H*ps, W*ps]
                 else:
-                    decoded = decoded.repeat(1, 3, 1, 1)[:, :3]
+                    logger.warning(
+                        f"VAE decoder output has {decoded.shape[1]} channels instead of 3 RGB. "
+                        f"Full shape: {decoded.shape}. Falling back to latent-space loss."
+                    )
+                    return None
 
-            # Normalize to [-1, 1] for LPIPS
-            # VAE output is typically in [0, 1] or similar range
+            # Clamp to [-1, 1] for LPIPS/VGG
             decoded = decoded.clamp(-1, 1)
 
             return decoded
 
         except Exception as e:
-            logger.warning(f"Failed to decode latents to pixels: {e}")
+            if not getattr(self, '_vae_decode_error_logged', False):
+                logger.warning(f"Failed to decode latents to pixels: {e}")
+                import traceback
+                logger.debug(traceback.format_exc())
+                self._vae_decode_error_logged = True
             return None
 
     def _get_vgg_features(self, images: Tensor) -> dict[str, Tensor]:
@@ -1186,6 +1253,18 @@ class OmniTransferStrategy(TrainingStrategy):
                     'relu5_1': 29, 'relu5_2': 31, 'relu5_3': 33, 'relu5_4': 35,
                 }
 
+            # Resize to 256px for VGG — full resolution (e.g., 448x832) wastes
+            # memory and compute; Gram-matrix style loss is scale-invariant.
+            _, _, h, w = images.shape
+            max_dim = max(h, w)
+            if max_dim > 256:
+                scale = 256 / max_dim
+                new_h = max(1, int(h * scale))
+                new_w = max(1, int(w * scale))
+                images = torch.nn.functional.interpolate(
+                    images, size=(new_h, new_w), mode="bilinear", align_corners=False
+                )
+
             # Normalize images for VGG (expects ImageNet normalization)
             # Input is [-1, 1], convert to [0, 1] then normalize
             images = (images + 1) / 2  # [-1, 1] -> [0, 1]
@@ -1193,24 +1272,9 @@ class OmniTransferStrategy(TrainingStrategy):
             std = torch.tensor([0.229, 0.224, 0.225], device=images.device).view(1, 3, 1, 1)
             images = (images - mean) / std
 
-            # Extract features at specified layers
+            # Run through VGG layers sequentially and grab features at target layers
             features = {}
             x = images.float()  # VGG expects float32
-            for name, layer_idx in self._vgg_layers.items():
-                if name in self.config.vgg_style_layers:
-                    # Run up to this layer
-                    while len(features) == 0 or max(self._vgg_layers[n] for n in features) < layer_idx:
-                        next_idx = min(k for k in self._vgg_layers.values() if k > max((self._vgg_layers[n] for n in features), default=-1))
-                        for i, layer in enumerate(self._vgg_features):
-                            if i <= next_idx:
-                                x = layer(x)
-                            if i == layer_idx:
-                                features[name] = x.clone()
-                                break
-
-            # Simpler approach: just run through and grab features
-            features = {}
-            x = images.float()
             for i, layer in enumerate(self._vgg_features):
                 x = layer(x)
                 for name, idx in self._vgg_layers.items():
@@ -1972,16 +2036,10 @@ class OmniTransferStrategy(TrainingStrategy):
             return None
 
         try:
-            # Initialize LPIPS model lazily
-            if not hasattr(self, '_lpips_model'):
-                self._lpips_model = lpips.LPIPS(net='vgg').to(target_pred.device)
-                self._lpips_model.eval()
-                for p in self._lpips_model.parameters():
-                    p.requires_grad = False
-
             # Compute predicted clean latent from velocity prediction
             # For flow matching: clean = noisy - sigma * velocity
             dtype = inputs.tgt_latent_noisy.dtype
+            device = inputs.tgt_latent_noisy.device
             sigmas = inputs.sigmas.to(dtype=dtype).view(-1, 1, 1, 1, 1)
             clean_pred = inputs.tgt_latent_noisy - sigmas * target_pred.view_as(inputs.tgt_latent_noisy)
             target_clean = inputs.tgt_latent_raw
@@ -1992,10 +2050,19 @@ class OmniTransferStrategy(TrainingStrategy):
                 target_pixels = self._decode_latents_to_pixels(target_clean, sample_frames=4)
 
                 if pred_pixels is not None and target_pixels is not None:
+                    # Initialize LPIPS on the pixel device (VAE device) to avoid
+                    # VRAM pressure on the training GPU
+                    pixel_device = pred_pixels.device
+                    if not hasattr(self, '_lpips_model'):
+                        self._lpips_model = lpips.LPIPS(net='vgg').to(pixel_device)
+                        self._lpips_model.eval()
+                        for p in self._lpips_model.parameters():
+                            p.requires_grad = False
+
                     # Pixels are already in [-1, 1] with 3 RGB channels
                     # Cast to float32 for LPIPS model (VGG expects float32)
                     lpips_loss = self._lpips_model(pred_pixels.float(), target_pixels.float()).mean()
-                    return lpips_loss
+                    return lpips_loss.to(device)
                 else:
                     # Fall through to latent-space fallback
                     logger.debug("VAE decode failed, falling back to latent-space LPIPS")
@@ -2027,9 +2094,22 @@ class OmniTransferStrategy(TrainingStrategy):
                     pred_norm = pred_norm.repeat(1, 3, 1, 1)[:, :3]
                     target_norm = target_norm.repeat(1, 3, 1, 1)[:, :3]
 
-            # Cast to float32 for LPIPS model (VGG expects float32)
-            lpips_loss = self._lpips_model(pred_norm.float(), target_norm.float()).mean()
-            return lpips_loss
+            # Lazily initialize LPIPS model on VAE device to avoid VRAM pressure
+            # on the training GPU (cuda:0)
+            if not hasattr(self, '_lpips_model'):
+                lpips_device = self._vae_decoder.device if hasattr(self, '_vae_decoder') and self._vae_decoder is not None else device
+                self._lpips_model = lpips.LPIPS(net='vgg').to(lpips_device)
+                self._lpips_model.eval()
+                for p in self._lpips_model.parameters():
+                    p.requires_grad = False
+
+            # Move tensors to LPIPS model device, compute, move result back
+            lpips_device = next(self._lpips_model.parameters()).device
+            lpips_loss = self._lpips_model(
+                pred_norm.float().to(lpips_device),
+                target_norm.float().to(lpips_device),
+            ).mean()
+            return lpips_loss.to(device)
 
         except Exception as e:
             logger.warning(f"LPIPS loss computation failed: {e}")
@@ -2150,13 +2230,24 @@ class OmniTransferStrategy(TrainingStrategy):
                 pred_pixels = self._decode_latents_to_pixels(tgt_pred_5d, sample_frames=3)
 
                 if ref_pixels is not None and pred_pixels is not None:
+                    if not getattr(self, '_style_pixel_logged', False):
+                        logger.info(
+                            f"Style loss: using PIXEL-SPACE VGG features "
+                            f"(ref={ref_pixels.shape}, pred={pred_pixels.shape}, "
+                            f"grad={pred_pixels.requires_grad})"
+                        )
+                        self._style_pixel_logged = True
+
                     # Use VGG features for multi-layer Gram matrices
                     if self.config.use_vgg_style_features and VGG_AVAILABLE:
                         ref_features = self._get_vgg_features(ref_pixels)
                         pred_features = self._get_vgg_features(pred_pixels)
 
                         if ref_features and pred_features:
-                            style_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
+                            # Accumulate on the feature device (VAE device, cuda:1)
+                            # to avoid VRAM pressure on training GPU (cuda:0).
+                            feat_device = next(iter(ref_features.values())).device
+                            style_loss = torch.tensor(0.0, device=feat_device, dtype=torch.float32)
                             num_layers = 0
 
                             for layer_name in ref_features:
@@ -2178,7 +2269,8 @@ class OmniTransferStrategy(TrainingStrategy):
                                     num_layers += 1
 
                             if num_layers > 0:
-                                return style_loss / num_layers
+                                # Move scalar loss back to training device
+                                return (style_loss / num_layers).to(device)
                         else:
                             logger.debug("VGG feature extraction returned empty, falling back")
 
@@ -2193,11 +2285,21 @@ class OmniTransferStrategy(TrainingStrategy):
                     pred_gram = torch.bmm(pred_flat, pred_flat.transpose(1, 2)) / n_elements
 
                     style_loss = torch.nn.functional.mse_loss(pred_gram.float(), ref_gram.float())
-                    return style_loss
+                    return style_loss.to(device)
                 else:
-                    logger.debug("VAE decode failed, falling back to latent-space style loss")
+                    if not getattr(self, '_style_latent_logged', False):
+                        logger.info("Style loss: VAE decode returned None, using LATENT-SPACE Gram matrices")
+                        self._style_latent_logged = True
 
-            # Fallback: Latent-space Gram matrices (not recommended per Grok)
+            # Latent-space Gram matrices — gradient-connected alternative to pixel-space VGG.
+            # Less rich than VGG features but gradients flow through to model parameters.
+            if not getattr(self, '_style_latent_direct_logged', False):
+                logger.info(
+                    "Style loss: using LATENT-SPACE Gram matrices "
+                    f"(128-ch, gradient-connected, ref_grad={ref_latent.requires_grad}, "
+                    f"pred_grad={tgt_pred_5d.requires_grad})"
+                )
+                self._style_latent_direct_logged = True
             num_frames = ref_latent.shape[2]
             sample_frames = min(3, num_frames)
             frame_indices = torch.linspace(0, num_frames - 1, sample_frames, device=device).long()

@@ -42,12 +42,12 @@ from ltx_trainer import logger
 
 
 # Default model paths (can be overridden via CLI)
-DEFAULT_MODEL_PATH = "/media/2TB/ltx-models/ltx2/ltx-2-19b-dev-fp8.safetensors"
+DEFAULT_MODEL_PATH = "/media/2TB/ltx-models/ltx2/ltx-2-19b-dev.safetensors"
 DEFAULT_TEXT_ENCODER_PATH = "/media/2TB/ltx-models/gemma"
 DEFAULT_CONFIG_TEMPLATE = Path(__file__).parent.parent / "configs" / "ltx2_progressive_overfit.yaml"
 
 # Training chunk size
-STEPS_PER_CHUNK = 100
+STEPS_PER_CHUNK = 250
 
 
 def encode_images(
@@ -110,9 +110,11 @@ def encode_images(
             }, out_path)
             logger.info(f"[Stage A] Saved latent {latent.squeeze(0).shape} to {out_path}")
 
-        # Cleanup VAE
+        # Cleanup VAE — only touch the encode device
         del vae_encoder
-        torch.cuda.empty_cache()
+        device_idx = torch.device(device).index or 0
+        with torch.cuda.device(device_idx):
+            torch.cuda.empty_cache()
         gc.collect()
         logger.info("[Stage A] VAE encoder unloaded")
 
@@ -219,9 +221,11 @@ def compute_text_embedding(
     else:
         logger.info(f"[Stage B] Final embedding already exists: {final_path}")
 
-    # Cleanup text encoder
+    # Cleanup text encoder — only touch the encode device
     del text_encoder
-    torch.cuda.empty_cache()
+    device_idx = torch.device(device).index or 0
+    with torch.cuda.device(device_idx):
+        torch.cuda.empty_cache()
     gc.collect()
     logger.info("[Stage B] Text encoder unloaded")
 
@@ -264,6 +268,12 @@ def generate_config(
     config["training_strategy"]["style_loss_weight"] = style_loss_weight
     config["training_strategy"]["lpips_weight"] = lpips_weight
 
+    # Explicitly set pixel-space decode flags (latent-space Gram matrices are
+    # gradient-connected and work better on 32GB GPUs than detached VGG)
+    config["training_strategy"]["use_decoded_pixels_for_style"] = False
+    config["training_strategy"]["use_decoded_pixels_for_lpips"] = False
+    config["training_strategy"]["use_vgg_style_features"] = False
+
     # Optimization
     config["optimization"]["steps"] = steps
     config["optimization"]["learning_rate"] = learning_rate
@@ -281,6 +291,9 @@ def generate_config(
     config["data"]["preprocessed_data_root"] = str(data_root)
     config["data"]["use_cached_final_embeddings"] = True
     config["data"]["final_embeddings_dir"] = "conditions_final"
+
+    # Checkpoint interval matches training steps (save at end of chunk)
+    config["checkpoints"]["interval"] = steps
 
     # Output directory
     pair_output = output_dir / pair_id / "output"
@@ -300,16 +313,85 @@ def generate_config(
 
 
 def find_latest_checkpoint(output_dir: Path) -> Path | None:
-    """Find the latest checkpoint in the output directory."""
-    ckpt_dir = output_dir / "checkpoints"
-    if not ckpt_dir.exists():
+    """Find the latest checkpoint in the output directory.
+
+    Searches the checkpoints/ subdirectory and also the output_dir itself,
+    since the trainer saves to output_dir/checkpoints/ by default.
+    """
+    search_dirs = [
+        output_dir / "checkpoints",
+        output_dir,
+    ]
+
+    all_checkpoints: list[Path] = []
+    for d in search_dirs:
+        if d.exists():
+            all_checkpoints.extend(d.glob("lora_weights_step_*.safetensors"))
+
+    if not all_checkpoints:
         return None
 
-    checkpoints = sorted(ckpt_dir.glob("lora_weights_step_*.safetensors"))
-    if not checkpoints:
-        return None
+    # Sort by modification time (most recent first)
+    all_checkpoints.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return all_checkpoints[0]
 
-    return checkpoints[-1]
+
+def cleanup_gpu_processes(exclude_pid: int | None = None) -> None:
+    """Kill stale Python processes on GPU to prevent OOM.
+
+    Only kills Python processes (not display servers etc.) that are using
+    GPU memory. Skips the current process.
+    """
+    import os
+
+    current_pid = os.getpid()
+    exclude_pids = {current_pid}
+    if exclude_pid:
+        exclude_pids.add(exclude_pid)
+
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid,name,used_memory",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return
+
+        for line in result.stdout.strip().split("\n"):
+            if not line.strip():
+                continue
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 3:
+                continue
+            pid = int(parts[0])
+            name = parts[1]
+
+            # Only kill Python processes, skip system processes
+            if pid in exclude_pids:
+                continue
+            if "python" not in name.lower():
+                continue
+
+            mem_mb = int(parts[2])
+            if mem_mb < 100:  # Skip tiny allocations
+                continue
+
+            logger.warning(f"Killing stale GPU process: PID={pid}, name={name}, VRAM={mem_mb}MB")
+            try:
+                os.kill(pid, 9)  # SIGKILL
+            except ProcessLookupError:
+                pass  # Already dead
+
+        # Wait for GPU memory to be freed
+        import time as _time
+        _time.sleep(2)
+        # NOTE: Do NOT call torch.cuda.empty_cache() here — it initializes
+        # a CUDA context on the default device (cuda:0), consuming ~1-6GB
+        # that competes with the training subprocess.
+
+    except Exception as e:
+        logger.warning(f"GPU cleanup failed (non-fatal): {e}")
 
 
 def parse_loss_from_output(output: str) -> float | None:
@@ -317,9 +399,15 @@ def parse_loss_from_output(output: str) -> float | None:
 
     The trainer logs lines like:
         Step 80/100 - Loss: 0.0423, LR: 1.00e-04, ...
+
+    The output may contain ANSI escape codes from rich logger, so we strip them.
     """
-    pattern = r"Loss:\s*([\d.]+)"
-    matches = re.findall(pattern, output)
+    # Strip ANSI escape sequences
+    ansi_escape = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07')
+    clean = ansi_escape.sub('', output)
+
+    pattern = r"Loss:\s*([\d.]+(?:e[+-]?\d+)?)"
+    matches = re.findall(pattern, clean)
     if matches:
         return float(matches[-1])
     return None
@@ -358,15 +446,36 @@ def run_training_chunk(
     logger.info(f"[Stage D] Running: {' '.join(cmd)}")
     logger.info(f"[Stage D] Log file: {log_path}")
 
-    with open(log_path, "w") as log_file:
+    # Release any GPU memory held by this parent process before
+    # launching the training subprocess. This prevents the parent from
+    # competing for GPU VRAM with the child (which needs ~25GB).
+    gc.collect()
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            with torch.cuda.device(i):
+                torch.cuda.empty_cache()
+        # Force-release CUDA context from parent process
+        torch.cuda.synchronize()
+
+    with open(log_path, "wb") as log_file:
+        # Start subprocess with clean CUDA environment.
+        # Copy current env but ensure PYTORCH_ALLOC_CONF propagates.
+        env = os.environ.copy()
+        env.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+        # Prevent W&B from spawning a background service process that
+        # initialises a CUDA context (~8 GB).  The config template already
+        # sets wandb.enabled=false, but an env-var is a belt-and-braces
+        # safety net that blocks W&B entirely in the subprocess.
+        env.setdefault("WANDB_MODE", "disabled")
         result = subprocess.run(
             cmd,
             stdout=log_file,
             stderr=subprocess.STDOUT,
             timeout=timeout,
+            env=env,
         )
 
-    output = log_path.read_text()
+    output = log_path.read_text(errors="replace")
 
     if result.returncode != 0:
         logger.error(f"Training failed with code {result.returncode}")
@@ -384,7 +493,7 @@ def progressive_overfit(
     target_image: Path,
     prompt: str,
     max_steps: int = 500,
-    convergence_loss: float = 0.005,
+    convergence_loss: float = 5.0,
     model_path: Path = Path(DEFAULT_MODEL_PATH),
     text_encoder_path: Path = Path(DEFAULT_TEXT_ENCODER_PATH),
     config_template: Path = DEFAULT_CONFIG_TEMPLATE,
@@ -394,7 +503,7 @@ def progressive_overfit(
     target_w: int = 832,
     learning_rate: float = 1e-4,
     style_loss_weight: float = 0.5,
-    lpips_weight: float = 0.1,
+    lpips_weight: float = 0.0,
     lora_rank: int = 64,
     encode_device: str = "cuda:1",
     train_device: str = "cuda:0",
@@ -418,7 +527,7 @@ def progressive_overfit(
         target_w: Target image width (divisible by 32).
         learning_rate: Learning rate for training.
         style_loss_weight: Weight for VGG Gram matrix loss.
-        lpips_weight: Weight for LPIPS perceptual loss.
+        lpips_weight: Weight for LPIPS perceptual loss (0.0 saves VRAM).
         lora_rank: LoRA adapter rank.
         encode_device: CUDA device for encoding stages.
         train_device: CUDA device for training.
@@ -439,6 +548,9 @@ def progressive_overfit(
     logger.info(f"  Max steps: {max_steps}, Convergence: {convergence_loss}")
     logger.info("=" * 60)
 
+    # Kill any stale GPU processes from previous runs
+    cleanup_gpu_processes()
+
     start_time = time.time()
 
     # ================================================================
@@ -454,8 +566,10 @@ def progressive_overfit(
         target_w=target_w,
     )
 
-    # Force GPU cleanup after VAE encoding
-    torch.cuda.empty_cache()
+    # Cleanup: encode functions handle their own GPU cleanup.
+    # IMPORTANT: Do NOT call torch.cuda.empty_cache() without device context —
+    # it initializes CUDA on the default device (cuda:0), consuming ~1-6GB
+    # that competes with the training subprocess.
     gc.collect()
 
     # ================================================================
@@ -470,8 +584,7 @@ def progressive_overfit(
         load_in_8bit=load_in_8bit,
     )
 
-    # Force GPU cleanup after text encoding
-    torch.cuda.empty_cache()
+    # Let encode functions handle their own cleanup.
     gc.collect()
 
     # ================================================================
@@ -504,6 +617,12 @@ def progressive_overfit(
             encode_device=encode_device,
             train_device=train_device,
         )
+
+        # Clean up before each chunk (previous chunk's subprocess is already dead,
+        # so we just need gc.collect() — the subprocess released its own GPU memory).
+        # IMPORTANT: Do NOT call torch.cuda.empty_cache() here — it initializes
+        # CUDA context on cuda:0, consuming ~1-6GB that competes with the next chunk.
+        gc.collect()
 
         # Stage D: Run training chunk
         success, loss, output = run_training_chunk(config_path)
@@ -591,11 +710,11 @@ Examples:
     parser.add_argument("--prompt", type=str, required=True, help="Text prompt describing transformation")
 
     # Training parameters
-    parser.add_argument("--max-steps", type=int, default=500, help="Max total training steps (default: 500)")
-    parser.add_argument("--convergence-loss", type=float, default=0.005, help="Stop if loss < this (default: 0.005)")
+    parser.add_argument("--max-steps", type=int, default=750, help="Max total training steps (default: 750)")
+    parser.add_argument("--convergence-loss", type=float, default=5.0, help="Stop if loss < this (default: 5.0)")
     parser.add_argument("--learning-rate", type=float, default=1e-4, help="Learning rate (default: 1e-4)")
     parser.add_argument("--style-loss-weight", type=float, default=0.5, help="VGG style loss weight (default: 0.5)")
-    parser.add_argument("--lpips-weight", type=float, default=0.1, help="LPIPS loss weight (default: 0.1)")
+    parser.add_argument("--lpips-weight", type=float, default=0.0, help="LPIPS loss weight (default: 0.0, saves VRAM)")
     parser.add_argument("--lora-rank", type=int, default=64, help="LoRA rank (default: 64)")
 
     # Model paths

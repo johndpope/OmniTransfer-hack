@@ -49,6 +49,40 @@ This file provides guidance to AI coding assistants (Claude, Cursor, etc.) when 
 
 ---
 
+## ⚠️ CRITICAL: Never Store Important Output on /tmp
+
+> **`/tmp` is ephemeral — it gets wiped on reboot!** Never store:
+> - Training checkpoints
+> - Inference output images/videos
+> - Training configs
+> - Scripts
+> - Any artifact you'd be upset to lose
+>
+> **Use persistent storage instead:**
+>
+> | What | Store On | Example |
+> |------|----------|---------|
+> | Training output (checkpoints, logs) | `/media/2TB/training_output/<experiment>/` | `/media/2TB/training_output/isometric_phase3/` |
+> | Inference output (images, videos) | `/media/2TB/inference_output/` | `/media/2TB/inference_output/blade_runner.png` |
+> | Training configs | In the repo: `packages/ltx-trainer/configs/` | `configs/ltx2_isometric_phase3.yaml` |
+> | Scripts | In the repo: `packages/ltx-trainer/scripts/` | `scripts/omnitransfer_inference.py` |
+> | Training data (latents, embeddings) | `/media/2TB/` | `/media/2TB/diorama_training/` |
+>
+> **When creating training configs at runtime**, save them to `configs/` in the repo so they survive.
+> If you must use `/tmp` for scratch work, always copy the final result to persistent storage.
+>
+> **Example — WRONG:**
+> ```bash
+> output_dir: "/tmp/progressive_overfit/phase3/output"  # ❌ Gone after reboot!
+> ```
+>
+> **Example — CORRECT:**
+> ```bash
+> output_dir: "/media/2TB/training_output/isometric_phase3/output"  # ✅ Persistent
+> ```
+
+---
+
 ## ⚠️ CRITICAL: Model Quantization for Training
 
 > **Pre-quantized FP8 checkpoints (`ltx-2-19b-dev-fp8.safetensors`) DO NOT work for LoRA training!**

@@ -1,349 +1,384 @@
 #!/usr/bin/env python3
-"""OmniTransfer Inference Script for LTX-2.
+"""OmniTransfer Style Transfer Inference — single image output.
 
-Generate videos using a trained OmniTransfer model with reference video guidance.
-
-Quote: "OmniTransfer enables unified spatio-temporal video transfer through
-in-context learning, using a reference video to guide the generation of
-target videos." (Section 1, OmniTransfer paper)
-
-Supported task types:
-- Temporal tasks: motion_transfer, pose_reenactment, action_customization
-  (reference provides motion/temporal cues)
-- Appearance tasks: style_transfer, identity_preservation, scene_composition
-  (reference provides spatial/appearance cues)
+Generates an isometric 3D view from a movie scene using the trained LoRA
+plus ConceptEmbedding and TMA strategy parameters.
 
 Usage:
-    python scripts/omnitransfer_inference.py \\
-        --model-path /path/to/ltx2_model.safetensors \\
-        --lora-path outputs/omnitransfer_stage3/checkpoint-final \\
-        --reference-video /path/to/reference.mp4 \\
-        --prompt "A person dancing gracefully" \\
-        --task-type motion_transfer \\
-        --output output.mp4
+    cd ~/Documents/GitHub/ltx2-omnitransfer/packages/ltx-trainer
+    uv run python scripts/omnitransfer_inference.py \
+        --reference /media/2TB/movie_dioramas/blade_runner_rooftop/scene.jpg \
+        --lora /media/2TB/training_output/isometric_phase3/checkpoints/lora_weights_step_01000.safetensors \
+        --output /media/2TB/inference_output/blade_runner_isometric.png
+
+The script mirrors the training pipeline:
+  1. Encode reference image → latent (VAE on cuda:1)
+  2. Load transformer + LoRA (int8-quanto on cuda:0)
+  3. Load strategy params (ConceptEmbedding, TMA) from checkpoint
+  4. Construct reference + noisy target latents
+  5. Apply ConceptEmbedding to reference tokens
+  6. Apply TMA context to prompt embeddings
+  7. Apply TPB positional bias
+  8. Run denoising loop (X0 prediction with CFG)
+  9. Decode target latent → pixel image (VAE on cuda:1)
 """
 
 import argparse
+from dataclasses import replace
 from pathlib import Path
 
 import torch
-from tqdm import tqdm
+from PIL import Image
+from safetensors.torch import load_file
 
-from ltx_trainer import logger
-from ltx_trainer.model_loader import load_model
-from ltx_trainer.omnitransfer.components import OmniTransferTask
-from ltx_trainer.omnitransfer.latent_constructor import ReferenceLatentConstructor
-from ltx_trainer.video_utils import load_video_frames, resize_for_vae, save_video
+# ── Paths ────────────────────────────────────────────────────────────────────
+MODEL_PATH = Path("/media/2TB/ltx-models/ltx2/ltx-2-19b-dev.safetensors")
+CACHED_EMBEDDINGS_DIR = Path("/media/2TB/diorama_training/conditions_final")
+CACHED_QWEN_DIR = Path("/media/2TB/diorama_training/qwen_vl_features")
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+WIDTH, HEIGHT = 832, 448          # Must match training resolution
+FPS = 25.0
+INFERENCE_STEPS = 30
+GUIDANCE_SCALE = 4.0
+SEED = 42
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="OmniTransfer inference for video generation with reference guidance"
-    )
-
-    # Model paths
-    parser.add_argument(
-        "--model-path",
-        type=Path,
-        required=True,
-        help="Path to LTX-2 model checkpoint",
-    )
-    parser.add_argument(
-        "--text-encoder-path",
-        type=Path,
-        required=True,
-        help="Path to Gemma text encoder",
-    )
-    parser.add_argument(
-        "--lora-path",
-        type=Path,
-        default=None,
-        help="Path to trained OmniTransfer LoRA checkpoint",
-    )
-
-    # Input
-    parser.add_argument(
-        "--reference-video",
-        type=Path,
-        required=True,
-        help="Path to reference video",
-    )
-    parser.add_argument(
-        "--prompt",
-        type=str,
-        required=True,
-        help="Text prompt for generation",
-    )
-    parser.add_argument(
-        "--negative-prompt",
-        type=str,
-        default="worst quality, inconsistent motion, blurry, jittery, distorted",
-        help="Negative prompt",
-    )
-    parser.add_argument(
-        "--first-frame-image",
-        type=Path,
-        default=None,
-        help="Optional first frame image for conditioning",
-    )
-
-    # Task configuration
-    parser.add_argument(
-        "--task-type",
-        type=str,
-        default="motion_transfer",
-        choices=[
-            "motion_transfer",
-            "pose_reenactment",
-            "action_customization",
-            "style_transfer",
-            "identity_preservation",
-            "scene_composition",
-        ],
-        help="Type of transfer task",
-    )
-
-    # Generation parameters
-    parser.add_argument(
-        "--width",
-        type=int,
-        default=960,
-        help="Output video width",
-    )
-    parser.add_argument(
-        "--height",
-        type=int,
-        default=544,
-        help="Output video height",
-    )
-    parser.add_argument(
-        "--num-frames",
-        type=int,
-        default=97,
-        help="Number of frames to generate (must satisfy frames %% 8 == 1)",
-    )
-    parser.add_argument(
-        "--fps",
-        type=float,
-        default=25.0,
-        help="Output video frame rate",
-    )
-    parser.add_argument(
-        "--num-inference-steps",
-        type=int,
-        default=50,
-        help="Number of denoising steps",
-    )
-    parser.add_argument(
-        "--guidance-scale",
-        type=float,
-        default=4.0,
-        help="CFG guidance scale",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed",
-    )
-
-    # Output
-    parser.add_argument(
-        "--output",
-        type=Path,
-        required=True,
-        help="Output video path",
-    )
-
-    # Device
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="cuda",
-        help="Device to use",
-    )
-    parser.add_argument(
-        "--dtype",
-        type=str,
-        default="bfloat16",
-        choices=["float16", "bfloat16", "float32"],
-        help="Data type",
-    )
-
-    return parser.parse_args()
+    p = argparse.ArgumentParser(description="OmniTransfer isometric inference")
+    p.add_argument("--reference", type=Path, required=True, help="Reference scene image")
+    p.add_argument("--output", type=Path, default=Path("/media/2TB/inference_output/result.png"))
+    p.add_argument("--lora", type=Path, required=True, help="Path to LoRA checkpoint (.safetensors)")
+    p.add_argument("--steps", type=int, default=INFERENCE_STEPS)
+    p.add_argument("--cfg", type=float, default=GUIDANCE_SCALE)
+    p.add_argument("--seed", type=int, default=SEED)
+    p.add_argument("--no-quantize", action="store_true", help="Skip int8 quantization")
+    p.add_argument("--no-strategy", action="store_true",
+                    help="Skip loading ConceptEmbedding/TMA (use LoRA only)")
+    return p.parse_args()
 
 
-def get_task_enum(task_type: str) -> OmniTransferTask:
-    """Convert task type string to enum."""
-    task_map = {
-        "motion_transfer": OmniTransferTask.MOTION_TRANSFER,
-        "pose_reenactment": OmniTransferTask.POSE_REENACTMENT,
-        "action_customization": OmniTransferTask.ACTION_CUSTOMIZATION,
-        "style_transfer": OmniTransferTask.STYLE_TRANSFER,
-        "identity_preservation": OmniTransferTask.IDENTITY_PRESERVATION,
-        "scene_composition": OmniTransferTask.SCENE_COMPOSITION,
-    }
-    return task_map.get(task_type, OmniTransferTask.MOTION_TRANSFER)
+def load_and_prepare_image(path: Path, target_w: int, target_h: int) -> torch.Tensor:
+    """Load image, resize to target, return [1, 3, 1, H, W] in [-1, 1]."""
+    img = Image.open(path).convert("RGB")
+    img = img.resize((target_w, target_h), Image.LANCZOS)
+    import torchvision.transforms as T
+    tensor = T.ToTensor()(img)           # [3, H, W] in [0, 1]
+    tensor = tensor * 2.0 - 1.0          # → [-1, 1]
+    return tensor.unsqueeze(0).unsqueeze(2)  # [1, 3, 1, H, W]
+
+
+def get_video_positions(
+    num_frames: int, height: int, width: int,
+    batch_size: int, fps: float,
+    device: torch.device, dtype: torch.dtype,
+) -> torch.Tensor:
+    """Compute video positions [B, 3, seq_len, 2] matching training code."""
+    from ltx_core.components.patchifiers import VideoLatentPatchifier, get_pixel_coords
+    from ltx_core.types import SpatioTemporalScaleFactors, VideoLatentShape
+
+    patchifier = VideoLatentPatchifier(patch_size=1)
+    latent_coords = patchifier.get_patch_grid_bounds(
+        output_shape=VideoLatentShape(
+            frames=num_frames, height=height, width=width,
+            batch=batch_size, channels=128,
+        ),
+        device=device,
+    )
+    pixel_coords = get_pixel_coords(
+        latent_coords=latent_coords,
+        scale_factors=SpatioTemporalScaleFactors.default(),
+        causal_fix=True,
+    ).to(dtype)
+    pixel_coords[:, 0, ...] = pixel_coords[:, 0, ...] / fps
+    return pixel_coords
+
+
+def load_strategy_components(
+    state_dict: dict[str, torch.Tensor],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple:
+    """Load ConceptEmbedding and TMA from strategy.* keys in checkpoint.
+
+    Returns:
+        (concept_embedding, tma) — either can be None if not in checkpoint.
+    """
+    from ltx_trainer.omnitransfer.components import (
+        ConceptEmbedding,
+        ConceptEmbeddingConfig,
+        TaskAdaptiveMultimodalAlignment,
+    )
+
+    concept_embedding = None
+    tma = None
+
+    # Check for ConceptEmbedding params
+    ce_keys = {k[len("strategy.concept_embedding."):]: v
+               for k, v in state_dict.items()
+               if k.startswith("strategy.concept_embedding.")}
+    if ce_keys:
+        config = ConceptEmbeddingConfig(embedding_dim=128, task_specific=True)
+        concept_embedding = ConceptEmbedding(config)
+        concept_embedding.load_state_dict(ce_keys, strict=False)
+        concept_embedding = concept_embedding.to(device=device, dtype=dtype).eval()
+        print(f"   ✅ ConceptEmbedding loaded ({len(ce_keys)} params)")
+
+    # Check for TMA params
+    tma_keys = {k[len("strategy.tma."):]: v
+                for k, v in state_dict.items()
+                if k.startswith("strategy.tma.")}
+    if tma_keys:
+        # Match training config: mllm_hidden_dim=3584, output_dim=3840, 8 queries
+        tma = TaskAdaptiveMultimodalAlignment(
+            mllm_hidden_dim=3584,
+            output_dim=3840,  # matches Gemma embedding dim
+            num_connector_layers=3,
+            num_queries_per_task=8,
+        )
+        tma.load_state_dict(tma_keys, strict=False)
+        tma = tma.to(device=device, dtype=dtype).eval()
+        print(f"   ✅ TMA loaded ({len(tma_keys)} params)")
+
+    return concept_embedding, tma
 
 
 def main():
     args = parse_args()
+    args.output.parent.mkdir(parents=True, exist_ok=True)
 
-    # Validate frame count
-    if args.num_frames % 8 != 1:
-        raise ValueError(
-            f"num_frames must satisfy frames %% 8 == 1 for LTX-2, "
-            f"got {args.num_frames}. Valid values: 1, 9, 17, 25, ..., 97, ..."
-        )
+    device_transformer = torch.device("cuda:0")  # RTX 5090
+    device_vae = torch.device("cuda:1")           # RTX PRO 4000
+    dtype = torch.bfloat16
 
-    # Setup
-    dtype_map = {
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
-        "float32": torch.float32,
-    }
-    dtype = dtype_map[args.dtype]
-    device = torch.device(args.device)
-
-    # Set seed
     torch.manual_seed(args.seed)
-    if device.type == "cuda":
-        torch.cuda.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
 
-    logger.info(f"Running OmniTransfer inference with task: {args.task_type}")
+    # ── Step 1: Encode reference image with VAE ──────────────────────────────
+    print("📸 Loading VAE encoder and encoding reference image...")
+    from ltx_trainer.model_loader import load_video_vae_encoder, load_video_vae_decoder
 
-    # Load model components
-    logger.info("Loading model components...")
-    components = load_model(
-        model_path=args.model_path,
-        text_encoder_path=args.text_encoder_path,
-        dtype=dtype,
-        device=device,
+    vae_encoder = load_video_vae_encoder(MODEL_PATH).to(device_vae)
+    ref_pixels = load_and_prepare_image(args.reference, WIDTH, HEIGHT).to(device_vae, torch.float32)
+
+    with torch.inference_mode(), torch.autocast("cuda", dtype=dtype):
+        ref_latent = vae_encoder(ref_pixels)  # [1, 128, 1, 14, 26]
+    print(f"   Reference latent: {ref_latent.shape}")
+
+    del vae_encoder
+    torch.cuda.empty_cache()
+
+    # ── Step 2: Load transformer + LoRA ──────────────────────────────────────
+    print("🔧 Loading transformer (this takes ~2 min with quantization)...")
+    from ltx_trainer.model_loader import load_transformer
+
+    transformer = load_transformer(MODEL_PATH)  # loads to CPU
+
+    if not args.no_quantize:
+        print("   Quantizing to int8-quanto...")
+        from ltx_trainer.quantization import quantize_model
+        quantize_model(transformer, precision="int8-quanto")
+
+    transformer = transformer.to(device_transformer)
+
+    # Apply LoRA
+    print(f"   Loading LoRA from {args.lora.name}...")
+    from peft import LoraConfig as PeftLoraConfig, get_peft_model, set_peft_model_state_dict
+
+    lora_config = PeftLoraConfig(
+        r=64, lora_alpha=64, lora_dropout=0.0,
+        target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+        init_lora_weights=True,
     )
+    transformer = get_peft_model(transformer, lora_config)
 
-    # Load LoRA if provided
-    if args.lora_path is not None:
-        logger.info(f"Loading LoRA from {args.lora_path}")
-        from peft import PeftModel
-        components.transformer = PeftModel.from_pretrained(
-            components.transformer,
-            args.lora_path,
+    # Load full checkpoint (LoRA + strategy params)
+    full_state_dict = load_file(str(args.lora))
+
+    # Split: LoRA params vs strategy params
+    lora_dict = {k.replace("diffusion_model.", "", 1): v
+                 for k, v in full_state_dict.items()
+                 if not k.startswith("strategy.")}
+    set_peft_model_state_dict(transformer.get_base_model(), lora_dict)
+    transformer.eval()
+    print(f"   ✅ LoRA loaded. GPU: {torch.cuda.memory_allocated(0) / 1e9:.1f} GB")
+
+    # ── Step 2b: Load strategy components (ConceptEmbedding, TMA) ────────────
+    concept_embedding = None
+    tma = None
+    has_strategy = any(k.startswith("strategy.") for k in full_state_dict)
+
+    if has_strategy and not args.no_strategy:
+        print("🧩 Loading strategy components from checkpoint...")
+        concept_embedding, tma = load_strategy_components(
+            full_state_dict, device_transformer, dtype
         )
+    elif not has_strategy:
+        print("ℹ️  No strategy params in checkpoint (old format) — using LoRA only")
 
-    # Initialize latent constructor
-    latent_constructor = ReferenceLatentConstructor(
-        latent_channels=128,
-        default_task=get_task_enum(args.task_type),
-    )
+    # ── Step 3: Load cached text embeddings ──────────────────────────────────
+    print("📝 Loading cached text embeddings...")
+    cond = torch.load(CACHED_EMBEDDINGS_DIR / "0.pt", map_location="cpu", weights_only=True)
+    prompt_embeds = cond["video_prompt_embeds"].unsqueeze(0).to(device_transformer, dtype)
+    prompt_mask = cond["prompt_attention_mask"].unsqueeze(0).to(device_transformer)
 
-    # Load and encode reference video
-    logger.info("Processing reference video...")
-    ref_frames = load_video_frames(args.reference_video)
-    ref_frames = resize_for_vae(
-        ref_frames,
-        target_width=args.width,
-        target_height=args.height,
-    )
-    ref_frames = ref_frames.to(device, dtype=dtype).unsqueeze(0)
+    # For CFG, create unconditional embeddings (zeros)
+    neg_embeds = torch.zeros_like(prompt_embeds)
 
-    with torch.inference_mode():
-        ref_latent = components.vae_encoder.encode(ref_frames)
+    # ── Step 3b: Apply TMA to prompt embeddings ─────────────────────────────
+    if tma is not None and CACHED_QWEN_DIR.exists():
+        print("🔗 Applying TMA (Qwen VL features → cross-attention context)...")
+        # Load sample 0's Qwen features as proxy (all have same style task)
+        qwen_data = torch.load(CACHED_QWEN_DIR / "0.pt", map_location="cpu", weights_only=True)
+        qwen_features = qwen_data["qwen_features"].unsqueeze(0).to(device_transformer, dtype)
 
-    # Encode first frame if provided
-    first_frame_latent = None
-    if args.first_frame_image is not None:
-        logger.info("Processing first frame image...")
-        from PIL import Image
-        import torchvision.transforms as T
-
-        img = Image.open(args.first_frame_image).convert("RGB")
-        img = img.resize((args.width, args.height))
-        transform = T.Compose([T.ToTensor(), T.Normalize([0.5], [0.5])])
-        first_frame = transform(img).unsqueeze(0).unsqueeze(2)  # [1, 3, 1, H, W]
-        first_frame = first_frame.to(device, dtype=dtype)
+        from ltx_trainer.omnitransfer.components import OmniTransferTask
+        task_idx = torch.tensor([OmniTransferTask.STYLE_TRANSFER.task_index],
+                                device=device_transformer)
 
         with torch.inference_mode():
-            first_frame_latent = components.vae_encoder.encode(first_frame)
+            tma_context = tma(qwen_features, task_idx)  # [1, 8, 3840]
 
-    # Compute latent dimensions
-    latent_height = args.height // 32
-    latent_width = args.width // 32
-    latent_frames = (args.num_frames - 1) // 8 + 1
+        # Prepend TMA context to prompt embeddings (same as training)
+        prompt_embeds = torch.cat([tma_context, prompt_embeds], dim=1)
+        tma_mask = torch.ones(1, tma_context.shape[1],
+                              dtype=prompt_mask.dtype, device=device_transformer)
+        prompt_mask = torch.cat([tma_mask, prompt_mask], dim=1)
 
-    # Construct inference latents
-    logger.info("Constructing inference latents...")
-    constructed = latent_constructor.construct_for_inference(
-        ref_video_latent=ref_latent,
-        tgt_first_frame_latent=first_frame_latent,
-        task=get_task_enum(args.task_type),
-        num_frames=latent_frames,
-        height=latent_height,
-        width=latent_width,
-    )
+        # Also extend negative embeddings to match
+        neg_embeds = torch.zeros_like(prompt_embeds)
+        print(f"   TMA context: {tma_context.shape} prepended → prompt_embeds: {prompt_embeds.shape}")
+    else:
+        print(f"   Prompt embeds: {prompt_embeds.shape}")
 
-    # Encode prompt
-    logger.info("Encoding prompt...")
-    with torch.inference_mode():
-        prompt_embeds = components.text_encoder.encode(args.prompt)
-        negative_embeds = components.text_encoder.encode(args.negative_prompt)
+    # ── Step 4: Construct latents ────────────────────────────────────────────
+    print("🏗️  Constructing reference + target latents...")
+    from ltx_core.components.patchifiers import VideoLatentPatchifier
+    from ltx_core.components.schedulers import LTX2Scheduler
+    from ltx_core.components.diffusion_steps import EulerDiffusionStep
+    from ltx_core.components.guiders import CFGGuider
+    from ltx_core.model.transformer.model import X0Model
+    from ltx_core.model.transformer.modality import Modality
+    from ltx_trainer.omnitransfer.components import OmniTransferTask, TaskAwarePositionalBias
 
-    # Setup scheduler
-    from ltx_core.pipeline.components.schedulers import LTX2Scheduler
-    from ltx_core.pipeline.components.diffusion_steps import EulerDiffusionStep
-    from ltx_core.pipeline.components.guiders import CFGGuider
+    patchifier = VideoLatentPatchifier(patch_size=1)
+    ref_latent = ref_latent.to(device_transformer, dtype)
 
-    scheduler = LTX2Scheduler(num_inference_steps=args.num_inference_steps)
-    diffusion_step = EulerDiffusionStep()
-    guider = CFGGuider(guidance_scale=args.guidance_scale)
+    lat_h, lat_w, lat_f = 14, 26, 1  # 448/32, 832/32, 1 frame
 
-    # Get timesteps
-    timesteps = scheduler.get_timesteps()
+    # Patchify reference: [1, 128, 1, 14, 26] → [1, 364, 128]
+    ref_patched = patchifier.patchify(ref_latent)
+    ref_seq_len = ref_patched.shape[1]
 
-    logger.info(f"Running {args.num_inference_steps} denoising steps...")
-
-    # Denoising loop
-    # Note: This is a simplified loop - full implementation would integrate
-    # with the OmniTransfer components (TPB, RCL, TMA) through the model forward
-    latent = constructed.tgt_latent
-
-    for i, t in enumerate(tqdm(timesteps, desc="Denoising")):
-        # Prepare model input with reference
-        # In full implementation, this would:
-        # 1. Apply TPB to reference positions
-        # 2. Use RCL attention for decoupled ref/target
-        # 3. Inject TMA features into target
-
-        # For now, simplified forward pass
+    # Apply ConceptEmbedding to reference tokens (identity anchoring)
+    if concept_embedding is not None:
         with torch.inference_mode():
-            # This would be replaced with full OmniTransfer forward
-            # including reference conditioning
-            noise_pred = components.transformer(
-                latent=latent,
-                timestep=t,
-                context=prompt_embeds.video_encoding,
+            ref_patched = concept_embedding(
+                ref_patched, concept_index=0,
+                task=OmniTransferTask.STYLE_TRANSFER,
             )
+        print(f"   ✅ ConceptEmbedding applied to {ref_seq_len} ref tokens")
 
-            # Euler step
-            latent = diffusion_step(
-                x_t=latent,
-                noise_pred=noise_pred,
-                sigma=t,
-            )
+    # Create noisy target (pure noise)
+    generator = torch.Generator(device=device_transformer).manual_seed(args.seed)
+    tgt_noise = torch.randn(1, 128, lat_f, lat_h, lat_w,
+                            device=device_transformer, dtype=dtype, generator=generator)
+    tgt_patched = patchifier.patchify(tgt_noise)
+    tgt_seq_len = tgt_patched.shape[1]
 
-    # Decode latent
-    logger.info("Decoding video...")
-    with torch.inference_mode():
-        # VideoDecoder uses forward(), not decode()
-        video = components.vae_decoder(latent)
+    # Compute positions
+    ref_positions = get_video_positions(lat_f, lat_h, lat_w, 1, FPS, device_transformer, dtype)
+    tgt_positions = get_video_positions(lat_f, lat_h, lat_w, 1, FPS, device_transformer, dtype)
 
-    # Save video
-    save_video(
-        video.squeeze(0),
-        args.output,
-        fps=args.fps,
+    # Apply TPB: style_transfer = appearance task → offset along temporal dim
+    tpb = TaskAwarePositionalBias(dim=128)
+    biased_ref_pos = tpb.apply_task_bias(
+        ref_positions, OmniTransferTask.STYLE_TRANSFER,
+        target_width=lat_w, target_frames=lat_f,
     )
 
-    logger.info(f"Video saved to {args.output}")
+    # ── Step 5: Denoising loop ───────────────────────────────────────────────
+    print(f"🔄 Running {args.steps}-step denoising (CFG={args.cfg})...")
+    scheduler = LTX2Scheduler()
+    sigmas = scheduler.execute(steps=args.steps).to(device_transformer).float()
+    stepper = EulerDiffusionStep()
+    cfg_guider = CFGGuider(args.cfg)
+    x0_model = X0Model(transformer)
+
+    ref_denoise_mask = torch.zeros(1, ref_seq_len, 1, device=device_transformer, dtype=torch.float32)
+    tgt_denoise_mask = torch.ones(1, tgt_seq_len, 1, device=device_transformer, dtype=torch.float32)
+
+    tgt_state = tgt_patched.clone()
+
+    with torch.inference_mode(), torch.autocast("cuda", dtype=dtype):
+        for step_idx, sigma in enumerate(sigmas[:-1]):
+            combined_latent = torch.cat([ref_patched, tgt_state], dim=1)
+            combined_denoise = torch.cat([ref_denoise_mask, tgt_denoise_mask], dim=1)
+            combined_timesteps = sigma * combined_denoise
+            combined_positions = torch.cat([biased_ref_pos, tgt_positions], dim=2)
+
+            video = Modality(
+                enabled=True,
+                latent=combined_latent,
+                timesteps=combined_timesteps,
+                positions=combined_positions,
+                context=prompt_embeds,
+                context_mask=prompt_mask,
+            )
+            pos_video, _ = x0_model(video=video, audio=None, perturbations=None)
+
+            video_neg = replace(video, context=neg_embeds)
+            neg_video, _ = x0_model(video=video_neg, audio=None, perturbations=None)
+
+            denoised = pos_video + cfg_guider.delta(pos_video, neg_video)
+            denoised_tgt = denoised[:, ref_seq_len:]
+
+            tgt_state = stepper.step(
+                sample=tgt_state, denoised_sample=denoised_tgt,
+                sigmas=sigmas, step_index=step_idx,
+            )
+
+            if (step_idx + 1) % 5 == 0 or step_idx == 0:
+                print(f"   Step {step_idx + 1}/{args.steps} | σ={sigma:.4f}")
+
+    print("✅ Denoising complete!")
+
+    # ── Step 6: Decode to pixels ─────────────────────────────────────────────
+    print("🖼️  Decoding latent to image...")
+    from ltx_core.types import VideoLatentShape
+
+    tgt_decoded_latent = patchifier.unpatchify(
+        tgt_state,
+        output_shape=VideoLatentShape(
+            frames=lat_f, height=lat_h, width=lat_w, batch=1, channels=128,
+        ),
+    )
+
+    del transformer, x0_model
+    torch.cuda.empty_cache()
+
+    vae_decoder = load_video_vae_decoder(MODEL_PATH).to(device_vae)
+    tgt_decoded_latent = tgt_decoded_latent.to(device_vae, dtype)
+
+    with torch.inference_mode():
+        pixels = vae_decoder(tgt_decoded_latent)  # [1, 3, 1, 448, 832]
+
+    pixels = ((pixels + 1.0) / 2.0).clamp(0.0, 1.0)
+    pixels = pixels[0, :, 0].float().cpu()  # [3, 448, 832]
+
+    import torchvision.transforms as T
+    img = T.ToPILImage()(pixels)
+    img.save(args.output)
+    print(f"💾 Saved to {args.output}")
+
+    # Side-by-side comparison
+    ref_img = Image.open(args.reference).convert("RGB").resize((WIDTH, HEIGHT), Image.LANCZOS)
+    comparison = Image.new("RGB", (WIDTH * 2, HEIGHT))
+    comparison.paste(ref_img, (0, 0))
+    comparison.paste(img, (WIDTH, 0))
+    comp_path = args.output.parent / f"{args.output.stem}_comparison{args.output.suffix}"
+    comparison.save(comp_path)
+    print(f"📊 Comparison saved to {comp_path}")
 
 
 if __name__ == "__main__":

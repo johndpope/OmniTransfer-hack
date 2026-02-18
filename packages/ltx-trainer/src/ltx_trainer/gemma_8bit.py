@@ -39,6 +39,7 @@ def load_8bit_gemma(
     checkpoint_path: str | Path,
     gemma_model_path: str | Path,
     dtype: torch.dtype = torch.bfloat16,
+    device: str | torch.device | None = None,
 ) -> "AVGemmaTextEncoderModel":
     """Load the Gemma text encoder in 8-bit precision using bitsandbytes.
     This function bypasses ltx-core's standard loading path to enable 8-bit quantization
@@ -49,6 +50,9 @@ def load_8bit_gemma(
         checkpoint_path: Path to the LTX-2 safetensors checkpoint file
         gemma_model_path: Path to Gemma model directory
         dtype: Data type for non-quantized model weights (feature extractor, connectors)
+        device: Target CUDA device (e.g., "cuda:1"). If None, uses device_map="auto"
+            which distributes across all GPUs. Set explicitly for multi-GPU setups
+            to avoid consuming VRAM needed for other models.
     Returns:
         Loaded AVGemmaTextEncoderModel with 8-bit quantized Gemma backbone
     Raises:
@@ -67,12 +71,21 @@ def load_8bit_gemma(
     tokenizer_path = _find_gemma_subpath(gemma_model_path, "tokenizer.model")
 
     quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+
+    # Use explicit device placement if specified, otherwise auto-distribute.
+    # In multi-GPU setups, "auto" fills the largest GPU first which may
+    # conflict with the transformer. Use {"": device} to pin to one GPU.
+    if device is not None:
+        device_map = {"": str(device)}
+    else:
+        device_map = "auto"
+
     with _suppress_accelerate_memory_warnings():
         gemma_model = Gemma3ForConditionalGeneration.from_pretrained(
             gemma_path,
             quantization_config=quantization_config,
             torch_dtype=torch.bfloat16,
-            device_map="auto",
+            device_map=device_map,
             local_files_only=True,
         )
 

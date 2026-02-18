@@ -573,7 +573,17 @@ class LtxvTrainer:
         # Note: For FSDP + LoRA, we'll cast to FP32 later in _prepare_models_for_training()
         # after the accelerator is set up, and we can detect FSDP.
         transformer_dtype = torch.bfloat16 if self._config.model.training_mode == "lora" else torch.float32
-        self._transformer = self._transformer.to(dtype=transformer_dtype)
+
+        # Check if the checkpoint already contains FP8 weights (pre-quantized).
+        # If so, skip the blanket dtype cast which would upcast FP8→bf16 and double memory.
+        has_fp8_weights = any(
+            p.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+            for p in self._transformer.parameters()
+        )
+        if has_fp8_weights:
+            logger.info("Detected pre-quantized FP8 weights — skipping dtype cast to preserve FP8")
+        else:
+            self._transformer = self._transformer.to(dtype=transformer_dtype)
 
         # Quantize on CPU first (the full bf16 model is ~38GB, won't fit on most GPUs)
         if self._config.acceleration.quantization is not None:

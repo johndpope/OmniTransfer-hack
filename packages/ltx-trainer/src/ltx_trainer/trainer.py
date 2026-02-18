@@ -729,15 +729,27 @@ class LtxvTrainer:
         """Load LoRA checkpoint with DDP/FSDP compatibility."""
         state_dict = load_file(checkpoint_path)
 
+        # Split strategy params (strategy.*) from LoRA params (diffusion_model.*)
+        strategy_dict = {k: v for k, v in state_dict.items() if k.startswith("strategy.")}
+        lora_dict = {k: v for k, v in state_dict.items() if not k.startswith("strategy.")}
+
         # Adjust layer names to match internal format.
         # (Weights are saved in ComfyUI-compatible format, with "diffusion_model." prefix)
-        state_dict = {k.replace("diffusion_model.", "", 1): v for k, v in state_dict.items()}
+        lora_dict = {k.replace("diffusion_model.", "", 1): v for k, v in lora_dict.items()}
 
         # Load LoRA weights and verify all weights were loaded
         base_model = self._transformer.get_base_model()
-        set_peft_model_state_dict(base_model, state_dict)
+        set_peft_model_state_dict(base_model, lora_dict)
 
         logger.info("✅ LoRA checkpoint loaded successfully")
+
+        # Load strategy parameters (ConceptEmbedding, TMA, etc.) if present
+        if strategy_dict and hasattr(self._training_strategy, "load_strategy_state_dict"):
+            loaded, skipped = self._training_strategy.load_strategy_state_dict(strategy_dict)
+            if loaded:
+                logger.info(f"✅ Loaded {len(loaded)} strategy params from checkpoint")
+            if skipped:
+                logger.warning(f"⚠️ Skipped {len(skipped)} strategy params (modules not initialised)")
 
     def _prepare_models_for_training(self) -> None:
         """Prepare models for training with Accelerate."""
@@ -1157,6 +1169,13 @@ class LtxvTrainer:
 
             # Convert to ComfyUI-compatible format (add "diffusion_model." prefix)
             state_dict = {f"diffusion_model.{k}": v for k, v in state_dict.items()}
+
+            # Include strategy-owned parameters (ConceptEmbedding, TMA, etc.)
+            if hasattr(self._training_strategy, "get_strategy_state_dict"):
+                strategy_sd = self._training_strategy.get_strategy_state_dict()
+                if strategy_sd:
+                    state_dict.update(strategy_sd)
+                    logger.debug(f"Included {len(strategy_sd)} strategy params in checkpoint")
 
             # Cast to configured precision
             state_dict = {k: v.to(save_dtype) if isinstance(v, Tensor) else v for k, v in state_dict.items()}

@@ -1077,6 +1077,93 @@ class OmniTransferStrategy(TrainingStrategy):
 
         return params
 
+    def get_strategy_state_dict(self) -> dict[str, torch.Tensor]:
+        """Get a named state dict for all strategy-owned modules.
+
+        Returns parameters from ConceptEmbedding, TMA, MotionEncoder, and
+        GeometricDecoder with a ``strategy.`` prefix so they can be saved
+        alongside LoRA weights in the same checkpoint file.
+
+        Returns:
+            Dictionary mapping ``strategy.<module>.<param>`` → tensor.
+        """
+        state_dict: dict[str, torch.Tensor] = {}
+
+        if self._concept_embedding is not None:
+            for k, v in self._concept_embedding.state_dict().items():
+                state_dict[f"strategy.concept_embedding.{k}"] = v
+
+        if self._tma is not None:
+            for k, v in self._tma.state_dict().items():
+                state_dict[f"strategy.tma.{k}"] = v
+
+        if self._motion_encoder is not None:
+            for k, v in self._motion_encoder.state_dict().items():
+                state_dict[f"strategy.motion_encoder.{k}"] = v
+
+        if self._geometric_decoder is not None:
+            for k, v in self._geometric_decoder.state_dict().items():
+                state_dict[f"strategy.geometric_decoder.{k}"] = v
+
+        return state_dict
+
+    def load_strategy_state_dict(
+        self,
+        state_dict: dict[str, torch.Tensor],
+        strict: bool = False,
+    ) -> tuple[list[str], list[str]]:
+        """Load strategy parameters from a checkpoint state dict.
+
+        Expects keys with the ``strategy.<module>.<param>`` prefix produced by
+        :meth:`get_strategy_state_dict`.
+
+        Args:
+            state_dict: Full checkpoint state dict (may contain non-strategy keys).
+            strict: If True, raise on missing/unexpected keys per module.
+
+        Returns:
+            Tuple of (loaded_keys, skipped_keys).
+        """
+        loaded: list[str] = []
+        skipped: list[str] = []
+
+        module_map: dict[str, torch.nn.Module | None] = {
+            "concept_embedding": self._concept_embedding,
+            "tma": self._tma,
+            "motion_encoder": self._motion_encoder,
+            "geometric_decoder": self._geometric_decoder,
+        }
+
+        for module_name, module in module_map.items():
+            prefix = f"strategy.{module_name}."
+            sub_dict = {
+                k[len(prefix):]: v
+                for k, v in state_dict.items()
+                if k.startswith(prefix)
+            }
+            if not sub_dict:
+                continue
+
+            if module is None:
+                skipped.extend(f"{prefix}{k}" for k in sub_dict)
+                logger.warning(
+                    f"Checkpoint has {len(sub_dict)} {module_name} params "
+                    f"but module is not initialised — skipping"
+                )
+                continue
+
+            result = module.load_state_dict(sub_dict, strict=strict)
+            loaded.extend(f"{prefix}{k}" for k in sub_dict)
+            if result.missing_keys:
+                logger.warning(f"{module_name}: missing keys {result.missing_keys}")
+            if result.unexpected_keys:
+                logger.warning(f"{module_name}: unexpected keys {result.unexpected_keys}")
+            logger.info(
+                f"✅ Loaded {len(sub_dict)} {module_name} params from checkpoint"
+            )
+
+        return loaded, skipped
+
     def _get_task_enum(self, task_str: str) -> OmniTransferTask:
         """Convert task string to OmniTransferTask enum.
 

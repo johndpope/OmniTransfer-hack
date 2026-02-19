@@ -805,6 +805,27 @@ Frames must satisfy `frames % 8 == 1`:
 
 Width and height must be divisible by 32.
 
+> **⚠️ ALWAYS use the highest resolution that fits in VRAM!**
+>
+> Low-resolution training (e.g., 512×768) produces noticeably poor quality output.
+> Always encode training data and run inference at near-native resolution.
+>
+> | Source Resolution | Training Resolution | Quality |
+> |------------------|-------------------|---------|
+> | 784×1168 (Grok) | 512×768 | ❌ Poor — blurry, loses detail |
+> | 784×1168 (Grok) | **768×1152** | ✅ Good — near-native quality |
+> | 784×1168 (Grok) | 800×1184 | ✅ Best — closest to native |
+>
+> **Config example:**
+> ```yaml
+> validation:
+>   # video_dims: [512, 768, 25]    # Low-res — faster, lower quality
+>   video_dims: [768, 1152, 25]    # Hi-res — near-native Grok 784×1168
+> ```
+>
+> **VRAM impact**: Higher resolution uses more tokens (864 vs 384 per frame at 768×1152 vs 512×768).
+> With int8-quanto + gradient checkpointing, 768×1152 fits on 32GB GPU (~24GB used).
+
 ### Model Paths
 
 - Must be local paths (URLs not supported)

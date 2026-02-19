@@ -540,6 +540,137 @@ training_strategy:
   video_log_interval: 2000
 ```
 
+## OmniTransfer Paper Insights (arXiv:2601.14250v1)
+
+> **Key takeaway: OmniTransfer is a VIDEO-reference method. All tasks use video references, not images.**
+
+### How OmniTransfer Actually Works (from the Paper)
+
+The paper (ByteDance, Jan 2026) builds on **Wan2.1 I2V 14B** — a video-to-video DiT model. The critical insight is that OmniTransfer exploits **multi-view, multi-frame information** from video references, which single images cannot provide.
+
+**Table 1 from the Paper — Task Input Formats:**
+
+| Task | Reference Input | Conditioning | Training Mode |
+|------|----------------|--------------|---------------|
+| Identity Preservation | V_ref (video) | Text prompt | T2V |
+| Style Transfer | V_ref (video) | Text prompt | T2V |
+| Motion Transfer | V_ref (video) | First frame I | I2V |
+| Camera Movement | V_ref (video) | First frame I | I2V |
+| Video Effect | V_ref (video) | First frame I | I2V |
+
+**Appearance tasks** (ID, Style) → Reference video + text prompt (style/identity comes from reference, NOT from prompt)
+**Temporal tasks** (Motion, Camera, Effect) → Reference video + first frame image
+
+### Training Strategy: 3 Stages (from Section 5.1)
+
+| Stage | Trainable Components | Steps | LR | Batch | Purpose |
+|-------|---------------------|-------|-----|-------|---------|
+| Stage 1 | DiT (LoRA) + TPB + RCL | 10,000 | 1e-5 | 16 | Learn reference conditioning |
+| Stage 2 | TMA connector only | 2,000 | 1e-5 | 16 | Align MLLM features |
+| Stage 3 | All components jointly | 5,000 | 1e-5 | 16 | End-to-end refinement |
+
+### CRITICAL: Prompt Design for Style Transfer
+
+> **Do NOT leak the target style into the text prompt!**
+>
+> In OmniTransfer, style/identity comes from the **reference video**, not the text prompt.
+> The text prompt should describe the **content/scene**, not the style.
+>
+> **WRONG** (leaks style into text, model ignores reference):
+> ```
+> "isometric 3D view of this scene, photorealistic miniature diorama"  # ❌
+> ```
+>
+> **CORRECT** (neutral prompt, style learned from reference):
+> ```
+> "a scene from the movie"  # ✅ — style comes from reference latent
+> "a cinematic scene"       # ✅ — generic content description
+> ```
+>
+> If the prompt describes the style, the model learns to use text for styling instead
+> of learning to extract style from the reference video — defeating the whole purpose.
+
+### Why Video References Matter
+
+- **Multiple viewpoints**: A 6-second video provides ~145 frames = 145 different views of the same style/subject
+- **Temporal consistency**: Model learns style is consistent across time, not a per-frame artifact
+- **TPB (Task-aware Positional Bias)**: RoPE offset Δ=(f, 0, 0) for appearance tasks — exploits temporal dimension to separate ref from target. With num_frames=1, this offset is meaningless.
+- **RCL (Reference-decoupled Causal Learning)**: Reference at fixed t=0 (noise-free) while target is denoised. Requires temporal extent to work properly.
+
+## Dataset Inventory
+
+### Raw Data Sources
+
+#### 1. Movie Diorama Pairs (`/media/2TB/movie_dioramas/`)
+- **82 movie scenes**, each containing:
+  - `scene.jpg` / `scene.png` — Original movie scene screenshot
+  - `diorama.png` — Isometric diorama version (Grok-generated)
+  - `diorama_2.png` — Alternate diorama version (some scenes)
+- Examples: `matrix_lobby/`, `blade_runner_rooftop/`, `inception_hotel/`, `pulp_fiction_diner/`
+- **Use**: scene = reference, diorama = target (for style transfer training)
+
+#### 2. Grok Isometric Images (`/media/12TB/isometric_3d/r2_native_dataset/images/`)
+- **592 images** (784x1168) with matching `.txt` prompt files
+- Mix of sources: `harvested_*`, `r2_iso_*`, `r2_untag_*`, `frame_*`
+- Grok-generated high-quality isometric 3D renders
+
+#### 3. Grok Isometric Videos (`/media/12TB/isometric_3d/r2_native_dataset/new_grok_videos/`)
+- **8 videos** (784x1168, 145 frames, 24fps, ~6 seconds each)
+- With matching `.txt` prompt files
+- High-quality Grok-generated isometric 3D animations
+- **This is the ideal reference format for OmniTransfer** — multi-frame style source
+
+#### 4. Extracted Frames
+- `/media/12TB/isometric_3d/r2_native_dataset/new_grok_frames/` — 384 frames from 8 Grok videos
+- `/media/12TB/isometric_3d/r2_native_dataset/new_video_frames/` — 216 entries (.jpg + .pt + .txt)
+
+#### 5. Combined Dataset Metadata
+- `/media/12TB/isometric_3d/r2_native_dataset/dataset_combined.json` — 3,128 entries total:
+  - 2,608 frames from 108 source videos
+  - 439 harvested images
+  - 65 r2_iso images
+  - 16 r2_untag images
+
+### Precomputed Training Data
+
+#### Active Training Set (`/media/2TB/diorama_training/`)
+- **157 pairs** (82 movies x ~2 variants each) — currently used for training
+- Structure:
+  ```
+  /media/2TB/diorama_training/
+  ├── latents/              # 157 target (diorama) latents [128, 1, 14, 26]
+  ├── reference_latents/    # 157 reference (scene) latents [128, 1, 14, 26]
+  ├── conditions_final/     # 157 text embeddings [1024, 3840]
+  ├── qwen_vl_features/     # 157 Qwen2.5-VL features [seq_len, 3584]
+  └── metadata.json
+  ```
+
+#### Preprocessed Image Sets (on 12TB drive)
+- `/media/12TB/.../preprocessed_large/` — 592 latents + 592 conditions (from Grok images)
+- `/media/12TB/.../preprocessed_grok/` — 8 latents + 8 conditions (from Grok videos)
+
+### Training Output (`/media/2TB/training_output/`)
+
+| Directory | Stage | Status | Key Details |
+|-----------|-------|--------|-------------|
+| `diorama_phase1/` | Stage 1 (DiT+TPB+RCL+CE) | Complete | 1000 steps, loss 81→31.4, 57.6 min |
+| `diorama_phase2/` | Stage 2 (TMA connector) | Complete | 1000 steps, loss →24.3, 58.5 min |
+| `diorama_phase3/` | Stage 3 (joint fine-tune) | Not started | Config at `configs/ltx2_diorama_phase3.yaml` |
+
+### Training Configs (in repo)
+
+| Config | Stage | Output Dir |
+|--------|-------|------------|
+| `configs/ltx2_diorama_phase1.yaml` | Stage 1 | `/media/2TB/training_output/diorama_phase1` |
+| `configs/ltx2_diorama_phase2.yaml` | Stage 2 | `/media/2TB/training_output/diorama_phase2` |
+| `configs/ltx2_diorama_phase3.yaml` | Stage 3 | `/media/2TB/training_output/diorama_phase3` |
+
+### Inference Script
+
+- `packages/ltx-trainer/scripts/omnitransfer_inference.py` — Full inference with LoRA + ConceptEmbedding + TMA
+- Output: `/media/2TB/inference_output/`
+- Supports `--lora`, `--no-strategy`, dual GPU, int8-quanto quantization
+
 ## Memory-Efficient Workflows (RTX 5090 / 32GB VRAM)
 
 The RTX 5090 has 32GB VRAM which is tight for LTX-2 training. The key insight is that **models cannot be loaded simultaneously** - you must precompute data in stages.

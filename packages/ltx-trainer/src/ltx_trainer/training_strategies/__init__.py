@@ -20,13 +20,14 @@ from ltx_trainer.training_strategies.base_strategy import (
 )
 from ltx_trainer.training_strategies.text_to_video import TextToVideoConfig, TextToVideoStrategy
 from ltx_trainer.training_strategies.video_to_video import VideoToVideoConfig, VideoToVideoStrategy
+from ltx_trainer.training_strategies.scd_strategy import SCDTrainingConfig, SCDTrainingStrategy
 
 # Lazy import to avoid circular dependency with omnitransfer
 if TYPE_CHECKING:
     from ltx_trainer.omnitransfer.strategy import OmniTransferConfig, OmniTransferStrategy
 
     # Type alias for all strategy config types (only for type checking)
-    TrainingStrategyConfig = TextToVideoConfig | VideoToVideoConfig | OmniTransferConfig
+    TrainingStrategyConfig = TextToVideoConfig | VideoToVideoConfig | OmniTransferConfig | SCDTrainingConfig
 
 
 def _get_omnitransfer_types() -> tuple:
@@ -38,6 +39,8 @@ __all__ = [
     "DEFAULT_FPS",
     "VIDEO_SCALE_FACTORS",
     "ModelInputs",
+    "SCDTrainingConfig",
+    "SCDTrainingStrategy",
     "TextToVideoConfig",
     "TextToVideoStrategy",
     "TrainingStrategy",
@@ -68,6 +71,8 @@ def get_training_strategy(config: TrainingStrategyConfig) -> TrainingStrategy:
             strategy = TextToVideoStrategy(config)
         case VideoToVideoConfig():
             strategy = VideoToVideoStrategy(config)
+        case SCDTrainingConfig():
+            strategy = SCDTrainingStrategy(config)
         case OmniTransferConfig():
             strategy = OmniTransferStrategy(config)
         case _:

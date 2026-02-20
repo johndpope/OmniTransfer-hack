@@ -7,6 +7,7 @@ from ltx_trainer.quantization import QuantizationOptions
 from ltx_trainer.training_strategies.base_strategy import TrainingStrategyConfigBase
 from ltx_trainer.training_strategies.text_to_video import TextToVideoConfig
 from ltx_trainer.training_strategies.video_to_video import VideoToVideoConfig
+from ltx_trainer.training_strategies.scd_strategy import SCDTrainingConfig
 from ltx_trainer.omnitransfer.strategy import OmniTransferConfig
 
 
@@ -92,6 +93,7 @@ def _get_strategy_discriminator(v: dict | TrainingStrategyConfigBase) -> str:
 TrainingStrategyConfig = Annotated[
     Annotated[TextToVideoConfig, Tag("text_to_video")]
     | Annotated[VideoToVideoConfig, Tag("video_to_video")]
+    | Annotated[SCDTrainingConfig, Tag("scd")]
     | Annotated[OmniTransferConfig, Tag("omnitransfer")],
     Discriminator(_get_strategy_discriminator),
 ]

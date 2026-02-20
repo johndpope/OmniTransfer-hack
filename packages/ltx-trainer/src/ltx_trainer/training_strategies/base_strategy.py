@@ -35,7 +35,7 @@ class TrainingStrategyConfigBase(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    name: Literal["text_to_video", "video_to_video", "omnitransfer"] = Field(
+    name: Literal["text_to_video", "video_to_video", "omnitransfer", "scd"] = Field(
         description="Unique name identifying the training strategy type"
     )
 
@@ -55,8 +55,17 @@ class ModelInputs:
     video_loss_mask: Tensor  # Boolean mask: True = compute loss for this token
     audio_loss_mask: Tensor | None
 
+    # Shared noise/sigmas for edit loss (reuse same noise and sigma in second forward pass)
+    shared_noise: Tensor | None = None
+    shared_sigmas: Tensor | None = None
+
     # Metadata needed for loss computation in some strategies
     ref_seq_len: int | None = None  # For IC-LoRA: length of reference sequence
+
+    # SCD-specific: encoder features and model reference for split forward pass
+    _encoder_features: Tensor | None = None
+    _scd_model: Any | None = None
+    _encoder_audio_args: Any | None = None
 
 
 class TrainingStrategy(ABC):
@@ -127,6 +136,15 @@ class TrainingStrategy(ABC):
         Returns:
             Scalar loss tensor
         """
+
+    def get_checkpoint_metadata(self) -> dict[str, Any]:
+        """Get strategy-specific metadata to include in checkpoint files.
+        Override this method in subclasses to add custom metadata,
+        e.g. any parameters that a downstream inference pipeline may need.
+        Returns:
+            Dictionary of metadata key-value pairs (values must be JSON-serializable)
+        """
+        return {}
 
     def _get_video_positions(
         self,

@@ -452,11 +452,22 @@ class LtxvTrainer:
         model_inputs = self._training_strategy.prepare_training_inputs(batch, self._timestep_sampler)
 
         # Run transformer forward pass with Modality-based interface
-        video_pred, audio_pred = self._transformer(
-            video=model_inputs.video,
-            audio=model_inputs.audio,
-            perturbations=None,
-        )
+        # For SCD strategy: encoder already ran in prepare_training_inputs;
+        # here we only run the decoder with encoder features
+        if hasattr(model_inputs, "_scd_model") and model_inputs._scd_model is not None:
+            video_pred, audio_pred = model_inputs._scd_model.forward_decoder(
+                video=model_inputs.video,
+                encoder_features=model_inputs._encoder_features,
+                audio=model_inputs.audio,
+                perturbations=None,
+                encoder_audio_args=model_inputs._encoder_audio_args,
+            )
+        else:
+            video_pred, audio_pred = self._transformer(
+                video=model_inputs.video,
+                audio=model_inputs.audio,
+                perturbations=None,
+            )
 
         # Use strategy to compute loss
         loss = self._training_strategy.compute_loss(video_pred, audio_pred, model_inputs)
@@ -606,6 +617,23 @@ class LtxvTrainer:
             model_size = "quantized" if self._config.acceleration.quantization else "bf16"
             logger.info(f"Moving {model_size} transformer to {hw_devices.transformer}...")
             self._transformer = self._transformer.to(hw_devices.transformer)
+
+        # Wrap transformer with SCD model if using SCD strategy
+        from ltx_trainer.training_strategies.scd_strategy import SCDTrainingStrategy  # noqa: PLC0415
+        if isinstance(self._training_strategy, SCDTrainingStrategy):
+            from ltx_core.model.transformer.scd_model import LTXSCDModel  # noqa: PLC0415
+            scd_config = self._training_strategy.config
+            self._transformer = LTXSCDModel(
+                base_model=self._transformer,
+                encoder_layers=scd_config.encoder_layers,
+                decoder_input_combine=scd_config.decoder_input_combine,
+            )
+            self._training_strategy.set_scd_model(self._transformer)
+            logger.info(
+                f"SCD wrapper: {scd_config.encoder_layers} encoder layers, "
+                f"{len(self._transformer.decoder_blocks)} decoder layers, "
+                f"combine={scd_config.decoder_input_combine}"
+            )
 
         # Freeze all models. We later unfreeze the transformer based on training mode.
         # Note: embedding_connectors are already frozen (they come from the frozen text encoder)
@@ -1291,7 +1319,8 @@ class LtxvTrainer:
 
             # Take middle frame, first 3 channels as pseudo-RGB
             mid_f = f // 2
-            ref_vis = ref_lat[0, :3, mid_f, :, :].cpu().float()  # [3, H, W]
+            ref_mid_f = min(mid_f, ref_lat.shape[2] - 1)  # Clamp for single-frame refs
+            ref_vis = ref_lat[0, :3, ref_mid_f, :, :].cpu().float()  # [3, H, W]
             tgt_vis = tgt_lat[0, :3, mid_f, :, :].cpu().float()
 
             # For I2V mode, get first frame latent visualization
@@ -1391,8 +1420,8 @@ class LtxvTrainer:
                     else:
                         frame_indices = [mid_f]
 
-                    # Decode reference video middle frame
-                    ref_frame_lat = ref_lat[0:1, :, mid_f:mid_f+1, :, :].to(vae_device, dtype=vae_dtype)
+                    # Decode reference video middle frame (clamp for single-frame refs)
+                    ref_frame_lat = ref_lat[0:1, :, ref_mid_f:ref_mid_f+1, :, :].to(vae_device, dtype=vae_dtype)
 
                     # For I2V mode, decode first frame (reference image)
                     if is_i2v_mode:

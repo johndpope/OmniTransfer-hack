@@ -49,6 +49,30 @@ This file provides guidance to AI coding assistants (Claude, Cursor, etc.) when 
 
 ---
 
+## ⚠️ CRITICAL: Always Enable W&B and Reconstruction Logging
+
+> **Every training config MUST have W&B enabled and reconstruction images turned on.**
+>
+> When creating or modifying training configs, always include:
+> ```yaml
+> wandb:
+>   enabled: true
+>   project: "<descriptive-project-name>"
+>   log_validation_videos: true
+>
+> training_strategy:
+>   log_reconstructions: true
+>   reconstruction_log_interval: 200   # Log debug images every 200 steps
+>   num_frames_to_visualize: 1         # At least 1 frame
+>   max_samples_per_log: 1
+> ```
+>
+> **Do NOT use `WANDB_MODE=disabled`** unless explicitly asked. Reconstruction images
+> (Reference | Target | Prediction grids) are essential for diagnosing training quality.
+> Without them, you're training blind.
+
+---
+
 ## ⚠️ CRITICAL: Never Store Important Output on /tmp
 
 > **`/tmp` is ephemeral — it gets wiped on reboot!** Never store:
@@ -58,27 +82,46 @@ This file provides guidance to AI coding assistants (Claude, Cursor, etc.) when 
 > - Scripts
 > - Any artifact you'd be upset to lose
 >
-> **Use persistent storage instead:**
+> **Use persistent storage under ONE parent folder: `/media/2TB/omnitransfer/`**
+>
+> All project data lives under a single root to keep the HDD tidy:
+>
+> ```
+> /media/2TB/omnitransfer/
+> ├── data/                          # Precomputed training datasets
+> │   ├── diorama_training/          # 157 diorama pairs (latents, ref_latents, conditions_final)
+> │   ├── isometric_i2v/             # 128 isometric I2V clips
+> │   ├── isometric_identity/        # 192 cross-clip identity pairs
+> │   └── movie_dioramas/            # Raw 82 movie scene→diorama image pairs
+> ├── output/                        # Training checkpoints & logs
+> │   ├── diorama_phase1/
+> │   ├── diorama_phase2/
+> │   ├── isometric_i2v/
+> │   └── isometric_identity/
+> └── inference/                     # Inference output (images, videos)
+> ```
 >
 > | What | Store On | Example |
 > |------|----------|---------|
-> | Training output (checkpoints, logs) | `/media/2TB/training_output/<experiment>/` | `/media/2TB/training_output/isometric_phase3/` |
-> | Inference output (images, videos) | `/media/2TB/inference_output/` | `/media/2TB/inference_output/blade_runner.png` |
-> | Training configs | In the repo: `packages/ltx-trainer/configs/` | `configs/ltx2_isometric_phase3.yaml` |
+> | Training datasets (latents, embeddings) | `/media/2TB/omnitransfer/data/<dataset>/` | `/media/2TB/omnitransfer/data/isometric_i2v/` |
+> | Training output (checkpoints, logs) | `/media/2TB/omnitransfer/output/<experiment>/` | `/media/2TB/omnitransfer/output/isometric_identity/` |
+> | Inference output (images, videos) | `/media/2TB/omnitransfer/inference/` | `/media/2TB/omnitransfer/inference/blade_runner.png` |
+> | Training configs | In the repo: `packages/ltx-trainer/configs/` | `configs/ltx2_isometric_identity.yaml` |
 > | Scripts | In the repo: `packages/ltx-trainer/scripts/` | `scripts/omnitransfer_inference.py` |
-> | Training data (latents, embeddings) | `/media/2TB/` | `/media/2TB/diorama_training/` |
 >
 > **When creating training configs at runtime**, save them to `configs/` in the repo so they survive.
 > If you must use `/tmp` for scratch work, always copy the final result to persistent storage.
 >
 > **Example — WRONG:**
 > ```bash
-> output_dir: "/tmp/progressive_overfit/phase3/output"  # ❌ Gone after reboot!
+> output_dir: "/tmp/progressive_overfit/phase3/output"         # ❌ Gone after reboot!
+> preprocessed_data_root: "/media/2TB/isometric_i2v_training"  # ❌ Scattered on HDD root!
 > ```
 >
 > **Example — CORRECT:**
 > ```bash
-> output_dir: "/media/2TB/training_output/isometric_phase3/output"  # ✅ Persistent
+> output_dir: "/media/2TB/omnitransfer/output/isometric_identity"     # ✅ Organized
+> preprocessed_data_root: "/media/2TB/omnitransfer/data/isometric_i2v" # ✅ Under single root
 > ```
 
 ---
@@ -631,44 +674,53 @@ The paper (ByteDance, Jan 2026) builds on **Wan2.1 I2V 14B** — a video-to-vide
   - 65 r2_iso images
   - 16 r2_untag images
 
-### Precomputed Training Data
+### Precomputed Training Data (`/media/2TB/omnitransfer/data/`)
 
-#### Active Training Set (`/media/2TB/diorama_training/`)
-- **157 pairs** (82 movies x ~2 variants each) — currently used for training
-- Structure:
-  ```
-  /media/2TB/diorama_training/
-  ├── latents/              # 157 target (diorama) latents [128, 1, 14, 26]
-  ├── reference_latents/    # 157 reference (scene) latents [128, 1, 14, 26]
-  ├── conditions_final/     # 157 text embeddings [1024, 3840]
-  ├── qwen_vl_features/     # 157 Qwen2.5-VL features [seq_len, 3584]
-  └── metadata.json
-  ```
+All precomputed datasets live under a single root. Each dataset follows the same structure:
+```
+<dataset>/
+├── latents/              # Target video latents [C, F, H, W]
+├── reference_latents/    # Reference latents [C, F, H, W]
+├── conditions_final/     # Text embeddings [1024, 3840]
+├── qwen_vl_features/     # (optional) Qwen2.5-VL features [seq_len, 3584]
+└── metadata.json
+```
+
+| Dataset | Pairs | Resolution | Description |
+|---------|-------|------------|-------------|
+| `data/diorama_training/` | 157 | 832x448 | Movie scene→diorama style transfer |
+| `data/isometric_i2v/` | 128 | 768x1152 | Grok video clips for I2V animation |
+| `data/isometric_identity/` | 192 | 768x1152 | Cross-clip identity preservation |
+| `data/movie_dioramas/` | 82 scenes | Raw images | Source scene+diorama image pairs |
 
 #### Preprocessed Image Sets (on 12TB drive)
 - `/media/12TB/.../preprocessed_large/` — 592 latents + 592 conditions (from Grok images)
 - `/media/12TB/.../preprocessed_grok/` — 8 latents + 8 conditions (from Grok videos)
 
-### Training Output (`/media/2TB/training_output/`)
+### Training Output (`/media/2TB/omnitransfer/output/`)
 
-| Directory | Stage | Status | Key Details |
-|-----------|-------|--------|-------------|
-| `diorama_phase1/` | Stage 1 (DiT+TPB+RCL+CE) | Complete | 1000 steps, loss 81→31.4, 57.6 min |
-| `diorama_phase2/` | Stage 2 (TMA connector) | Complete | 1000 steps, loss →24.3, 58.5 min |
-| `diorama_phase3/` | Stage 3 (joint fine-tune) | Not started | Config at `configs/ltx2_diorama_phase3.yaml` |
+| Directory | Strategy | Status | Key Details |
+|-----------|----------|--------|-------------|
+| `output/diorama_phase1/` | OmniTransfer Stage 1 | Complete | 1000 steps, loss 81→31.4, 57.6 min |
+| `output/diorama_phase2/` | OmniTransfer Stage 2 | Complete | 1000 steps, loss →24.3, 58.5 min |
+| `output/diorama_phase3/` | OmniTransfer Stage 3 | Not started | Config: `ltx2_diorama_phase3.yaml` |
+| `output/isometric_i2v/` | TextToVideo (I2V) | Complete | 500 steps, loss 0.0813, 74.4 min |
+| `output/isometric_identity/` | OmniTransfer Stage 1 | In progress | TPB+RCL+CE, 192 pairs |
 
 ### Training Configs (in repo)
 
-| Config | Stage | Output Dir |
-|--------|-------|------------|
-| `configs/ltx2_diorama_phase1.yaml` | Stage 1 | `/media/2TB/training_output/diorama_phase1` |
-| `configs/ltx2_diorama_phase2.yaml` | Stage 2 | `/media/2TB/training_output/diorama_phase2` |
-| `configs/ltx2_diorama_phase3.yaml` | Stage 3 | `/media/2TB/training_output/diorama_phase3` |
+| Config | Strategy | Data Dir |
+|--------|----------|----------|
+| `configs/ltx2_diorama_phase1.yaml` | OmniTransfer Stage 1 | `data/diorama_training` |
+| `configs/ltx2_diorama_phase2.yaml` | OmniTransfer Stage 2 | `data/diorama_training` |
+| `configs/ltx2_diorama_phase3.yaml` | OmniTransfer Stage 3 | `data/diorama_training` |
+| `configs/ltx2_isometric_i2v.yaml` | TextToVideo (I2V) | `data/isometric_i2v` |
+| `configs/ltx2_isometric_identity.yaml` | OmniTransfer Stage 1 | `data/isometric_identity` |
 
 ### Inference Script
 
 - `packages/ltx-trainer/scripts/omnitransfer_inference.py` — Full inference with LoRA + ConceptEmbedding + TMA
-- Output: `/media/2TB/inference_output/`
+- Output: `/media/2TB/omnitransfer/inference/`
 - Supports `--lora`, `--no-strategy`, dual GPU, int8-quanto quantization
 
 ## Memory-Efficient Workflows (RTX 5090 / 32GB VRAM)

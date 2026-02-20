@@ -43,7 +43,7 @@ training_strategy:
 # Optimization
 optimization:
   learning_rate: 5e-5
-  steps: 500
+  steps: 3000
   batch_size: 1
   gradient_accumulation_steps: 4   # Effective batch = 4
   max_grad_norm: 1.0
@@ -98,7 +98,7 @@ validation:
 
 # Checkpoints
 checkpoints:
-  interval: 100
+  interval: 500
   keep_last_n: 3
 
 # Flow Matching

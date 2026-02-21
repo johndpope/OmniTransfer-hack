@@ -1291,7 +1291,8 @@ class LtxvTrainer:
 
             # Take middle frame, first 3 channels as pseudo-RGB
             mid_f = f // 2
-            ref_vis = ref_lat[0, :3, mid_f, :, :].cpu().float()  # [3, H, W]
+            ref_mid_f = min(mid_f, ref_lat.shape[2] - 1)  # Clamp for single-frame refs
+            ref_vis = ref_lat[0, :3, ref_mid_f, :, :].cpu().float()  # [3, H, W]
             tgt_vis = tgt_lat[0, :3, mid_f, :, :].cpu().float()
 
             # For I2V mode, get first frame latent visualization
@@ -1391,8 +1392,8 @@ class LtxvTrainer:
                     else:
                         frame_indices = [mid_f]
 
-                    # Decode reference video middle frame
-                    ref_frame_lat = ref_lat[0:1, :, mid_f:mid_f+1, :, :].to(vae_device, dtype=vae_dtype)
+                    # Decode reference video middle frame (clamp for single-frame refs)
+                    ref_frame_lat = ref_lat[0:1, :, ref_mid_f:ref_mid_f+1, :, :].to(vae_device, dtype=vae_dtype)
 
                     # For I2V mode, decode first frame (reference image)
                     if is_i2v_mode:

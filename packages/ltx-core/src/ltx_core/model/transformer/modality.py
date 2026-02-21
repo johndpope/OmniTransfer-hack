@@ -21,3 +21,5 @@ class Modality:
     context: torch.Tensor
     enabled: bool = True
     context_mask: torch.Tensor | None = None
+    self_attn_mask: torch.Tensor | None = None  # UNUSED — kept for API compat, see rcl_split_point
+    rcl_split_point: int | None = None  # Split point for RCL: ref tokens [0:split), target tokens [split:]

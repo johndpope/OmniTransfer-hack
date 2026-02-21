@@ -1196,23 +1196,52 @@ class OmniTransferStrategy(TrainingStrategy):
         }
         return task_map.get(task_str.lower(), OmniTransferTask.MOTION_TRANSFER)
 
+    @staticmethod
+    def _create_rcl_attention_mask(
+        ref_seq_len: int, tgt_seq_len: int, device: torch.device
+    ) -> Tensor:
+        """Create RCL attention mask (Section 4.3).
+
+        Reference tokens only self-attend (cannot see noisy target).
+        Target tokens attend to themselves AND reference (clean, t=0).
+
+        Quote: "The reference branch... remains noise-free throughout the diffusion
+        process... Attention masking prevents reference from attending to noisy target."
+
+        Returns: [total_seq_len, total_seq_len] float additive mask (0=attend, -inf=block)
+        """
+        total = ref_seq_len + tgt_seq_len
+        # Start with boolean: True = attend
+        mask = torch.zeros(total, total, dtype=torch.bool, device=device)
+
+        # Reference self-attention: ref rows attend to ref columns only
+        mask[:ref_seq_len, :ref_seq_len] = True
+
+        # Target attends to everything (itself + reference)
+        mask[ref_seq_len:, :] = True
+
+        # Convert to additive float mask for F.scaled_dot_product_attention
+        float_mask = torch.where(mask, 0.0, float("-inf"))
+        return float_mask
+
     def _decode_latents_to_pixels(
         self,
         latents: Tensor,
         sample_frames: int = 4,
+        preserve_grad: bool = False,
     ) -> Tensor | None:
         """Decode latents to RGB pixels for perceptual loss computation.
 
         [GROK RECOMMENDED] LPIPS expects RGB images in [-1, 1], not latent vectors.
         VGG features are meaningless on latents - they need proper image pixels.
 
-        IMPORTANT: This function preserves gradient flow so that style/perceptual
-        losses can backpropagate through the VAE decoder to the predicted latents
-        and ultimately train the model. DO NOT use detach() or inference_mode().
-
         Args:
             latents: Video latents [B, C, F, H, W]
             sample_frames: Number of frames to decode (for efficiency)
+            preserve_grad: If True, keep gradient flow through the VAE decoder
+                so that losses on decoded pixels can backprop to the model.
+                Costs ~2GB extra VRAM for the decoder computation graph.
+                Only useful when the decoder is on a separate GPU with headroom.
 
         Returns:
             Decoded RGB frames [B*sample_frames, 3, H, W] in [-1, 1] or None if decoder unavailable
@@ -1240,15 +1269,20 @@ class OmniTransferStrategy(TrainingStrategy):
             # Extract sampled frames [B, C, sample_frames, H, W]
             sampled = latents[:, :, frame_indices, :, :]
 
-            # Detach + clone to avoid keeping the decoder's computation graph in
-            # memory (saves ~2GB VRAM on 32GB GPUs). This means decoded pixels are
-            # gradient-disconnected — pixel-space losses won't backpropagate.
-            # For gradient-connected style loss, use latent-space Gram matrices
-            # by setting use_decoded_pixels_for_style=false in config.
             vae_param = next(self._vae_decoder.parameters())
             vae_device = vae_param.device
             vae_dtype = vae_param.dtype
-            sampled_vae = sampled.detach().clone().to(device=vae_device, dtype=vae_dtype)
+
+            if preserve_grad:
+                # Keep gradient flow: move to VAE device without detaching.
+                # VAE decoder params are frozen (requires_grad=False) so only
+                # the input tensor gets gradients. Costs ~2GB extra VRAM for
+                # the decoder computation graph on the VAE device.
+                sampled_vae = sampled.to(device=vae_device, dtype=vae_dtype)
+            else:
+                # Detach + clone to avoid keeping the decoder's computation graph
+                # in memory (saves ~2GB VRAM). Pixel-space losses won't backprop.
+                sampled_vae = sampled.detach().clone().to(device=vae_device, dtype=vae_dtype)
 
             # Disable autocast to prevent mixed-precision context from
             # interfering with the decoder's internal operations.
@@ -1374,7 +1408,7 @@ class OmniTransferStrategy(TrainingStrategy):
             logger.warning(f"VGG feature extraction failed: {e}")
             return {}
 
-    def _get_clip_features(self, images: Tensor) -> Tensor | None:
+    def _get_clip_features(self, images: Tensor, preserve_grad: bool = False) -> Tensor | None:
         """Extract CLIP/SigLIP features from images for identity loss.
 
         [GROK RECOMMENDED] CLIP/SigLIP provides robust semantic features that work
@@ -1385,6 +1419,10 @@ class OmniTransferStrategy(TrainingStrategy):
 
         Args:
             images: RGB images [B, 3, H, W] in [-1, 1]
+            preserve_grad: If True, don't use inference_mode so gradients can
+                flow through the CLIP forward pass back to the input images.
+                CLIP weights stay frozen (requires_grad=False) — only the input
+                tensor accumulates gradients.
 
         Returns:
             Features [B, feature_dim] or None if unavailable
@@ -1426,20 +1464,22 @@ class OmniTransferStrategy(TrainingStrategy):
 
             # Apply appropriate normalization
             if self._is_siglip:
-                # SigLIP uses different normalization (closer to ImageNet but not identical)
-                # SigLIP: mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5] for webli checkpoints
                 mean = torch.tensor([0.5, 0.5, 0.5], device=images.device).view(1, 3, 1, 1)
                 std = torch.tensor([0.5, 0.5, 0.5], device=images.device).view(1, 3, 1, 1)
             else:
-                # Standard CLIP normalization
                 mean = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=images.device).view(1, 3, 1, 1)
                 std = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=images.device).view(1, 3, 1, 1)
 
             images = (images - mean) / std
 
-            # Extract features
-            with torch.inference_mode():
+            # Extract features — preserve_grad keeps gradient flow through
+            # the CLIP forward pass so identity loss can backprop to the model.
+            # CLIP weights are frozen, only the input tensor gets gradients.
+            if preserve_grad:
                 features = self._clip_model.encode_image(images.float())
+            else:
+                with torch.inference_mode():
+                    features = self._clip_model.encode_image(images.float())
 
             return features
 
@@ -1921,6 +1961,21 @@ class OmniTransferStrategy(TrainingStrategy):
         # Concatenate positions
         combined_positions = torch.cat([biased_ref_positions, tgt_positions], dim=2)
 
+        # RCL split-attention (Section 4.3)
+        # Instead of a dense mask (OOM on 32GB), we pass the split point so the
+        # transformer block splits self-attention into two efficient calls:
+        #   (1) ref self-attention: ref tokens attend only to ref (flash attn, no mask)
+        #   (2) target full attention: target tokens attend to ref+self (flash attn, no mask)
+        rcl_split = None
+        if self.config.enable_rcl:
+            rcl_split = ref_seq_len
+            if not hasattr(self, "_logged_rcl_split"):
+                logger.info(
+                    f"RCL split-attention: ref={ref_seq_len} | tgt={tgt_seq_len} "
+                    f"(total={ref_seq_len + tgt_seq_len} tokens)"
+                )
+                self._logged_rcl_split = True
+
         # Create video Modality
         video_modality = Modality(
             enabled=True,
@@ -1929,6 +1984,7 @@ class OmniTransferStrategy(TrainingStrategy):
             positions=combined_positions,
             context=prompt_embeds,
             context_mask=prompt_attention_mask,
+            rcl_split_point=rcl_split,
         )
 
         # Compute targets for loss (velocity prediction)
@@ -2063,7 +2119,15 @@ class OmniTransferStrategy(TrainingStrategy):
         if compute_perceptual and self.config.identity_loss_weight > 0 and self.config.task_type == "identity_preservation":
             identity_loss = self._compute_identity_loss(target_pred, inputs)
             if identity_loss is not None:
-                loss = loss + self.config.identity_loss_weight * identity_loss * self.config.perceptual_loss_interval
+                scaled_id_loss = self.config.identity_loss_weight * identity_loss * self.config.perceptual_loss_interval
+                loss = loss + scaled_id_loss
+                # Log identity loss breakdown to W&B
+                if WANDB_AVAILABLE and wandb.run is not None:
+                    wandb.log({
+                        "train/identity_loss_raw": identity_loss.item(),
+                        "train/identity_loss_scaled": scaled_id_loss.item(),
+                        "train/mse_loss": (loss - scaled_id_loss).item(),
+                    }, commit=False)
 
         # Optional style loss (CRITICAL for style transfer)
         if compute_perceptual and self.config.style_loss_weight > 0 and self.config.task_type == "style_transfer":
@@ -2209,13 +2273,13 @@ class OmniTransferStrategy(TrainingStrategy):
     ) -> Tensor | None:
         """Compute identity embedding similarity loss.
 
-        [GROK RECOMMENDED] Use CLIP for identity loss instead of mean pooling:
-        1. Decode latents to RGB pixels
-        2. Extract CLIP image features (trained on 400M image-text pairs)
-        3. Compute cosine similarity between reference and prediction
+        Uses CLIP/SigLIP for semantic identity features with full gradient flow:
+        1. Decode predicted latents to RGB pixels (gradient-connected through VAE)
+        2. Extract CLIP features (gradient-connected through frozen CLIP)
+        3. Compute cosine similarity — gradients flow back to model prediction
 
-        CLIP provides robust semantic features that capture identity better than
-        simple spatial mean pooling of latent vectors.
+        The reference is decoded without gradients (it's a fixed target).
+        Only the prediction path needs gradients for backprop.
 
         Args:
             target_pred: Predicted target latents [B, seq_len, C]
@@ -2229,20 +2293,22 @@ class OmniTransferStrategy(TrainingStrategy):
             device = ref_latent.device
             dtype = ref_latent.dtype
 
-            # Compute predicted clean from velocity
+            # Compute predicted clean from velocity (gradient-connected to model output)
             sigmas = inputs.sigmas.to(dtype=dtype).view(-1, 1, 1, 1, 1)
             tgt_pred_5d = inputs.tgt_latent_noisy - sigmas * target_pred.view_as(inputs.tgt_latent_noisy)
 
-            # [GROK RECOMMENDED] Use CLIP for semantic identity features
+            # Use CLIP for semantic identity features with gradient flow
             if self.config.use_clip_identity and CLIP_AVAILABLE:
-                # Decode to pixels
-                ref_pixels = self._decode_latents_to_pixels(ref_latent, sample_frames=4)
-                pred_pixels = self._decode_latents_to_pixels(tgt_pred_5d, sample_frames=4)
+                # Reference: no gradients needed (fixed target)
+                ref_pixels = self._decode_latents_to_pixels(ref_latent, sample_frames=2, preserve_grad=False)
+                # Prediction: gradient-connected so loss backprops to model
+                pred_pixels = self._decode_latents_to_pixels(tgt_pred_5d, sample_frames=2, preserve_grad=True)
 
                 if ref_pixels is not None and pred_pixels is not None:
-                    # Extract CLIP features
-                    ref_features = self._get_clip_features(ref_pixels)
-                    pred_features = self._get_clip_features(pred_pixels)
+                    # Reference features: no gradient needed
+                    ref_features = self._get_clip_features(ref_pixels, preserve_grad=False)
+                    # Prediction features: gradient flows through frozen CLIP back to model
+                    pred_features = self._get_clip_features(pred_pixels, preserve_grad=True)
 
                     if ref_features is not None and pred_features is not None:
                         # Normalize for cosine similarity
@@ -2252,17 +2318,50 @@ class OmniTransferStrategy(TrainingStrategy):
                         # Identity loss = 1 - cosine_similarity
                         cosine_sim = (ref_norm * pred_norm).sum(dim=-1)
                         identity_loss = (1 - cosine_sim).mean()
+
+                        # Log on first successful computation
+                        if not getattr(self, '_clip_identity_logged', False):
+                            logger.info(
+                                f"CLIP identity loss active: sim={cosine_sim.mean().item():.4f}, "
+                                f"loss={identity_loss.item():.4f}, grad_connected={pred_features.requires_grad}"
+                            )
+                            self._clip_identity_logged = True
+
                         return identity_loss.float()
                     else:
                         logger.debug("CLIP feature extraction failed, falling back")
                 else:
                     logger.debug("VAE decode failed, falling back to latent-space identity")
 
-            # Fallback: Latent-space identity proxy (not recommended per Grok)
-            # Compare mean features between reference and predicted target
-            # [B, C, F, H, W] -> [B, C]
-            ref_features = ref_latent.mean(dim=(2, 3, 4))
-            pred_features = tgt_pred_5d.mean(dim=(2, 3, 4))
+            # Fallback: Multi-scale latent-space identity (better than simple mean pooling)
+            # Use channel statistics at multiple spatial scales for richer comparison
+            ref_5d = ref_latent
+            pred_5d = tgt_pred_5d
+
+            features_ref = []
+            features_pred = []
+
+            # Scale 1: Global mean (coarse identity)
+            features_ref.append(ref_5d.mean(dim=(2, 3, 4)))
+            features_pred.append(pred_5d.mean(dim=(2, 3, 4)))
+
+            # Scale 2: Global std (texture/detail signature)
+            features_ref.append(ref_5d.std(dim=(2, 3, 4)))
+            features_pred.append(pred_5d.std(dim=(2, 3, 4)))
+
+            # Scale 3: Spatial quadrant means (preserves coarse spatial structure)
+            h_mid = ref_5d.shape[3] // 2
+            w_mid = ref_5d.shape[4] // 2
+            for quad in [(slice(None, h_mid), slice(None, w_mid)),
+                         (slice(None, h_mid), slice(w_mid, None)),
+                         (slice(h_mid, None), slice(None, w_mid)),
+                         (slice(h_mid, None), slice(w_mid, None))]:
+                features_ref.append(ref_5d[:, :, :, quad[0], quad[1]].mean(dim=(2, 3, 4)))
+                features_pred.append(pred_5d[:, :, :, quad[0], quad[1]].mean(dim=(2, 3, 4)))
+
+            # Concatenate all scales: [B, 128*6] = [B, 768]
+            ref_features = torch.cat(features_ref, dim=-1)
+            pred_features = torch.cat(features_pred, dim=-1)
 
             # Normalize for cosine similarity
             ref_norm = ref_features / ref_features.norm(dim=-1, keepdim=True).clamp(min=1e-6)

@@ -30,6 +30,12 @@ from ltx_trainer.training_strategies.base_strategy import (
     TrainingStrategyConfigBase,
 )
 
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+
 
 class SCDTrainingConfig(TrainingStrategyConfigBase):
     """Configuration for SCD training strategy."""
@@ -80,6 +86,17 @@ class SCDTrainingConfig(TrainingStrategyConfigBase):
     audio_latents_dir: str = Field(
         default="audio_latents",
         description="Directory name for audio latents when with_audio is True",
+    )
+
+    # Reconstruction visualization
+    log_reconstructions: bool = Field(
+        default=False,
+        description="Whether to log reconstruction visualizations to W&B",
+    )
+
+    reconstruction_log_interval: int = Field(
+        default=50,
+        description="Steps between reconstruction visualization logging",
     )
 
 
@@ -344,6 +361,9 @@ class SCDTrainingStrategy(TrainingStrategy):
         model_inputs._scd_model = self._scd_model
         model_inputs._encoder_audio_args = encoder_audio_args
 
+        # Store raw latent shape for reconstruction unpatchification
+        model_inputs._raw_video_latents = batch["latents"]["latents"]  # [B, C, F, H, W]
+
         return model_inputs
 
     def compute_loss(
@@ -376,3 +396,132 @@ class SCDTrainingStrategy(TrainingStrategy):
             "scd_encoder_layers": self.config.encoder_layers,
             "scd_decoder_input_combine": self.config.decoder_input_combine,
         }
+
+    def log_reconstructions_to_wandb(
+        self,
+        video_pred: Tensor,
+        inputs: ModelInputs,
+        step: int,
+        vae_decoder: torch.nn.Module | None = None,
+        prefix: str = "train",
+    ) -> dict[str, Any]:
+        """Log reconstruction visualizations to W&B.
+
+        Decodes the velocity prediction back to clean latent, then VAE-decodes
+        both ground truth and prediction to pixel space for side-by-side comparison.
+
+        Args:
+            video_pred: Model velocity prediction [B, seq_len, C]
+            inputs: ModelInputs with raw latents and noise info
+            step: Current training step
+            vae_decoder: VAE decoder for pixel-space visualization
+            prefix: W&B metric prefix
+
+        Returns:
+            Dictionary of logged metrics
+        """
+        if not WANDB_AVAILABLE or wandb.run is None:
+            return {}
+
+        if not self.config.log_reconstructions:
+            return {}
+
+        raw_latents = getattr(inputs, "_raw_video_latents", None)
+        if raw_latents is None:
+            logger.warning("No raw latents stored for reconstruction")
+            return {}
+
+        b, c, f, h, w = raw_latents.shape
+
+        # Recover predicted clean latent from velocity prediction
+        # Flow matching: v = noise - clean → clean_pred = noise - v_pred
+        noise = inputs.shared_noise  # [B, seq_len, C] (patchified)
+        pred_clean = noise - video_pred  # [B, seq_len, C]
+
+        # Unpatchify: [B, seq_len, C] → [B, C, F, H, W]
+        # With patch_size=1, seq_len = F * H * W and C matches
+        pred_clean_spatial = pred_clean.reshape(b, f, h, w, c).permute(0, 4, 1, 2, 3)
+        gt_latents = raw_latents  # Already [B, C, F, H, W]
+
+        # Decode to pixel space
+        if vae_decoder is not None:
+            try:
+                decoder_device = next(vae_decoder.parameters()).device
+                decoder_dtype = next(vae_decoder.parameters()).dtype
+
+                with torch.inference_mode():
+                    gt_decoded = vae_decoder(
+                        gt_latents[:1].to(device=decoder_device, dtype=decoder_dtype)
+                    )
+                    pred_decoded = vae_decoder(
+                        pred_clean_spatial[:1].to(device=decoder_device, dtype=decoder_dtype)
+                    )
+
+                # Clamp to valid range and convert to [0, 1]
+                gt_decoded = gt_decoded.float().clamp(-1, 1) * 0.5 + 0.5
+                pred_decoded = pred_decoded.float().clamp(-1, 1) * 0.5 + 0.5
+
+                # Take middle frame for visualization
+                mid_f = gt_decoded.shape[2] // 2
+                gt_frame = gt_decoded[0, :, mid_f].cpu()   # [C, H, W]
+                pred_frame = pred_decoded[0, :, mid_f].cpu()
+
+                # Create side-by-side grid
+                import torchvision.utils as vutils
+                grid = vutils.make_grid([gt_frame, pred_frame], nrow=2, padding=4)
+
+                log_dict = {
+                    f"{prefix}/reconstruction": wandb.Image(
+                        grid.permute(1, 2, 0).numpy(),
+                        caption=f"Step {step} | Left: Ground Truth | Right: Prediction",
+                    ),
+                }
+
+                # Also log first and last frames if multiple frames
+                if gt_decoded.shape[2] > 1:
+                    gt_first = gt_decoded[0, :, 0].cpu()
+                    pred_first = pred_decoded[0, :, 0].cpu()
+                    gt_last = gt_decoded[0, :, -1].cpu()
+                    pred_last = pred_decoded[0, :, -1].cpu()
+
+                    grid_first = vutils.make_grid([gt_first, pred_first], nrow=2, padding=4)
+                    grid_last = vutils.make_grid([gt_last, pred_last], nrow=2, padding=4)
+
+                    log_dict[f"{prefix}/reconstruction_first_frame"] = wandb.Image(
+                        grid_first.permute(1, 2, 0).numpy(),
+                        caption=f"Step {step} | First frame | GT vs Pred",
+                    )
+                    log_dict[f"{prefix}/reconstruction_last_frame"] = wandb.Image(
+                        grid_last.permute(1, 2, 0).numpy(),
+                        caption=f"Step {step} | Last frame | GT vs Pred",
+                    )
+
+                wandb.log(log_dict, step=step)
+                logger.debug(f"Logged SCD reconstruction images at step {step}")
+                return log_dict
+
+            except Exception as e:
+                logger.warning(f"Failed to decode reconstruction: {e}")
+                # Fall through to latent-space visualization
+
+        # Fallback: latent-space visualization (pseudo-RGB from first 3 channels)
+        mid_f = f // 2
+        gt_vis = raw_latents[0, :3, mid_f].cpu().float()
+        pred_vis = pred_clean_spatial[0, :3, mid_f].cpu().float()
+
+        # Normalize to [0, 1]
+        def normalize(x):
+            x = x - x.min()
+            return x / (x.max() + 1e-8)
+
+        import torchvision.utils as vutils
+        grid = vutils.make_grid([normalize(gt_vis), normalize(pred_vis)], nrow=2, padding=4)
+
+        log_dict = {
+            f"{prefix}/reconstruction_latent": wandb.Image(
+                grid.permute(1, 2, 0).numpy(),
+                caption=f"Step {step} | Latent space (pseudo-RGB) | GT vs Pred",
+            ),
+        }
+        wandb.log(log_dict, step=step)
+        return log_dict

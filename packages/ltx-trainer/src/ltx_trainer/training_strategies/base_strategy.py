@@ -35,7 +35,7 @@ class TrainingStrategyConfigBase(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    name: Literal["text_to_video", "video_to_video", "omnitransfer", "scd"] = Field(
+    name: Literal["text_to_video", "video_to_video", "omnitransfer", "scd", "editctrl_scd"] = Field(
         description="Unique name identifying the training strategy type"
     )
 
@@ -66,6 +66,12 @@ class ModelInputs:
     _encoder_features: Tensor | None = None
     _scd_model: Any | None = None
     _encoder_audio_args: Any | None = None
+    _raw_video_latents: Tensor | None = None  # Pre-patchified [B, C, F, H, W] for reconstruction
+
+    # EditCtrl-specific: control signals and masks for edit-aware decoding
+    _local_control: Tensor | None = None   # [B, seq_len, D] from LocalContextModule
+    _global_context: Tensor | None = None  # [B, num_global, D] from GlobalContextEmbedder
+    _edit_mask: Tensor | None = None       # [B, seq_len] boolean edit mask
 
 
 class TrainingStrategy(ABC):

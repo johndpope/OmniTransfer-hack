@@ -455,12 +455,18 @@ class LtxvTrainer:
         # For SCD strategy: encoder already ran in prepare_training_inputs;
         # here we only run the decoder with encoder features
         if hasattr(model_inputs, "_scd_model") and model_inputs._scd_model is not None:
+            # Pass EditCtrl control signals if available
+            local_control = getattr(model_inputs, "_local_control", None)
+            global_context = getattr(model_inputs, "_global_context", None)
+
             video_pred, audio_pred = model_inputs._scd_model.forward_decoder(
                 video=model_inputs.video,
                 encoder_features=model_inputs._encoder_features,
                 audio=model_inputs.audio,
                 perturbations=None,
                 encoder_audio_args=model_inputs._encoder_audio_args,
+                local_control=local_control,
+                global_context=global_context,
             )
         else:
             video_pred, audio_pred = self._transformer(
@@ -618,7 +624,7 @@ class LtxvTrainer:
             logger.info(f"Moving {model_size} transformer to {hw_devices.transformer}...")
             self._transformer = self._transformer.to(hw_devices.transformer)
 
-        # Wrap transformer with SCD model if using SCD strategy
+        # Wrap transformer with SCD model if using SCD strategy (includes EditCtrl+SCD)
         from ltx_trainer.training_strategies.scd_strategy import SCDTrainingStrategy  # noqa: PLC0415
         if isinstance(self._training_strategy, SCDTrainingStrategy):
             from ltx_core.model.transformer.scd_model import LTXSCDModel  # noqa: PLC0415
@@ -634,6 +640,42 @@ class LtxvTrainer:
                 f"{len(self._transformer.decoder_blocks)} decoder layers, "
                 f"combine={scd_config.decoder_input_combine}"
             )
+
+        # Instantiate EditCtrl modules if using EditCtrl+SCD strategy
+        from ltx_trainer.training_strategies.editctrl_scd_strategy import EditCtrlSCDTrainingStrategy  # noqa: PLC0415
+        if isinstance(self._training_strategy, EditCtrlSCDTrainingStrategy):
+            from ltx_core.model.transformer.editctrl_modules import (  # noqa: PLC0415
+                GlobalContextEmbedder,
+                LocalContextModule,
+            )
+            editctrl_config = self._training_strategy.config
+
+            # Instantiate LocalContextModule on training device
+            self._local_context_module = LocalContextModule(
+                latent_dim=128,  # LTX-2 patchified latent dim
+                inner_dim=self._transformer.inner_dim,
+                context_dim=self._transformer.inner_dim,
+                num_blocks=editctrl_config.local_num_blocks,
+            ).to(device=hw_devices.transformer, dtype=torch.bfloat16)
+            self._training_strategy.set_local_context_module(self._local_context_module)
+            lcm_params = sum(p.numel() for p in self._local_context_module.parameters())
+            logger.info(f"EditCtrl LocalContextModule: {lcm_params:,} params ({lcm_params * 2 / 1e9:.2f} GB bf16)")
+
+            # Instantiate GlobalContextEmbedder for phase 2
+            if editctrl_config.editctrl_phase >= 2:
+                self._global_embedder = GlobalContextEmbedder(
+                    latent_dim=128,
+                    inner_dim=self._transformer.inner_dim,
+                    num_tokens=editctrl_config.global_context_num_tokens,
+                ).to(device=hw_devices.transformer, dtype=torch.bfloat16)
+                self._training_strategy.set_global_embedder(self._global_embedder)
+                ge_params = sum(p.numel() for p in self._global_embedder.parameters())
+                logger.info(f"EditCtrl GlobalContextEmbedder: {ge_params:,} params")
+            else:
+                self._global_embedder = None
+        else:
+            self._local_context_module = None
+            self._global_embedder = None
 
         # Freeze all models. We later unfreeze the transformer based on training mode.
         # Note: embedding_connectors are already frozen (they come from the frozen text encoder)
@@ -1280,6 +1322,99 @@ class LtxvTrainer:
         samples = [media_cls(str(path), caption=prompt) for path, prompt in zip(sample_paths, prompts, strict=True)]
         self._wandb_run.log({"validation_samples": samples}, step=self._global_step)
 
+    def _save_scd_debug_image(
+        self,
+        video_pred: Tensor,
+        model_inputs: "ModelInputs",
+        step: int,
+    ) -> None:
+        """Save SCD debug reconstruction image (GT vs Prediction side-by-side).
+
+        Saves to outputs/debug_recon.png (latent pseudo-RGB) and
+        outputs/debug_decoded.png (VAE decoded pixel space).
+        """
+        try:
+            from torchvision.utils import save_image
+
+            raw_latents = model_inputs._raw_video_latents  # [B, C, F, H, W]
+            noise = model_inputs.shared_noise  # [B, seq_len, C] (patchified)
+            sigmas = model_inputs.shared_sigmas
+
+            b, c, f, h, w = raw_latents.shape
+
+            # Recover predicted clean latent: clean = noise - v
+            pred_clean = noise - video_pred  # [B, seq_len, C]
+            pred_clean_spatial = pred_clean.reshape(b, f, h, w, c).permute(0, 4, 1, 2, 3)
+
+            # Latent pseudo-RGB (first 3 channels, middle frame)
+            mid_f = f // 2
+            gt_vis = raw_latents[0, :3, mid_f].cpu().float()
+            pred_vis = pred_clean_spatial[0, :3, mid_f].cpu().float()
+
+            def norm(x):
+                x = x - x.min()
+                x = x / (x.max() + 1e-8)
+                return x.clamp(0, 1)
+
+            # 2-image grid: GT | Prediction
+            grid = torch.cat([norm(gt_vis), norm(pred_vis)], dim=2)
+
+            out_dir = Path(self._config.output_dir)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            save_image(grid, out_dir / "debug_recon.png")
+
+            # Save step info
+            sigma = sigmas.flatten()[0].item() if sigmas is not None else 0.0
+            with open(out_dir / "debug_info.txt", "w") as info_file:
+                info_file.write(f"Step: {step}\nSigma: {sigma:.4f}\nMode: SCD\n")
+
+            # VAE-decoded frames
+            if self._vae_decoder is not None:
+                hw_devices = self._config.hardware.devices
+                is_multi_gpu = hw_devices.transformer != hw_devices.vae_decoder
+                vae_device = hw_devices.vae_decoder
+
+                if not is_multi_gpu:
+                    self._vae_decoder = self._vae_decoder.to(vae_device)
+
+                vae_dtype = next(self._vae_decoder.parameters()).dtype
+
+                def norm_decoded(x):
+                    return ((x.float() + 1) / 2).clamp(0, 1)
+
+                # Select up to 4 evenly spaced frames
+                num_display = min(4, f)
+                if num_display > 1:
+                    frame_indices = [int(i * (f - 1) / (num_display - 1)) for i in range(num_display)]
+                else:
+                    frame_indices = [mid_f]
+
+                gt_frames = []
+                pred_frames = []
+
+                with torch.inference_mode():
+                    for fidx in frame_indices:
+                        gt_lat = raw_latents[0:1, :, fidx:fidx+1, :, :].to(vae_device, dtype=vae_dtype)
+                        gt_dec = self._vae_decoder(gt_lat)[0, :, 0].cpu()
+                        gt_frames.append(norm_decoded(gt_dec))
+
+                        pred_lat = pred_clean_spatial[0:1, :, fidx:fidx+1, :, :].to(vae_device, dtype=vae_dtype)
+                        pred_dec = self._vae_decoder(pred_lat)[0, :, 0].cpu()
+                        pred_frames.append(norm_decoded(pred_dec))
+
+                if not is_multi_gpu:
+                    self._vae_decoder = self._vae_decoder.to("cpu")
+                torch.cuda.empty_cache()
+
+                # Portrait grid: GT column | Pred column
+                left_col = torch.cat(gt_frames, dim=1)
+                right_col = torch.cat(pred_frames, dim=1)
+                decoded_grid = torch.cat([left_col, right_col], dim=2)
+                save_image(decoded_grid, out_dir / "debug_decoded.png")
+
+        except Exception as e:
+            logger.debug(f"SCD debug image save failed: {e}")
+
     def _save_debug_image(
         self,
         video_pred: Tensor,
@@ -1294,6 +1429,12 @@ class LtxvTrainer:
         """
         try:
             from ltx_trainer.omnitransfer.strategy import OmniTransferModelInputs
+
+            # Check for SCD strategy debug image
+            raw_video_latents = getattr(model_inputs, "_raw_video_latents", None)
+            if raw_video_latents is not None:
+                self._save_scd_debug_image(video_pred, model_inputs, step)
+                return
 
             if not isinstance(model_inputs, OmniTransferModelInputs):
                 return

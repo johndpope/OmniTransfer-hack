@@ -160,7 +160,35 @@ class BasicAVTransformerBlock(torch.nn.Module):
             if not perturbations.all_in_batch(PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx):
                 norm_vx = rms_norm(vx, eps=self.norm_eps) * (1 + vscale_msa) + vshift_msa
                 v_mask = perturbations.mask_like(PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx, vx)
-                vx = vx + self.attn1(norm_vx, pe=video.positional_embeddings) * vgate_msa * v_mask
+
+                if video.rcl_split_point is not None:
+                    # RCL split attention: ref self-attends, target attends to ref+self
+                    # This avoids dense [N,N] mask that would disable flash attention.
+                    sp = video.rcl_split_point
+                    ref_x, tgt_x = norm_vx[:, :sp], norm_vx[:, sp:]
+
+                    # PE is a tuple (cos, sin). Shape depends on RoPE type:
+                    #   INTERLEAVED: [B, seq_len, dim] — slice at dim=1
+                    #   SPLIT: [B, H, seq_len, dim] — slice at dim=2
+                    pe = video.positional_embeddings
+                    if pe is not None:
+                        seq_dim = 2 if pe[0].ndim == 4 else 1
+                        ref_pe = (pe[0].narrow(seq_dim, 0, sp), pe[1].narrow(seq_dim, 0, sp))
+                        tgt_pe = (pe[0].narrow(seq_dim, sp, pe[0].shape[seq_dim] - sp),
+                                  pe[1].narrow(seq_dim, sp, pe[1].shape[seq_dim] - sp))
+                    else:
+                        ref_pe = tgt_pe = None
+
+                    # (1) Reference self-attention (ref tokens only see each other)
+                    ref_out = self.attn1(ref_x, pe=ref_pe)
+
+                    # (2) Target attends to full sequence (ref + target)
+                    tgt_out = self.attn1(tgt_x, context=norm_vx, pe=tgt_pe, k_pe=pe)
+
+                    attn_out = torch.cat([ref_out, tgt_out], dim=1)
+                    vx = vx + attn_out * vgate_msa * v_mask
+                else:
+                    vx = vx + self.attn1(norm_vx, pe=video.positional_embeddings, mask=video.self_attn_mask) * vgate_msa * v_mask
 
             vx = vx + self.attn2(rms_norm(vx, eps=self.norm_eps), context=video.context, mask=video.context_mask)
 

@@ -677,6 +677,22 @@ class LtxvTrainer:
             self._local_context_module = None
             self._global_embedder = None
 
+        # Instantiate HRR text enhancer if configured
+        self._hrr_enhancer = None
+        if self._config.hrr.enabled and isinstance(self._training_strategy, EditCtrlSCDTrainingStrategy):
+            from ltx_trainer.hrr_text_enhancer import create_hrr_enhancer  # noqa: PLC0415
+            self._hrr_enhancer = create_hrr_enhancer(self._config.hrr, dim=3840)
+            self._hrr_enhancer = self._hrr_enhancer.to(
+                device=hw_devices.transformer, dtype=torch.bfloat16
+            )
+            self._training_strategy.set_hrr_enhancer(self._hrr_enhancer)
+            hrr_params = sum(p.numel() for p in self._hrr_enhancer.parameters())
+            logger.info(
+                f"HRR {self._config.hrr.mode} enhancer: {hrr_params:,} params "
+                f"({hrr_params * 2 / 1e6:.1f} MB bf16), "
+                f"gate_init={self._config.hrr.gate_init_bias}"
+            )
+
         # Freeze all models. We later unfreeze the transformer based on training mode.
         # Note: embedding_connectors are already frozen (they come from the frozen text encoder)
         self._vae_decoder.requires_grad_(False)
@@ -934,7 +950,25 @@ class LtxvTrainer:
                     ]
                 logger.info(f"Using cached final embeddings from: {final_dir}/")
 
-            self._dataset = PrecomputedDataset(self._config.data.preprocessed_data_root, data_sources=data_sources)
+            # Use PairedPrecomputedDataset when HRR cross-caption training is enabled
+            use_paired = (
+                self._config.hrr.enabled
+                and hasattr(self._config.training_strategy, "use_hrr")
+                and self._config.training_strategy.use_hrr
+            )
+            if use_paired:
+                from ltx_trainer.datasets import PairedPrecomputedDataset  # noqa: PLC0415
+                self._dataset = PairedPrecomputedDataset(
+                    self._config.data.preprocessed_data_root, data_sources=data_sources
+                )
+                logger.info(
+                    f"Using PairedPrecomputedDataset with {len(self._dataset):,} samples "
+                    f"(cross-caption HRR training)"
+                )
+            else:
+                self._dataset = PrecomputedDataset(
+                    self._config.data.preprocessed_data_root, data_sources=data_sources
+                )
             logger.debug(f"Loaded dataset with {len(self._dataset):,} samples from sources: {list(data_sources)}")
 
         num_workers = self._config.data.num_dataloader_workers
@@ -957,19 +991,39 @@ class LtxvTrainer:
             if isinstance(module, (BaseTunerLayer, ModulesToSaveWrapper)):
                 module.reset_lora_parameters(adapter_name="default", init_lora_weights=True)
 
+    def _build_param_groups(self, lr: float, wd: float) -> list[dict]:
+        """Build optimizer parameter groups, applying lr_multiplier for HRR."""
+        if self._hrr_enhancer is not None and self._config.hrr.lr_multiplier != 1.0:
+            hrr_param_ids = {id(p) for p in self._hrr_enhancer.parameters()}
+            base_params = [p for p in self._trainable_params if id(p) not in hrr_param_ids]
+            hrr_params = [p for p in self._trainable_params if id(p) in hrr_param_ids]
+
+            groups = [{"params": base_params}]
+            if hrr_params:
+                hrr_lr = lr * self._config.hrr.lr_multiplier
+                groups.append({"params": hrr_params, "lr": hrr_lr})
+                logger.info(f"HRR param group: lr={hrr_lr:.2e} ({self._config.hrr.lr_multiplier}x base)")
+            return groups
+
+        return [{"params": self._trainable_params}]
+
     def _init_optimizer(self) -> None:
         """Initialize the optimizer and learning rate scheduler."""
         opt_cfg = self._config.optimization
 
         lr = opt_cfg.learning_rate
         wd = opt_cfg.weight_decay
+
+        # Build parameter groups (support HRR lr_multiplier)
+        param_groups = self._build_param_groups(lr, wd)
+
         if opt_cfg.optimizer_type == "adamw":
-            optimizer = AdamW(self._trainable_params, lr=lr, weight_decay=wd)
+            optimizer = AdamW(param_groups, lr=lr, weight_decay=wd)
         elif opt_cfg.optimizer_type == "adamw8bit":
             # noinspection PyUnresolvedReferences
             from bitsandbytes.optim import AdamW8bit  # noqa: PLC0415
 
-            optimizer = AdamW8bit(self._trainable_params, lr=lr, weight_decay=wd)
+            optimizer = AdamW8bit(param_groups, lr=lr, weight_decay=wd)
         else:
             raise ValueError(f"Unknown optimizer type: {opt_cfg.optimizer_type}")
 

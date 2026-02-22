@@ -493,6 +493,111 @@ class HardwareConfig(ConfigBaseModel):
     )
 
 
+class HRRConfig(ConfigBaseModel):
+    """Configuration for HRR (Holographic Reduced Representations) text enhancer.
+
+    When enabled, applies learnable HRR compositional binding to pre-computed
+    text embeddings before they enter the embedding connectors. This adds
+    structured, frequency-domain transformations with very few parameters.
+
+    Supports two modes:
+    - ``"global"``: Single spectral kernel applied uniformly to all tokens (original).
+    - ``"token_aware"``: Per-token routing to N HRR concept channels via a lightweight
+      router, enabling position-dependent text conditioning.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description="Enable HRR text enhancement",
+    )
+
+    mode: Literal["global", "token_aware"] = Field(
+        default="global",
+        description="HRR mode: 'global' applies one kernel to all tokens, "
+        "'token_aware' routes each token to different concept channels",
+    )
+
+    num_channels: int = Field(
+        default=49,
+        description="Number of HRR concept channels (bind/unbind pairs). "
+        "For global mode, default 49 matches Gemma hidden layers (~376K params). "
+        "For token_aware mode, 16 channels is recommended (~188K params).",
+        ge=1,
+        le=128,
+    )
+
+    num_concept_pairs: int | None = Field(
+        default=None,
+        description="Deprecated alias for num_channels. Use num_channels instead.",
+        ge=1,
+        le=128,
+    )
+
+    router_type: Literal["dot_product", "mlp"] = Field(
+        default="dot_product",
+        description="Router type for token_aware mode.",
+    )
+
+    router_dim: int | None = Field(
+        default=None,
+        description="Hidden dimension for MLP router. Defaults to dim // 4 if None.",
+    )
+
+    temperature: float = Field(
+        default=1.0,
+        description="Initial temperature for router softmax (token_aware mode).",
+        gt=0.0,
+    )
+
+    entropy_reg_weight: float = Field(
+        default=0.0,
+        description="Weight for routing entropy regularization loss.",
+        ge=0.0,
+    )
+
+    entropy_warmup_steps: int = Field(
+        default=0,
+        description="Number of steps to linearly warm up entropy regularization weight.",
+        ge=0,
+    )
+
+    lr_multiplier: float = Field(
+        default=1.0,
+        description="Learning rate multiplier for HRR params relative to base LR.",
+        gt=0.0,
+    )
+
+    solo_warmup_steps: int = Field(
+        default=0,
+        description="Number of steps where only HRR trains (LoRA/transformer frozen).",
+        ge=0,
+    )
+
+    gate_init_bias: float = Field(
+        default=-2.0,
+        description="Initial bias for the gate. sigmoid(-2)~0.12.",
+    )
+
+    init_noise: float = Field(
+        default=0.0,
+        description="Stddev of noise added to unbind_probes at init to break exact identity.",
+        ge=0.0,
+    )
+
+    gate_encourage_weight: float = Field(
+        default=0.0,
+        description="Weight for gate encouragement loss (-lambda * mean(gate)).",
+        ge=0.0,
+    )
+
+    @model_validator(mode="after")
+    def handle_backward_compat(self) -> "HRRConfig":
+        """Map deprecated num_concept_pairs to num_channels."""
+        if self.num_concept_pairs is not None and self.num_channels == 49:
+            object.__setattr__(self, "num_channels", self.num_concept_pairs)
+        return self
+
+
 class LtxTrainerConfig(ConfigBaseModel):
     """Unified configuration for LTXV training"""
 
@@ -512,6 +617,7 @@ class LtxTrainerConfig(ConfigBaseModel):
     flow_matching: FlowMatchingConfig = Field(default_factory=FlowMatchingConfig)
     wandb: WandbConfig = Field(default_factory=WandbConfig)
     hardware: HardwareConfig = Field(default_factory=HardwareConfig)
+    hrr: HRRConfig = Field(default_factory=HRRConfig)
 
     # General configuration
     seed: int = Field(

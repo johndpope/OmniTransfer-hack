@@ -5,6 +5,7 @@ Extends the SCD training strategy with EditCtrl-style video editing:
 - Runs LocalContextModule on sparse masked source tokens
 - Optionally runs GlobalContextEmbedder on downsampled background
 - Computes loss only on masked (edit) regions
+- (Optional) HRR text enhancement for richer conditioning + cross-caption signal
 
 Two training phases:
   Phase 1: Local context only (LocalContextModule + EditCtrl LoRA)
@@ -17,6 +18,7 @@ import sys
 from typing import Any, Literal
 
 import torch
+import torch.nn as nn
 from pydantic import Field
 from torch import Tensor
 
@@ -106,6 +108,17 @@ class EditCtrlSCDConfig(SCDTrainingConfig):
         description="Enable gradient checkpointing on LocalContextModule blocks",
     )
 
+    use_hrr: bool = Field(
+        default=False,
+        description="Enable HRR text enhancement for richer conditioning + cross-caption signal",
+    )
+
+    cross_caption_loss_weight: float = Field(
+        default=0.1,
+        description="Weight for cross-caption edit loss (requires HRR + paired dataset)",
+        ge=0.0,
+    )
+
 
 class EditCtrlSCDTrainingStrategy(SCDTrainingStrategy):
     """EditCtrl + SCD training strategy.
@@ -125,6 +138,7 @@ class EditCtrlSCDTrainingStrategy(SCDTrainingStrategy):
         super().__init__(config)
         self._local_context_module: LocalContextModule | None = None
         self._global_embedder: GlobalContextEmbedder | None = None
+        self._hrr_enhancer: nn.Module | None = None
 
     def set_local_context_module(self, module: LocalContextModule) -> None:
         """Set the LocalContextModule. Called by trainer after instantiation."""
@@ -134,6 +148,10 @@ class EditCtrlSCDTrainingStrategy(SCDTrainingStrategy):
         """Set the GlobalContextEmbedder. Called by trainer for phase 2."""
         self._global_embedder = module
 
+    def set_hrr_enhancer(self, enhancer: nn.Module) -> None:
+        """Set the HRR text enhancer. Called by trainer when HRR is enabled."""
+        self._hrr_enhancer = enhancer
+
     def get_trainable_parameters(self) -> list[torch.nn.Parameter]:
         """Return EditCtrl module parameters for the optimizer."""
         params = []
@@ -141,6 +159,8 @@ class EditCtrlSCDTrainingStrategy(SCDTrainingStrategy):
             params.extend(p for p in self._local_context_module.parameters() if p.requires_grad)
         if self._global_embedder is not None:
             params.extend(p for p in self._global_embedder.parameters() if p.requires_grad)
+        if self._hrr_enhancer is not None:
+            params.extend(p for p in self._hrr_enhancer.parameters() if p.requires_grad)
         return params
 
     def prepare_training_inputs(
@@ -180,6 +200,32 @@ class EditCtrlSCDTrainingStrategy(SCDTrainingStrategy):
         conditions = batch["conditions"]
         video_prompt_embeds = conditions["video_prompt_embeds"]
         prompt_attention_mask = conditions["prompt_attention_mask"]
+
+        # === HRR text enhancement ===
+        hrr_input_embeds = None
+        edit_prompt_embeds = None
+        edit_prompt_mask = None
+        hrr_edit_mask = None
+
+        if self._hrr_enhancer is not None:
+            # Store pre-HRR embeddings for entropy regularization
+            hrr_input_embeds = video_prompt_embeds.detach()
+            # Enhance source prompt with HRR
+            video_prompt_embeds = self._hrr_enhancer(video_prompt_embeds)
+
+            # Cross-caption: enhance edit prompt if available
+            if "edit_conditions" in batch:
+                edit_cond = batch["edit_conditions"]
+                edit_embeds_raw = edit_cond.get("video_prompt_embeds", edit_cond.get("prompt_embeds"))
+                if edit_embeds_raw is not None:
+                    edit_prompt_mask = edit_cond.get("prompt_attention_mask")
+                    edit_prompt_embeds = self._hrr_enhancer(edit_embeds_raw)
+
+                    # Compute HRR routing divergence (edit mask)
+                    if hasattr(self._hrr_enhancer, "get_edit_mask"):
+                        hrr_edit_mask = self._hrr_enhancer.get_edit_mask(
+                            hrr_input_embeds, edit_embeds_raw
+                        )
 
         batch_size = video_latents.shape[0]
         video_seq_len = video_latents.shape[1]
@@ -324,6 +370,13 @@ class EditCtrlSCDTrainingStrategy(SCDTrainingStrategy):
         model_inputs._global_context = global_context
         model_inputs._edit_mask = edit_mask
 
+        # Attach HRR-specific data (for cross-caption loss + entropy reg)
+        if self._hrr_enhancer is not None:
+            model_inputs._hrr_input_embeds = hrr_input_embeds
+            model_inputs._edit_prompt_embeds = edit_prompt_embeds
+            model_inputs._edit_prompt_mask = edit_prompt_mask
+            model_inputs._hrr_edit_mask = hrr_edit_mask
+
         return model_inputs
 
     def compute_loss(
@@ -336,6 +389,10 @@ class EditCtrlSCDTrainingStrategy(SCDTrainingStrategy):
 
         Loss is computed only on edit (masked) region tokens and normalized
         by the number of masked tokens (not total tokens).
+
+        When HRR is enabled, also adds:
+        - Entropy regularization (encourages diverse routing)
+        - Gate encouragement (pushes gate open so HRR contributes)
         """
         edit_mask = getattr(inputs, "_edit_mask", inputs.video_loss_mask)
 
@@ -349,6 +406,25 @@ class EditCtrlSCDTrainingStrategy(SCDTrainingStrategy):
         # Normalize by masked token count (avoid division by zero)
         num_masked = mask_float.sum().clamp(min=1.0)
         loss = masked_loss.sum() / num_masked
+
+        # === HRR auxiliary losses ===
+        if self._hrr_enhancer is not None and inputs._hrr_input_embeds is not None:
+            from ltx_trainer.config import HRRConfig  # noqa: PLC0415
+
+            # Get HRR config from trainer config (accessed via strategy config parent)
+            entropy_weight = self.config.cross_caption_loss_weight * 0.01  # Scale down
+            gate_weight = self.config.cross_caption_loss_weight * 0.01
+
+            # Entropy regularization: encourage diverse routing
+            if hasattr(self._hrr_enhancer, "get_routing_entropy"):
+                entropy = self._hrr_enhancer.get_routing_entropy(inputs._hrr_input_embeds)
+                # Negative entropy = encourage higher entropy (more diverse routing)
+                loss = loss - entropy_weight * entropy
+
+            # Gate encouragement: push gate toward opening
+            if hasattr(self._hrr_enhancer, "gate"):
+                gate_val = torch.sigmoid(self._hrr_enhancer.gate)
+                loss = loss - gate_weight * gate_val
 
         return loss
 
@@ -372,6 +448,9 @@ class EditCtrlSCDTrainingStrategy(SCDTrainingStrategy):
         if self._global_embedder is not None:
             for k, v in self._global_embedder.state_dict().items():
                 state[f"strategy.global_embedder.{k}"] = v
+        if self._hrr_enhancer is not None:
+            for k, v in self._hrr_enhancer.state_dict().items():
+                state[f"strategy.hrr_enhancer.{k}"] = v
         return state
 
     def load_strategy_state_dict(
@@ -406,5 +485,19 @@ class EditCtrlSCDTrainingStrategy(SCDTrainingStrategy):
             loaded.extend(ge_dict.keys())
         elif ge_dict:
             skipped.extend(ge_dict.keys())
+
+        # Extract HRR enhancer weights
+        hrr_prefix = "strategy.hrr_enhancer."
+        hrr_dict = {
+            k[len(hrr_prefix):]: v
+            for k, v in state_dict.items()
+            if k.startswith(hrr_prefix)
+        }
+        if hrr_dict and self._hrr_enhancer is not None:
+            self._hrr_enhancer.load_state_dict(hrr_dict, strict=False)
+            loaded.extend(hrr_dict.keys())
+            logger.info(f"Loaded HRR enhancer: {len(hrr_dict)} tensors")
+        elif hrr_dict:
+            skipped.extend(hrr_dict.keys())
 
         return loaded, skipped

@@ -5,7 +5,6 @@ Extends the SCD training strategy with EditCtrl-style video editing:
 - Runs LocalContextModule on sparse masked source tokens
 - Optionally runs GlobalContextEmbedder on downsampled background
 - Computes loss only on masked (edit) regions
-- (Optional) HRR text enhancement for richer conditioning + cross-caption signal
 
 Two training phases:
   Phase 1: Local context only (LocalContextModule + EditCtrl LoRA)
@@ -14,11 +13,12 @@ Two training phases:
 
 from __future__ import annotations
 
+import random
 import sys
+from pathlib import Path
 from typing import Any, Literal
 
 import torch
-import torch.nn as nn
 from pydantic import Field
 from torch import Tensor
 
@@ -45,9 +45,11 @@ from ltx_trainer.training_strategies.scd_strategy import (
 # Add mask utils path
 sys.path.insert(0, "/home/johndpope/Documents/GitHub/sparse-causal-diffusion")
 from scd.utils.mask_utils import (
+    SemanticMaskLibrary,
     dilate_token_mask,
     gather_masked_tokens,
     generate_random_token_masks,
+    generate_semantic_masks,
     prepare_background_latents,
     scatter_masked_tokens,
 )
@@ -98,6 +100,43 @@ class EditCtrlSCDConfig(SCDTrainingConfig):
         le=0.95,
     )
 
+    local_inner_dim: int = Field(
+        default=0,
+        description="Inner dim for LocalContextModule (0 = use transformer inner_dim 4096)",
+    )
+
+    local_heads: int = Field(
+        default=0,
+        description="Number of attention heads in LCM (0 = auto: inner_dim / 64)",
+    )
+
+    local_dim_head: int = Field(
+        default=64,
+        description="Dimension per attention head in LCM",
+    )
+
+    background_fill_value: float = Field(
+        default=0.5,
+        description="Value to fill masked (edit) region in background latents (paper: 0.5)",
+        ge=0.0,
+        le=1.0,
+    )
+
+    mask_channel_concat: bool = Field(
+        default=True,
+        description="Concatenate edit mask as extra channel to LCM input (paper: C=[E(V_b),V_m↓])",
+    )
+
+    local_control_injection: str = Field(
+        default="per_layer",
+        description="How to inject local control: 'pre_decoder' (once before blocks) or 'per_layer' (after FFN at selected blocks)",
+    )
+
+    local_control_layers: list[int] | None = Field(
+        default=None,
+        description="Which decoder block indices to inject local control at (None = all blocks). Only used when local_control_injection='per_layer'",
+    )
+
     freeze_base_lora: bool = Field(
         default=True,
         description="Freeze the base SCD LoRA weights (only train EditCtrl LoRA + modules)",
@@ -108,15 +147,55 @@ class EditCtrlSCDConfig(SCDTrainingConfig):
         description="Enable gradient checkpointing on LocalContextModule blocks",
     )
 
-    use_hrr: bool = Field(
+    # TMA (Task-adaptive Multimodal Alignment) params
+    use_tma: bool = Field(
         default=False,
-        description="Enable HRR text enhancement for richer conditioning + cross-caption signal",
+        description="Enable TMA with pre-computed Qwen VL features for semantic guidance",
     )
 
-    cross_caption_loss_weight: float = Field(
-        default=0.1,
-        description="Weight for cross-caption edit loss (requires HRR + paired dataset)",
+    tma_mllm_hidden_dim: int = Field(
+        default=3584,
+        description="Qwen VL hidden dimension (7B=3584, 3B=2048)",
+    )
+
+    tma_output_dim: int = Field(
+        default=3840,
+        description="TMA output dim — must match Gemma embedding dim (3840 for LTX-2)",
+    )
+
+    tma_num_queries: int = Field(
+        default=8,
+        description="Number of learnable MetaQuery tokens per task type",
+    )
+
+    tma_connector_layers: int = Field(
+        default=3,
+        description="Number of layers in the TMA connector MLP",
+    )
+
+    tma_features_dir: str = Field(
+        default="qwen_vl_features",
+        description="Subdirectory name for cached Qwen VL features under data root",
+    )
+
+    # Mask source settings
+    mask_source: str = Field(
+        default="random",
+        description="Mask generation mode: 'random' (rectangles/ellipses), "
+                    "'semantic' (per-sample Qwen VL object masks), 'mixed' (blend both)",
+    )
+
+    semantic_mask_dir: str | None = Field(
+        default=None,
+        description="Path to pre-computed per-sample semantic masks (output of compute_semantic_masks.py). "
+                    "Each {idx:03d}.pt contains 'masks' [N_objects, H, W] and 'objects' list.",
+    )
+
+    semantic_mask_ratio: float = Field(
+        default=0.5,
+        description="Fraction of samples using semantic masks in 'mixed' mode",
         ge=0.0,
+        le=1.0,
     )
 
 
@@ -138,7 +217,29 @@ class EditCtrlSCDTrainingStrategy(SCDTrainingStrategy):
         super().__init__(config)
         self._local_context_module: LocalContextModule | None = None
         self._global_embedder: GlobalContextEmbedder | None = None
-        self._hrr_enhancer: nn.Module | None = None
+        self._tma: torch.nn.Module | None = None
+        self._mask_library: SemanticMaskLibrary | None = None
+        self._per_sample_masks: dict[int, dict] | None = None
+
+        # Load per-sample semantic masks from compute_semantic_masks.py output
+        if config.mask_source in ("semantic", "mixed") and config.semantic_mask_dir:
+            mask_dir = config.semantic_mask_dir
+            self._per_sample_masks = {}
+            count = 0
+            for pt_file in sorted(Path(mask_dir).glob("*.pt")):
+                try:
+                    idx = int(pt_file.stem)
+                    data = torch.load(pt_file, weights_only=False, map_location="cpu")
+                    if data.get("num_objects", 0) > 0:
+                        self._per_sample_masks[idx] = data
+                        count += 1
+                except (ValueError, RuntimeError):
+                    continue
+            logger.info(
+                f"EditCtrl mask_source={config.mask_source}, "
+                f"loaded {count} per-sample semantic masks from {mask_dir}, "
+                f"ratio={config.semantic_mask_ratio}"
+            )
 
     def set_local_context_module(self, module: LocalContextModule) -> None:
         """Set the LocalContextModule. Called by trainer after instantiation."""
@@ -148,20 +249,139 @@ class EditCtrlSCDTrainingStrategy(SCDTrainingStrategy):
         """Set the GlobalContextEmbedder. Called by trainer for phase 2."""
         self._global_embedder = module
 
-    def set_hrr_enhancer(self, enhancer: nn.Module) -> None:
-        """Set the HRR text enhancer. Called by trainer when HRR is enabled."""
-        self._hrr_enhancer = enhancer
+    def set_tma(self, module: torch.nn.Module) -> None:
+        """Set the TMA module. Called by trainer when use_tma=True."""
+        self._tma = module
+
+    def get_data_sources(self) -> dict[str, str]:
+        """Return data source subdirectory mapping.
+
+        When TMA is enabled, adds qwen_vl_features as an additional data source
+        so the dataloader loads pre-computed Qwen features alongside latents/conditions.
+        """
+        sources = super().get_data_sources() if hasattr(super(), "get_data_sources") else {}
+        if self.config.use_tma:
+            sources[self.config.tma_features_dir] = "qwen_vl_features"
+        return sources
 
     def get_trainable_parameters(self) -> list[torch.nn.Parameter]:
-        """Return EditCtrl module parameters for the optimizer."""
+        """Return EditCtrl + TMA module parameters for the optimizer."""
         params = []
         if self._local_context_module is not None:
             params.extend(p for p in self._local_context_module.parameters() if p.requires_grad)
         if self._global_embedder is not None:
             params.extend(p for p in self._global_embedder.parameters() if p.requires_grad)
-        if self._hrr_enhancer is not None:
-            params.extend(p for p in self._hrr_enhancer.parameters() if p.requires_grad)
+        if self._tma is not None:
+            params.extend(p for p in self._tma.parameters() if p.requires_grad)
         return params
+
+    def _generate_per_sample_masks(
+        self,
+        batch: dict[str, Any],
+        batch_size: int,
+        num_frames: int,
+        height: int,
+        width: int,
+        tokens_per_frame: int,
+        video_seq_len: int,
+        device: torch.device,
+    ) -> Tensor:
+        """Generate edit masks from per-sample Qwen VL object detections.
+
+        For each sample in the batch:
+        1. Look up its index in the pre-computed semantic masks
+        2. Pick a random detected object that fits area constraints
+        3. Resize its bounding box mask to the current latent grid
+        4. Broadcast across all frames (static scene = same mask per frame)
+
+        Falls back to random token masks for samples without detections
+        or when in 'mixed' mode and the coin flip says random.
+        """
+        import torch.nn.functional as F
+
+        edit_mask = torch.zeros(batch_size, video_seq_len, dtype=torch.bool, device=device)
+
+        for b in range(batch_size):
+            # In mixed mode, randomly choose semantic vs random
+            if self.config.mask_source == "mixed" and random.random() >= self.config.semantic_mask_ratio:
+                # Random mask for this sample
+                m = generate_random_token_masks(
+                    batch_size=1, seq_len=video_seq_len,
+                    tokens_per_frame=tokens_per_frame,
+                    min_area=self.config.mask_min_area,
+                    max_area=self.config.mask_max_area,
+                    device=device, height=height, width=width,
+                )
+                edit_mask[b] = m[0]
+                continue
+
+            # Try to get per-sample mask data
+            # Dataset stores idx at top level of batch (see datasets.py line 243)
+            sample_idx = None
+            if "idx" in batch:
+                idx_val = batch["idx"]
+                sample_idx = idx_val[b].item() if isinstance(idx_val, Tensor) else int(idx_val)
+            elif "latents" in batch and "idx" in batch["latents"]:
+                sample_idx = batch["latents"]["idx"][b].item()
+
+            mask_data = None
+            if sample_idx is not None and self._per_sample_masks is not None:
+                mask_data = self._per_sample_masks.get(sample_idx)
+
+            if mask_data is None:
+                # No mask data for this sample — try random index from available
+                if self._per_sample_masks:
+                    fallback_idx = random.choice(list(self._per_sample_masks.keys()))
+                    mask_data = self._per_sample_masks[fallback_idx]
+
+            if mask_data is None or mask_data.get("num_objects", 0) == 0:
+                # Fallback to random mask
+                m = generate_random_token_masks(
+                    batch_size=1, seq_len=video_seq_len,
+                    tokens_per_frame=tokens_per_frame,
+                    min_area=self.config.mask_min_area,
+                    max_area=self.config.mask_max_area,
+                    device=device, height=height, width=width,
+                )
+                edit_mask[b] = m[0]
+                continue
+
+            # Pick a random object from detected objects
+            object_masks = mask_data["masks"]  # [N_objects, stored_h, stored_w]
+            objects_list = mask_data["objects"]
+            n_objects = object_masks.shape[0]
+
+            # Filter by area constraints
+            valid_indices = []
+            for i in range(n_objects):
+                bbox = objects_list[i]["bbox_norm"]
+                area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+                if self.config.mask_min_area <= area <= self.config.mask_max_area:
+                    valid_indices.append(i)
+
+            if not valid_indices:
+                # No objects in area range — use any object
+                valid_indices = list(range(n_objects))
+
+            obj_idx = random.choice(valid_indices)
+            obj_mask = object_masks[obj_idx]  # [stored_h, stored_w]
+            obj_name = objects_list[obj_idx]["name"]
+
+            # Resize to current latent dims [height, width]
+            obj_mask_resized = F.interpolate(
+                obj_mask.unsqueeze(0).unsqueeze(0).float(),  # [1, 1, stored_h, stored_w]
+                size=(height, width),
+                mode="nearest",
+            ).squeeze()  # [height, width]
+
+            # Broadcast across all frames → [num_frames, height, width]
+            frame_mask = obj_mask_resized.unsqueeze(0).expand(num_frames, -1, -1)
+
+            # Flatten to token sequence [seq_len]
+            token_mask = frame_mask.reshape(-1) > 0.5  # [num_frames * height * width]
+            edit_mask[b] = token_mask.to(device)
+
+        return edit_mask
 
     def prepare_training_inputs(
         self,
@@ -201,54 +421,62 @@ class EditCtrlSCDTrainingStrategy(SCDTrainingStrategy):
         video_prompt_embeds = conditions["video_prompt_embeds"]
         prompt_attention_mask = conditions["prompt_attention_mask"]
 
-        # === HRR text enhancement ===
-        hrr_input_embeds = None
-        edit_prompt_embeds = None
-        edit_prompt_mask = None
-        hrr_edit_mask = None
-
-        if self._hrr_enhancer is not None:
-            # Store pre-HRR embeddings for entropy regularization
-            hrr_input_embeds = video_prompt_embeds.detach()
-            # Enhance source prompt with HRR
-            video_prompt_embeds = self._hrr_enhancer(video_prompt_embeds)
-
-            # Cross-caption: enhance edit prompt if available
-            if "edit_conditions" in batch:
-                edit_cond = batch["edit_conditions"]
-                edit_embeds_raw = edit_cond.get("video_prompt_embeds", edit_cond.get("prompt_embeds"))
-                if edit_embeds_raw is not None:
-                    edit_prompt_mask = edit_cond.get("prompt_attention_mask")
-                    edit_prompt_embeds = self._hrr_enhancer(edit_embeds_raw)
-
-                    # Compute HRR routing divergence (edit mask)
-                    if hasattr(self._hrr_enhancer, "get_edit_mask"):
-                        hrr_edit_mask = self._hrr_enhancer.get_edit_mask(
-                            hrr_input_embeds, edit_embeds_raw
-                        )
-
         batch_size = video_latents.shape[0]
         video_seq_len = video_latents.shape[1]
         device = video_latents.device
         dtype = video_latents.dtype
 
+        # === TMA: Prepend Qwen VL semantic tokens to text context ===
+        if self._tma is not None and "qwen_vl_features" in batch:
+            qwen_data = batch["qwen_vl_features"]
+            # qwen_features: [B, seq_len_qwen, hidden_dim] — variable-length Qwen outputs
+            qwen_features = qwen_data["qwen_features"].to(device=device, dtype=dtype)
+            # Use task index 0 (editing) for all samples
+            task_indices = torch.zeros(batch_size, dtype=torch.long, device=device)
+            # TMA: cross-attend MetaQueries over Qwen features → [B, num_queries, output_dim]
+            tma_context = self._tma(qwen_features, task_indices)  # [B, 8, 3840]
+
+            # Prepend TMA tokens to text context
+            video_prompt_embeds = torch.cat([tma_context, video_prompt_embeds], dim=1)
+            tma_mask = torch.ones(
+                batch_size, tma_context.shape[1],
+                dtype=prompt_attention_mask.dtype, device=device,
+            )
+            prompt_attention_mask = torch.cat([tma_mask, prompt_attention_mask], dim=1)
+
         tokens_per_frame = video_seq_len // num_frames
 
-        # === Generate synthetic edit masks in token space ===
-        edit_mask = generate_random_token_masks(
-            batch_size=batch_size,
-            seq_len=video_seq_len,
-            tokens_per_frame=tokens_per_frame,
-            min_area=self.config.mask_min_area,
-            max_area=self.config.mask_max_area,
-            device=device,
-        )  # [B, seq_len] boolean
+        # === Generate edit masks in token space ===
+        # Try per-sample semantic masks (from compute_semantic_masks.py / Qwen VL detections)
+        use_semantic = (
+            self._per_sample_masks is not None
+            and len(self._per_sample_masks) > 0
+            and self.config.mask_source in ("semantic", "mixed")
+        )
+        if use_semantic:
+            edit_mask = self._generate_per_sample_masks(
+                batch, batch_size, num_frames, height, width,
+                tokens_per_frame, video_seq_len, device,
+            )
+        else:
+            edit_mask = generate_random_token_masks(
+                batch_size=batch_size,
+                seq_len=video_seq_len,
+                tokens_per_frame=tokens_per_frame,
+                min_area=self.config.mask_min_area,
+                max_area=self.config.mask_max_area,
+                device=device,
+                height=height,
+                width=width,
+            )  # [B, seq_len] boolean
 
         # Dilate mask for boundary context
         dilated_mask = dilate_token_mask(
             edit_mask,
             tokens_per_frame=tokens_per_frame,
             dilation=self.config.mask_dilation_latent,
+            height=height,
+            width=width,
         )  # [B, seq_len] boolean
 
         # === Sample noise and construct noisy latents ===
@@ -296,20 +524,25 @@ class EditCtrlSCDTrainingStrategy(SCDTrainingStrategy):
         # === LocalContextModule forward pass ===
         local_control = None
         if self._local_context_module is not None:
+            # Optionally concatenate edit mask channel to source tokens (paper: C = [E(V_b), V_m↓])
+            # This tells LCM which tokens are edit-region (1) vs boundary context (0)
+            if getattr(self._local_context_module, 'mask_channel_concat', False):
+                edit_mask_channel = edit_mask.unsqueeze(-1).to(dtype=dtype)  # [B, seq_len, 1] — match latent dtype
+                lcm_input = torch.cat([video_latents, edit_mask_channel], dim=-1)  # [B, seq_len, C+1]
+            else:
+                lcm_input = video_latents
+
             # Gather sparse source tokens at dilated mask positions
-            sparse_tokens, sparse_lengths = gather_masked_tokens(video_latents, dilated_mask)
+            sparse_tokens, sparse_lengths = gather_masked_tokens(lcm_input, dilated_mask)
 
             # Get timestep embedding from the base model's AdaLN
-            # We use the decoder timestep (actual sigma) for the local module
-            timestep_emb = self._scd_model.base_model.adaln_single(
-                sigmas.view(-1, 1).expand(-1, 1),
-                None,  # class_labels
-            )  # [B, 1, inner_dim] approximately
-
-            # Reshape if needed — adaln_single returns [B, num_ada_params, dim]
-            if timestep_emb.dim() == 3 and timestep_emb.shape[1] > 1:
-                # Take just the timestep portion [B, 1, dim]
-                timestep_emb = timestep_emb[:, :1, :]
+            # adaln_single returns (shift_scale_gate [B, 6*D], embedded_timestep [B, D])
+            # LocalContextModule's timestep_proj handles dim reduction internally
+            _, embedded_timestep = self._scd_model.base_model.adaln_single(
+                sigmas.flatten(),  # [B] — adaln expects 1D timesteps
+                None,  # hidden_dtype
+            )
+            timestep_emb = embedded_timestep.unsqueeze(1)  # [B, 1, base_model_dim]
 
             local_control = self._local_context_module(
                 source_tokens=sparse_tokens,
@@ -327,6 +560,7 @@ class EditCtrlSCDTrainingStrategy(SCDTrainingStrategy):
                 source_latents=video_latents,
                 edit_mask=edit_mask,
                 target_num_tokens=self.config.global_context_num_tokens,
+                fill_value=self.config.background_fill_value,
             )
             global_context = self._global_embedder(bg_tokens)
 
@@ -370,13 +604,6 @@ class EditCtrlSCDTrainingStrategy(SCDTrainingStrategy):
         model_inputs._global_context = global_context
         model_inputs._edit_mask = edit_mask
 
-        # Attach HRR-specific data (for cross-caption loss + entropy reg)
-        if self._hrr_enhancer is not None:
-            model_inputs._hrr_input_embeds = hrr_input_embeds
-            model_inputs._edit_prompt_embeds = edit_prompt_embeds
-            model_inputs._edit_prompt_mask = edit_prompt_mask
-            model_inputs._hrr_edit_mask = hrr_edit_mask
-
         return model_inputs
 
     def compute_loss(
@@ -389,10 +616,6 @@ class EditCtrlSCDTrainingStrategy(SCDTrainingStrategy):
 
         Loss is computed only on edit (masked) region tokens and normalized
         by the number of masked tokens (not total tokens).
-
-        When HRR is enabled, also adds:
-        - Entropy regularization (encourages diverse routing)
-        - Gate encouragement (pushes gate open so HRR contributes)
         """
         edit_mask = getattr(inputs, "_edit_mask", inputs.video_loss_mask)
 
@@ -407,40 +630,33 @@ class EditCtrlSCDTrainingStrategy(SCDTrainingStrategy):
         num_masked = mask_float.sum().clamp(min=1.0)
         loss = masked_loss.sum() / num_masked
 
-        # === HRR auxiliary losses ===
-        if self._hrr_enhancer is not None and inputs._hrr_input_embeds is not None:
-            from ltx_trainer.config import HRRConfig  # noqa: PLC0415
-
-            # Get HRR config from trainer config (accessed via strategy config parent)
-            entropy_weight = self.config.cross_caption_loss_weight * 0.01  # Scale down
-            gate_weight = self.config.cross_caption_loss_weight * 0.01
-
-            # Entropy regularization: encourage diverse routing
-            if hasattr(self._hrr_enhancer, "get_routing_entropy"):
-                entropy = self._hrr_enhancer.get_routing_entropy(inputs._hrr_input_embeds)
-                # Negative entropy = encourage higher entropy (more diverse routing)
-                loss = loss - entropy_weight * entropy
-
-            # Gate encouragement: push gate toward opening
-            if hasattr(self._hrr_enhancer, "gate"):
-                gate_val = torch.sigmoid(self._hrr_enhancer.gate)
-                loss = loss - gate_weight * gate_val
-
         return loss
 
     def get_checkpoint_metadata(self) -> dict[str, Any]:
-        """Include EditCtrl metadata in checkpoints."""
+        """Include EditCtrl + TMA metadata in checkpoints."""
         meta = super().get_checkpoint_metadata()
         meta.update({
             "editctrl_phase": self.config.editctrl_phase,
             "editctrl_local_num_blocks": self.config.local_num_blocks,
             "editctrl_mask_dilation": self.config.mask_dilation_latent,
             "editctrl_global_num_tokens": self.config.global_context_num_tokens,
+            "editctrl_background_fill": self.config.background_fill_value,
+            "editctrl_mask_channel_concat": self.config.mask_channel_concat,
+            "editctrl_local_control_injection": self.config.local_control_injection,
+            "editctrl_local_control_layers": self.config.local_control_layers,
+            "use_tma": self.config.use_tma,
         })
+        if self.config.use_tma:
+            meta.update({
+                "tma_mllm_hidden_dim": self.config.tma_mllm_hidden_dim,
+                "tma_output_dim": self.config.tma_output_dim,
+                "tma_num_queries": self.config.tma_num_queries,
+                "tma_connector_layers": self.config.tma_connector_layers,
+            })
         return meta
 
     def get_strategy_state_dict(self) -> dict[str, Tensor]:
-        """Save EditCtrl module weights alongside LoRA checkpoint."""
+        """Save EditCtrl + TMA module weights alongside LoRA checkpoint."""
         state = {}
         if self._local_context_module is not None:
             for k, v in self._local_context_module.state_dict().items():
@@ -448,15 +664,15 @@ class EditCtrlSCDTrainingStrategy(SCDTrainingStrategy):
         if self._global_embedder is not None:
             for k, v in self._global_embedder.state_dict().items():
                 state[f"strategy.global_embedder.{k}"] = v
-        if self._hrr_enhancer is not None:
-            for k, v in self._hrr_enhancer.state_dict().items():
-                state[f"strategy.hrr_enhancer.{k}"] = v
+        if self._tma is not None:
+            for k, v in self._tma.state_dict().items():
+                state[f"strategy.tma.{k}"] = v
         return state
 
     def load_strategy_state_dict(
         self, state_dict: dict[str, Tensor]
     ) -> tuple[list[str], list[str]]:
-        """Load EditCtrl module weights from checkpoint."""
+        """Load EditCtrl + TMA module weights from checkpoint."""
         loaded = []
         skipped = []
 
@@ -486,18 +702,18 @@ class EditCtrlSCDTrainingStrategy(SCDTrainingStrategy):
         elif ge_dict:
             skipped.extend(ge_dict.keys())
 
-        # Extract HRR enhancer weights
-        hrr_prefix = "strategy.hrr_enhancer."
-        hrr_dict = {
-            k[len(hrr_prefix):]: v
+        # Extract TMA weights
+        tma_prefix = "strategy.tma."
+        tma_dict = {
+            k[len(tma_prefix):]: v
             for k, v in state_dict.items()
-            if k.startswith(hrr_prefix)
+            if k.startswith(tma_prefix)
         }
-        if hrr_dict and self._hrr_enhancer is not None:
-            self._hrr_enhancer.load_state_dict(hrr_dict, strict=False)
-            loaded.extend(hrr_dict.keys())
-            logger.info(f"Loaded HRR enhancer: {len(hrr_dict)} tensors")
-        elif hrr_dict:
-            skipped.extend(hrr_dict.keys())
+        if tma_dict and self._tma is not None:
+            self._tma.load_state_dict(tma_dict, strict=False)
+            loaded.extend(tma_dict.keys())
+            logger.info(f"Loaded TMA weights: {len(tma_dict)} tensors")
+        elif tma_dict:
+            skipped.extend(tma_dict.keys())
 
         return loaded, skipped

@@ -629,10 +629,15 @@ class LtxvTrainer:
         if isinstance(self._training_strategy, SCDTrainingStrategy):
             from ltx_core.model.transformer.scd_model import LTXSCDModel  # noqa: PLC0415
             scd_config = self._training_strategy.config
+            # Pass EditCtrl local control injection config if available
+            lc_injection = getattr(scd_config, 'local_control_injection', 'pre_decoder')
+            lc_layers = getattr(scd_config, 'local_control_layers', None)
             self._transformer = LTXSCDModel(
                 base_model=self._transformer,
                 encoder_layers=scd_config.encoder_layers,
                 decoder_input_combine=scd_config.decoder_input_combine,
+                local_control_injection=lc_injection,
+                local_control_layers=lc_layers,
             )
             self._training_strategy.set_scd_model(self._transformer)
             logger.info(
@@ -651,12 +656,29 @@ class LtxvTrainer:
             editctrl_config = self._training_strategy.config
 
             # Instantiate LocalContextModule on training device
+            # context_dim = text embedding dim (3840 for Gemma), NOT inner_dim (4096),
+            # because LocalContextModule receives raw prompt_embeds before caption_projection
+            text_embed_dim = self._transformer.base_model.caption_projection.linear_1.in_features  # 3840
+            lcm_inner_dim = editctrl_config.local_inner_dim or self._transformer.inner_dim
+            # output_dim must match transformer inner_dim for residual addition in decoder
+            lcm_output_dim = self._transformer.inner_dim if lcm_inner_dim != self._transformer.inner_dim else None
+            # Auto-compute heads from inner_dim if not specified
+            lcm_heads = editctrl_config.local_heads or max(1, lcm_inner_dim // editctrl_config.local_dim_head)
+            lcm_dim_head = editctrl_config.local_dim_head
+            mask_channel = getattr(editctrl_config, 'mask_channel_concat', False)
             self._local_context_module = LocalContextModule(
                 latent_dim=128,  # LTX-2 patchified latent dim
-                inner_dim=self._transformer.inner_dim,
-                context_dim=self._transformer.inner_dim,
+                inner_dim=lcm_inner_dim,
+                context_dim=text_embed_dim,
                 num_blocks=editctrl_config.local_num_blocks,
+                heads=lcm_heads,
+                dim_head=lcm_dim_head,
+                output_dim=lcm_output_dim,
+                timestep_dim=self._transformer.inner_dim,  # 4096 — LCM projects internally
+                mask_channel_concat=mask_channel,
             ).to(device=hw_devices.transformer, dtype=torch.bfloat16)
+            if getattr(editctrl_config, 'gradient_checkpointing_local', False):
+                self._local_context_module._gradient_checkpointing = True
             self._training_strategy.set_local_context_module(self._local_context_module)
             lcm_params = sum(p.numel() for p in self._local_context_module.parameters())
             logger.info(f"EditCtrl LocalContextModule: {lcm_params:,} params ({lcm_params * 2 / 1e9:.2f} GB bf16)")
@@ -673,9 +695,30 @@ class LtxvTrainer:
                 logger.info(f"EditCtrl GlobalContextEmbedder: {ge_params:,} params")
             else:
                 self._global_embedder = None
+
+            # Instantiate TMA module if enabled
+            if getattr(editctrl_config, "use_tma", False):
+                from ltx_trainer.omnitransfer.components import TaskAdaptiveMultimodalAlignment  # noqa: PLC0415
+                self._tma = TaskAdaptiveMultimodalAlignment(
+                    mllm_hidden_dim=editctrl_config.tma_mllm_hidden_dim,
+                    output_dim=editctrl_config.tma_output_dim,
+                    num_connector_layers=editctrl_config.tma_connector_layers,
+                    num_queries_per_task=editctrl_config.tma_num_queries,
+                ).to(device=hw_devices.transformer, dtype=torch.bfloat16)
+                self._training_strategy.set_tma(self._tma)
+                tma_params = sum(p.numel() for p in self._tma.parameters())
+                logger.info(
+                    f"EditCtrl TMA: {tma_params:,} params ({tma_params * 2 / 1e6:.1f} MB bf16), "
+                    f"mllm_dim={editctrl_config.tma_mllm_hidden_dim}, "
+                    f"output_dim={editctrl_config.tma_output_dim}, "
+                    f"queries={editctrl_config.tma_num_queries}"
+                )
+            else:
+                self._tma = None
         else:
             self._local_context_module = None
             self._global_embedder = None
+            self._tma = None
 
         # Instantiate HRR text enhancer if configured
         self._hrr_enhancer = None
@@ -722,6 +765,13 @@ class LtxvTrainer:
             # Stage 2: Freeze LoRA parameters (only train TMA)
             if training_stage == 2:
                 logger.info("Stage 2: Freezing DiT/LoRA parameters (training TMA only)")
+                for param in self._transformer.parameters():
+                    param.requires_grad = False
+
+            # EditCtrl: Freeze base SCD LoRA (only train LocalContextModule + TMA)
+            editctrl_freeze = getattr(self._config.training_strategy, 'freeze_base_lora', False)
+            if editctrl_freeze:
+                logger.info("EditCtrl: Freezing base SCD LoRA parameters (training EditCtrl modules only)")
                 for param in self._transformer.parameters():
                     param.requires_grad = False
 
@@ -1382,7 +1432,10 @@ class LtxvTrainer:
         model_inputs: "ModelInputs",
         step: int,
     ) -> None:
-        """Save SCD debug reconstruction image (GT vs Prediction side-by-side).
+        """Save SCD debug reconstruction image.
+
+        For EditCtrl: 3-column grid (GT | Masked Input | Composited Prediction)
+        For vanilla SCD: 2-column grid (GT | Prediction)
 
         Saves to outputs/debug_recon.png (latent pseudo-RGB) and
         outputs/debug_decoded.png (VAE decoded pixel space).
@@ -1396,22 +1449,44 @@ class LtxvTrainer:
 
             b, c, f, h, w = raw_latents.shape
 
+            # Check for EditCtrl mask
+            edit_mask = getattr(model_inputs, "_edit_mask", None)  # [B, seq_len] bool
+
             # Recover predicted clean latent: clean = noise - v
             pred_clean = noise - video_pred  # [B, seq_len, C]
-            pred_clean_spatial = pred_clean.reshape(b, f, h, w, c).permute(0, 4, 1, 2, 3)
+
+            # For EditCtrl: composite clean background + predicted edit region
+            if edit_mask is not None:
+                mask_expanded = edit_mask.unsqueeze(-1).float()  # [B, seq_len, 1]
+                # Flatten raw_latents to patchified form for compositing
+                gt_patchified = raw_latents.permute(0, 2, 3, 4, 1).reshape(b, -1, c)  # [B, seq_len, C]
+                # Composite: use GT for unmasked, prediction for masked
+                composited = gt_patchified * (1 - mask_expanded) + pred_clean * mask_expanded
+                composited_spatial = composited.reshape(b, f, h, w, c).permute(0, 4, 1, 2, 3)
+                # Also build the noisy input for visualization
+                noisy_input = gt_patchified * (1 - mask_expanded) + noise * mask_expanded
+                noisy_spatial = noisy_input.reshape(b, f, h, w, c).permute(0, 4, 1, 2, 3)
+            else:
+                composited_spatial = pred_clean.reshape(b, f, h, w, c).permute(0, 4, 1, 2, 3)
+                noisy_spatial = None
 
             # Latent pseudo-RGB (first 3 channels, middle frame)
             mid_f = f // 2
             gt_vis = raw_latents[0, :3, mid_f].cpu().float()
-            pred_vis = pred_clean_spatial[0, :3, mid_f].cpu().float()
+            comp_vis = composited_spatial[0, :3, mid_f].cpu().float()
 
             def norm(x):
                 x = x - x.min()
                 x = x / (x.max() + 1e-8)
                 return x.clamp(0, 1)
 
-            # 2-image grid: GT | Prediction
-            grid = torch.cat([norm(gt_vis), norm(pred_vis)], dim=2)
+            if edit_mask is not None and noisy_spatial is not None:
+                noisy_vis = noisy_spatial[0, :3, mid_f].cpu().float()
+                # 3-image grid: GT | Masked Input | Composited Prediction
+                grid = torch.cat([norm(gt_vis), norm(noisy_vis), norm(comp_vis)], dim=2)
+            else:
+                # 2-image grid: GT | Prediction
+                grid = torch.cat([norm(gt_vis), norm(comp_vis)], dim=2)
 
             out_dir = Path(self._config.output_dir)
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -1419,8 +1494,11 @@ class LtxvTrainer:
 
             # Save step info
             sigma = sigmas.flatten()[0].item() if sigmas is not None else 0.0
+            mask_pct = edit_mask[0].float().mean().item() * 100 if edit_mask is not None else 0
             with open(out_dir / "debug_info.txt", "w") as info_file:
                 info_file.write(f"Step: {step}\nSigma: {sigma:.4f}\nMode: SCD\n")
+                if edit_mask is not None:
+                    info_file.write(f"Mask: {mask_pct:.1f}% tokens\n")
 
             # VAE-decoded frames
             if self._vae_decoder is not None:
@@ -1444,7 +1522,8 @@ class LtxvTrainer:
                     frame_indices = [mid_f]
 
                 gt_frames = []
-                pred_frames = []
+                masked_frames = []
+                comp_frames = []
 
                 with torch.inference_mode():
                     for fidx in frame_indices:
@@ -1452,18 +1531,54 @@ class LtxvTrainer:
                         gt_dec = self._vae_decoder(gt_lat)[0, :, 0].cpu()
                         gt_frames.append(norm_decoded(gt_dec))
 
-                        pred_lat = pred_clean_spatial[0:1, :, fidx:fidx+1, :, :].to(vae_device, dtype=vae_dtype)
-                        pred_dec = self._vae_decoder(pred_lat)[0, :, 0].cpu()
-                        pred_frames.append(norm_decoded(pred_dec))
+                        comp_lat = composited_spatial[0:1, :, fidx:fidx+1, :, :].to(vae_device, dtype=vae_dtype)
+                        comp_dec = self._vae_decoder(comp_lat)[0, :, 0].cpu()
+                        comp_frames.append(norm_decoded(comp_dec))
+
+                        if noisy_spatial is not None:
+                            noisy_lat = noisy_spatial[0:1, :, fidx:fidx+1, :, :].to(vae_device, dtype=vae_dtype)
+                            noisy_dec = self._vae_decoder(noisy_lat)[0, :, 0].cpu()
+                            masked_frames.append(norm_decoded(noisy_dec))
 
                 if not is_multi_gpu:
                     self._vae_decoder = self._vae_decoder.to("cpu")
                 torch.cuda.empty_cache()
 
-                # Portrait grid: GT column | Pred column
-                left_col = torch.cat(gt_frames, dim=1)
-                right_col = torch.cat(pred_frames, dim=1)
-                decoded_grid = torch.cat([left_col, right_col], dim=2)
+                # Build grid columns
+                gt_col = torch.cat(gt_frames, dim=1)
+                comp_col = torch.cat(comp_frames, dim=1)
+
+                if masked_frames:
+                    # EditCtrl: 4 columns — GT | Mask Overlay | Masked Input | Composited
+                    mask_col = torch.cat(masked_frames, dim=1)
+
+                    # Build mask overlay: GT with red tint on masked region
+                    if edit_mask is not None:
+                        mask_overlay_frames = []
+                        mask_3d = edit_mask[0].reshape(f, h, w)  # [F, H, W]
+                        for fidx in frame_indices:
+                            gt_frame = gt_frames[frame_indices.index(fidx)]  # [3, H_pix, W_pix]
+                            frame_mask = mask_3d[fidx]  # [H_lat, W_lat]
+                            # Upsample mask to pixel resolution
+                            mask_up = torch.nn.functional.interpolate(
+                                frame_mask.float().unsqueeze(0).unsqueeze(0),
+                                size=gt_frame.shape[1:],
+                                mode="nearest",
+                            ).squeeze()  # [H_pix, W_pix]
+                            # Red tint: boost red channel, dim green+blue on masked region
+                            overlay = gt_frame.clone()
+                            overlay[0] = torch.where(mask_up > 0.5, torch.clamp(overlay[0] * 0.5 + 0.5, 0, 1), overlay[0])
+                            overlay[1] = torch.where(mask_up > 0.5, overlay[1] * 0.3, overlay[1])
+                            overlay[2] = torch.where(mask_up > 0.5, overlay[2] * 0.3, overlay[2])
+                            mask_overlay_frames.append(overlay)
+                        overlay_col = torch.cat(mask_overlay_frames, dim=1)
+                        decoded_grid = torch.cat([gt_col, overlay_col, mask_col, comp_col], dim=2)
+                    else:
+                        decoded_grid = torch.cat([gt_col, mask_col, comp_col], dim=2)
+                else:
+                    # Vanilla SCD: 2 columns — GT | Prediction
+                    decoded_grid = torch.cat([gt_col, comp_col], dim=2)
+
                 save_image(decoded_grid, out_dir / "debug_decoded.png")
 
         except Exception as e:

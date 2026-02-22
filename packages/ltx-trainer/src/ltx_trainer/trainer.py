@@ -1555,7 +1555,7 @@ class LtxvTrainer:
                     # Build mask overlay: GT with red tint on masked region
                     if edit_mask is not None:
                         mask_overlay_frames = []
-                        mask_3d = edit_mask[0].reshape(f, h, w)  # [F, H, W]
+                        mask_3d = edit_mask[0].cpu().reshape(f, h, w)  # [F, H, W]
                         for fidx in frame_indices:
                             gt_frame = gt_frames[frame_indices.index(fidx)]  # [3, H_pix, W_pix]
                             frame_mask = mask_3d[fidx]  # [H_lat, W_lat]

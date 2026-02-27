@@ -1,3 +1,55 @@
+1. Plan Node Default
+•Enter plan mode for any non-trivial task (three or more steps, or involving architectural decisions).
+•If something goes wrong, stop and re-plan immediately rather than continuing blindly.
+•Use plan mode for verification steps, not just implementation.
+•Write detailed specifications upfront to reduce ambiguity.
+
+2. Subagent Strategy
+•Use subagents liberally to keep the main context window clean.
+•Offload research, exploration, and parallel analysis to subagents.
+•For complex problems, allocate more compute via subagents.
+•Assign one task per subagent to ensure focused execution.
+
+3. Self-Improvement Loop
+•After any correction from the user, update tasks/lessons.md with the relevant pattern.
+•Create rules for yourself that prevent repeating the same mistake.
+•Iterate on these lessons rigorously until the mistake rate declines.
+•Review lessons at the start of each session when relevant to the project.
+
+4. Verification Before Done
+•Never mark a task complete without proving it works.
+•Diff behavior between main and your changes when relevant.
+•Ask: “Would a staff engineer approve this?”
+•Run tests, check logs, and demonstrate correctness.
+
+5. Demand Elegance (Balanced)
+•For non-trivial changes, pause and ask whether there is a more elegant solution.
+•If a fix feels hacky, implement the solution you would choose knowing everything you now know.
+•Do not over-engineer simple or obvious fixes.
+•Critically evaluate your own work before presenting it.
+
+6. Autonomous Bug Fixing
+•When given a bug report, fix it without asking for unnecessary guidance.
+•Review logs, errors, and failing tests, then resolve them.
+•Avoid requiring context switching from the user.
+•Fix failing CI tests proactively.
+
+Task Management
+1.Plan First: Write the plan to tasks/todo.md with checkable items.
+2.Verify Plan: Review before starting implementation.
+3.Track Progress: Mark items complete as you go.
+4.Explain Changes: Provide a high-level summary at each step.
+5.Document Results: Add a review section to tasks/todo.md.
+6.Capture Lessons: Update tasks/lessons.md after corrections.
+
+Core Principles
+•Simplicity First: Make every change as simple as possible. Minimize code impact.
+•No Laziness: Identify root causes. Avoid temporary fixes. Apply senior developer standards.
+•Minimal Impact: Touch only what is necessary. Avoid introducing new bugs.
+
+
+
+
 # AGENTS.md
 
 This file provides guidance to AI coding assistants (Claude, Cursor, etc.) when working with code in this repository.
@@ -639,6 +691,347 @@ The paper (ByteDance, Jan 2026) builds on **Wan2.1 I2V 14B** — a video-to-vide
 - **Temporal consistency**: Model learns style is consistent across time, not a per-frame artifact
 - **TPB (Task-aware Positional Bias)**: RoPE offset Δ=(f, 0, 0) for appearance tasks — exploits temporal dimension to separate ref from target. With num_frames=1, this offset is meaningless.
 - **RCL (Reference-decoupled Causal Learning)**: Reference at fixed t=0 (noise-free) while target is denoised. Requires temporal extent to work properly.
+
+## SCD + DDiT: Efficient Autoregressive Video Generation
+
+### Overview
+
+SCD (Separable Causal Diffusion) and DDiT (Dynamic Patch Scheduling) are complementary inference optimizations for LTX-2 that enable long-form video generation (30s+) on consumer GPUs.
+
+- **SCD** splits the 48-layer DiT into encoder (32 layers) + decoder (16 layers). The encoder runs **once** per frame (causal, σ=0, KV-cached); the decoder runs **N steps** per frame. Zero new parameters — pure architectural wrapper.
+- **DDiT** (arXiv:2602.16968) varies spatial patch sizes per denoising step. Early steps use merged 2×2 patches (4× fewer tokens → ~16× less attention compute); late steps use native resolution for fine detail. Adds a 4.2M-param adapter.
+
+Together they attack different bottleneck dimensions: SCD reduces layers-per-step (48→16), DDiT reduces tokens-per-step (336→84 at scale=2).
+
+### Architecture Diagram
+
+```
+Frame N generation with SCD + DDiT:
+
+ENCODER (32 layers, runs ONCE per frame, causal with KV-cache):
+  Frame N-1 (clean, σ=0) ──→ [32 transformer blocks] ──→ encoder_features
+                                   KV-cache accumulates across frames
+
+DECODER (16 layers, runs N_steps times per frame):
+  Step 1-2:  Native resolution (336 tokens)  ← structure establishment
+  Step 3-27: DDiT merged    (84 tokens)     ← 4× fewer tokens, 16× less attention
+  Step 28-30: Native resolution (336 tokens)  ← fine detail refinement
+
+DDiT merge/unmerge per step:
+  [1, 336, 128] ──merge 2×2──→ [1, 84, 512] ──patchify──→ [1, 84, 4096]
+                                  16 decoder blocks at reduced resolution
+  [1, 84, 4096] ──proj_out──→ [1, 84, 512] ──unmerge──→ [1, 336, 128]
+```
+
+### Key Source Files
+
+| File | Location | Purpose |
+|------|----------|---------|
+| `scd_model.py` | `ltx-core/src/ltx_core/model/transformer/scd_model.py` | `LTXSCDModel` wrapper — splits encoder/decoder, KV-cache |
+| `ddit.py` | `ltx-core/src/ltx_core/model/transformer/ddit.py` | `DDiTAdapter`, `DDiTMergeLayer`, `DDiTPatchScheduler` (4.2M params) |
+| `scd_inference.py` | `ltx-trainer/scripts/scd_inference.py` | Combined SCD + DDiT inference pipeline |
+| `scd_strategy.py` | `ltx-trainer/src/ltx_trainer/training_strategies/scd_strategy.py` | SCD LoRA training strategy |
+
+### Pre-trained Checkpoints
+
+| Checkpoint | Path | Details |
+|-----------|------|---------|
+| SCD LoRA (Ditto-1M) | `/media/2TB/omnitransfer/output/scd_ditto_subset/checkpoints/lora_weights_step_02000.safetensors` | 500 pairs, 2000 steps, rank=32, loss=0.231 |
+| DDiT adapter v2 | `sparse-causal-diffusion/outputs/ddit_scd_v2/ddit_scd_adapter_final.safetensors` | 8.4MB, scale=2, residual_weight=0.1 |
+| DDiT decoder LoRA | `sparse-causal-diffusion/outputs/ddit_scd_v2/ddit_scd_lora_final.safetensors` | 16.8MB, hook-based rank=16 on to_q/k/v/to_out.0 |
+
+### Training Recommendations
+
+#### Phase 1: SCD LoRA (required)
+
+Train the SCD LoRA first — this teaches the encoder/decoder split behavior:
+
+```yaml
+# configs/ltx2_scd_lora.yaml
+training_strategy:
+  name: scd
+  encoder_layers: 32
+  decoder_input_combine: add     # Use "add" — token_concat doubles sequence and OOMs at 720p
+  with_audio: false
+
+model:
+  model_path: "/media/2TB/ltx-models/ltx2/ltx-2-19b-dev.safetensors"
+  training_mode: lora
+
+lora:
+  rank: 32
+  alpha: 32
+
+optimization:
+  batch_size: 1
+  gradient_accumulation_steps: 8
+  learning_rate: 1.0e-4
+  max_train_steps: 2000
+
+acceleration:
+  quantization: fp8-quanto       # Runtime quantization for training
+```
+
+**Training data**: Any video dataset with precomputed latents + conditions works. Tested with:
+- Ditto-1M subset (500 pairs): loss 0.386 → 0.231 over 2000 steps
+- Isometric videos (128 clips): good convergence but teacher forcing → rapid quality collapse in autoregressive inference
+
+**Key insight**: SCD training uses **teacher forcing** (clean frames as encoder input), but inference is **autoregressive** (model's own noisy predictions feed back). Diverse training data (like Ditto-1M) produces much more robust inference than small same-domain datasets.
+
+#### Phase 2: DDiT Adapter (optional, for decoder speedup)
+
+> **⚠️ The DDiT adapter MUST be trained against the specific SCD LoRA it will be used with.**
+> The current DDiT v2 adapter was trained against the old isometric SCD LoRA — not the Ditto-1M LoRA.
+> Retraining against the current SCD LoRA would improve DDiT quality and speedup.
+
+DDiT adapter training lives in the `sparse-causal-diffusion` repo:
+```bash
+cd /home/johndpope/Documents/GitHub/sparse-causal-diffusion
+python -m scd.train_ddit \
+    --scd-checkpoint /path/to/scd_lora.safetensors \
+    --output-dir outputs/ddit_scd_v3 \
+    --scale 2 \
+    --steps 3000
+```
+
+The DDiT adapter (4.2M params) trains in ~45 minutes on RTX 5090. It learns:
+- `DDiTMergeLayer.patchify_proj`: projects merged tokens (128×s²) → inner_dim (4096)
+- `DDiTMergeLayer.proj_out`: projects inner_dim → merged token space
+- `DDiTMergeLayer.patch_id`: learned positional embedding for merged patches
+- `DDiTMergeLayer.residual_block`: optional residual refinement
+- Hook-based decoder LoRA (rank-16 on attn layers) to adapt decoder for merged tokens
+
+### Inference Quick Reference
+
+```bash
+# Basic SCD inference (30 seconds)
+python scripts/scd_inference.py \
+    --cached-embedding /media/2TB/omnitransfer/data/isometric_i2v/conditions_final/000.pt \
+    --num-seconds 30 \
+    --quantization int8-quanto \
+    --output /media/2TB/omnitransfer/inference/scd_30s.mp4
+
+# SCD + DDiT (faster decoder)
+python scripts/scd_inference.py \
+    --cached-embedding /media/2TB/omnitransfer/data/isometric_i2v/conditions_final/000.pt \
+    --num-seconds 30 \
+    --quantization int8-quanto \
+    --ddit-adapter /home/johndpope/Documents/GitHub/sparse-causal-diffusion/outputs/ddit_scd_v2/ddit_scd_adapter_final.safetensors \
+    --ddit-scale 2 \
+    --ddit-native-head 2 --ddit-native-tail 3 \
+    --output /media/2TB/omnitransfer/inference/scd_ddit_30s.mp4
+
+# With live text prompt (loads/unloads Gemma automatically)
+python scripts/scd_inference.py \
+    --prompt "A mountain landscape with flowing rivers" \
+    --num-seconds 10 \
+    --output /media/2TB/omnitransfer/inference/scd_prompt_10s.mp4
+```
+
+### CLI Arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--checkpoint` | ltx-2-19b-dev.safetensors | Base model |
+| `--lora-path` | Ditto SCD LoRA | SCD LoRA checkpoint |
+| `--cached-embedding` | — | Precomputed text embedding .pt |
+| `--prompt` | — | Live text (loads Gemma, ~28GB) |
+| `--num-seconds` | 5.0 | Video duration |
+| `--height/--width` | 448/768 | Resolution (must be ÷32) |
+| `--num-inference-steps` | 30 | Denoising steps per frame |
+| `--encoder-layers` | 32 | Encoder/decoder split point |
+| `--decoder-combine` | add | Encoder-decoder coupling: `add` or `token_concat` |
+| `--quantization` | fp8-quanto | `fp8-quanto`, `int8-quanto`, or `none` |
+| `--ddit-adapter` | None | DDiT adapter .safetensors path (enables DDiT) |
+| `--ddit-scale` | 2 | Spatial merge factor (2=4× fewer tokens, 4=16×) |
+| `--ddit-native-head` | 2 | Initial steps at native resolution |
+| `--ddit-native-tail` | 3 | Final steps at native resolution |
+| `--split-gpus` | false | Distribute encoder→cuda:0, decoder→cuda:1 in bf16 (no quant) |
+
+### Performance Benchmarks (RTX 5090 + RTX PRO 4000, 768×448)
+
+Measured on this exact hardware:
+
+**Single-GPU (int8-quanto on RTX 5090):**
+
+| Duration | Method | Gen Time | Encoder | Decoder | s/frame | Total | Dec Speedup | Total Speedup |
+|----------|--------|----------|---------|---------|---------|-------|-------------|---------------|
+| 30s (76 frames) | SCD baseline | 2.1 min | — | 118.7s | 1.7 | 2.9 min | 1.0× | 1.0× |
+| 30s (76 frames) | SCD + DDiT 2× (fixed) | 1.7 min | — | 94.8s | 1.4 | 2.6 min | 1.25× | 1.12× |
+| 30s (76 frames) | SCD + DDiT 2× (**dynamic**) | 1.7 min | 6.8s | **93.3s** | **1.3** | **2.5 min** | **1.27×** | 1.16× |
+| 60s (151 frames) | SCD baseline | 4.2 min | 14.6s | 237.2s | 1.7 | 5.2 min | 1.0× | 1.0× |
+| 60s (151 frames) | SCD + DDiT 2× | 3.4 min | 14.4s | 189.5s | 1.4 | 4.4 min | 1.25× | 1.18× |
+| 120s (301 frames) | SCD baseline | 8.4 min | 28.8s | 472.6s | 1.7 | 9.9 min | 1.0× | 1.0× |
+| 120s (301 frames) | SCD + DDiT 2× | 6.7 min | 28.1s | 373.3s | 1.3 | 8.3 min | 1.27× | 1.19× |
+
+**Split-GPU (bf16, encoder→RTX 5090, decoder→RTX PRO 4000):**
+
+| Duration | Method | Gen Time | Encoder | Decoder | s/frame | Total | Dec Speedup |
+|----------|--------|----------|---------|---------|---------|-------|-------------|
+| 30s (76 frames) | Split baseline | 3.4 min | 6.6s | 198.1s | 2.7 | 4.3 min | 1.0× |
+| 30s (76 frames) | Split + DDiT 2× | 2.4 min | 6.3s | 133.7s | 1.9 | 3.2 min | **1.48×** |
+
+> **Key finding:** DDiT speedup is **1.48× in bf16** vs **1.25× in int8-quanto**, confirming that bf16 makes the decoder compute-bound where DDiT's 4× token reduction has real impact. However, because the PRO 4000 is slower than the 5090, single-GPU int8-quanto is still faster in absolute terms (1.4s vs 1.9s/frame). Split-GPU would win with two equally fast GPUs.
+
+**Scaling Characteristics:**
+- **Encoder is O(1) per frame** via KV-cache: ~14.5s per 150 frames, ~6-7% of total time
+- **Decoder scales linearly** with frame count: ~1.7s/frame baseline, ~1.3-1.4s/frame with DDiT
+- **DDiT speedup improves slightly at longer durations**: 1.25× → 1.27× decoder speedup (better cache utilization with fewer tokens)
+- **Dynamic scheduler uses 90% merged steps** vs fixed schedule's 83% — adapts per-prompt via 3rd-order trajectory analysis
+- **Total speedup improves at scale**: 1.12× at 30s → 1.19× at 120s (decoder fraction grows)
+
+**Theoretical vs Actual Speedup:**
+
+| Metric | Theoretical | int8-quanto (actual) | bf16 split (actual) | Notes |
+|--------|-------------|---------------------|---------------------|-------|
+| Decoder token reduction | 4× (336→84) | 4× | 4× | Merge works correctly |
+| Attention compute reduction | 16× (O(N²)) | 16× | 16× | Fused attention kernel |
+| Decoder wall-clock speedup | 2-3× | 1.25-1.27× | **1.48×** | bf16 is compute-bound ✓ |
+| DDiT steps (of 30 total) | 25/30 | 25/30 | 25/30 | 2 head + 3 tail native |
+| Best overall (s/frame) | — | **1.4s** | 1.9s | 5090 is faster than PRO 4000 |
+
+**Why actual gains are lower than theoretical:**
+1. **int8-quanto memory bandwidth bottleneck**: Quantized weights must be dequantized every step. This makes the decoder memory-bound, not compute-bound. Reducing compute (fewer tokens) helps less when you're bottlenecked on weight loading.
+2. **bf16 split-GPU confirms**: Moving to bf16 (compute-bound) gives 1.48× DDiT speedup — significantly closer to theoretical 2-3×. The remaining gap is likely from non-attention operations (FFN, norm, projection).
+3. **Asymmetric GPUs hurt split-GPU**: The PRO 4000 (24GB) has ~50% less memory bandwidth than the 5090 (32GB), negating the DDiT gains in absolute terms.
+4. **With two identical fast GPUs** (e.g., 2× RTX 5090 or 2× A100): Expected ~1.5× total speedup over single-GPU int8-quanto.
+
+### Sanity Checks
+
+Before running SCD + DDiT inference, verify:
+
+1. **Coupling mode match**: The DDiT adapter's `coupling` field in `ddit_scd_config.json` should ideally match `--decoder-combine`. Current adapter uses `token_concat` but inference defaults to `add` — this works but is suboptimal.
+
+2. **Decoder block count**: `ddit_scd_config.json:scd_decoder_blocks` must equal `48 - --encoder-layers`. Default: 16 decoder blocks (48 - 32 encoder).
+
+3. **Scale compatibility**: Only use scales the adapter was trained for (check `ddit_scd_config.json:scales`). Current adapter: `[2]` only.
+
+4. **Native head/tail**: At least 2-3 steps at native resolution for fine detail. If output looks blocky, increase `--ddit-native-tail`.
+
+5. **Memory check**: SCD + DDiT adds ~25MB for the adapter — negligible. The DDiT decoder LoRA hooks add ~17MB.
+
+6. **Quality validation**: Compare SCD-only vs SCD+DDiT output side-by-side. DDiT should produce similar quality with fewer artifacts. If quality degrades significantly, the adapter needs retraining against the current SCD LoRA.
+
+### Known Limitations
+
+- **fp8-quanto + DDiT**: Marlin kernel JIT compilation may fail (ninja build error). Use `int8-quanto` as fallback.
+- **token_concat coupling**: Doubles the decoder sequence length, causing OOM at high resolutions. Use `add` coupling for 720p+ inference.
+- **DDiT scale=4**: Not yet trained. Would give 16× fewer tokens but requires separate adapter training.
+- **No DDiT for encoder**: DDiT only accelerates the decoder. Encoder is already efficient with KV-cache (~6% of total time).
+- **Autoregressive quality drift**: SCD uses teacher forcing during training but autoregressive rollout at inference. Quality degrades after ~10-15 seconds with small training datasets. Use diverse, large datasets (Ditto-1M) for robust long-form generation.
+
+---
+
+## DDiT Implementation Rules (CRITICAL — Read Before Modifying)
+
+> **Reference:** [arXiv:2602.16968](https://arxiv.org/abs/2602.16968) — Dynamic Diffusion Transformer
+> **Detailed doc:** `ltx-trainer/docs/ddit-implementation.md`
+
+### What DDiT IS
+
+DDiT dynamically changes spatial resolution per denoising step. Early steps use coarse patches (fewer tokens, faster attention), late steps use fine patches (more tokens, better detail). The **dynamic scheduler** (3rd-order finite differences of the denoising trajectory) picks the optimal scale per step per prompt.
+
+### Rules for DDiT Development
+
+> **1. ALWAYS use `DDiTPatchScheduler` for scale selection — NEVER hardcode head/tail**
+>
+> The paper's core contribution is the **adaptive per-step scheduling**. A fixed "skip first 2 and last 3 steps" schedule defeats the purpose. The scheduler:
+> - Analyzes the 3rd-order finite difference of the denoising trajectory
+> - Picks the coarsest scale where spatial variance < threshold (τ=0.001)
+> - Adapts per-prompt — different content gets different schedules
+> - Code: `DDiTPatchScheduler` in `ltx-core/.../transformer/ddit.py`
+>
+> ```python
+> # CORRECT — dynamic scheduling
+> scheduler = ddit_adapter.scheduler
+> scheduler.reset()
+> for step in range(num_steps):
+>     scheduler.record(z)
+>     scale = scheduler.compute_schedule(z, step, nf, h, w)
+>     if scale > 1:
+>         velocity = ddit_decode(noisy, enc_ctx, sigma, positions, scale)
+>     else:
+>         velocity = native_decode(noisy, enc_ctx, sigma, positions)
+>
+> # WRONG — fixed schedule (loses adaptive behavior)
+> if step >= 2 and step < num_steps - 3:
+>     velocity = ddit_decode(...)
+> ```
+
+> **2. DDiT MUST work for ALL LTX-2 modalities, not just SCD**
+>
+> The paper targets T2I (FLUX) and T2V (Wan-2.1). Our implementation must support:
+>
+> | Mode | Blocks | DDiT Tokens Saved | Adapter Type |
+> |---|---|---|---|
+> | SCD T2V (autoregressive) | 16 decoder | 4× per frame per step | SCD adapter |
+> | Standard T2V | 48 full model | 4× × all frames simultaneously | Full adapter |
+> | I2V / T2I / I2I | 48 full model | 4× × all frames | Full adapter |
+>
+> **Standard T2V is where DDiT shines most** — 97 frames × 336 tokens = 32,592 tokens. Scale=2 reduces to 8,148 → **16× less attention compute**. SCD's single-frame decoder only saves 336→84 tokens.
+>
+> Two adapter types are needed:
+> - `train_ddit_scd.py` → SCD-specific (16 decoder blocks)
+> - `train_ddit_adapter.py` → Full model (48 blocks, any modality)
+
+> **3. LoRA targets must match the paper for each mode**
+>
+> | Mode | Paper Targets | Our Current | Status |
+> |---|---|---|---|
+> | Full model (T2V/I2V/T2I) | FFN: `net.0.proj, net.2` | FFN + attn | ✅ Superset |
+> | SCD decoder | Attention: `to_q,k,v,out` | Attention only | ⚠️ Should add FFN |
+
+> **4. Test DDiT quality with distillation metrics**
+>
+> After training or modifying DDiT:
+> - Compare teacher (native) vs student (merged) MSE at multiple sigma values
+> - Check cosine similarity between outputs (should be > 0.95)
+> - Visual comparison: side-by-side at σ=0.05 (fine detail), σ=0.5 (structure), σ=0.9 (noise)
+> - If quality degrades at low sigma, increase `--ddit-native-tail` or retrain
+
+> **5. Split-GPU mode puts DDiT adapter on the decoder GPU**
+>
+> In `--split-gpus` mode (encoder→cuda:0, decoder→cuda:1):
+> - DDiT adapter MUST be on `cuda:1` (decoder device)
+> - DDiT decoder LoRA hooks MUST target decoder blocks on `cuda:1`
+> - Prompt embeddings for decoder must also be on `cuda:1`
+
+### DDiT Hyperparameter Reference
+
+| Parameter | Paper Default | Our Default | Config Key |
+|---|---|---|---|
+| Scheduler threshold | τ=0.001 | 0.001 | `DDiTConfig.threshold` |
+| Scheduler percentile | ρ=0.4 | 0.4 | `DDiTConfig.percentile` |
+| Warmup steps | 3 | 3 | `DDiTConfig.warmup_steps` |
+| Supported scales | (1, 2, 4) | (1, 2) | `DDiTConfig.supported_scales` |
+| Residual weight | — | 0.1 | `DDiTConfig.residual_weight` |
+| LoRA rank (full) | 32 | 32 | `ddit_config.json:lora_rank` |
+| LoRA rank (SCD decoder) | — | 16 | `ddit_config.json:ddit_lora_rank` |
+| Distillation LR | 1e-4 | 1e-4 | Training script arg |
+| Sigma curriculum | — | cosine [0.3→0.9] | `ddit_config.json:sigma_curriculum` |
+
+### Cross-Repository Reference
+
+The DDiT training code lives in a separate repository:
+
+```
+/home/johndpope/Documents/GitHub/sparse-causal-diffusion/
+├── scd/
+│   ├── ddit_inference.py         # DDiTInferenceWrapper class
+│   ├── train_ddit.py             # DDiT adapter training
+│   └── scd_model.py              # SCD model (duplicated in ltx-core)
+├── inference/
+│   └── run_scd_ddit_inference.py # Full SCD+DDiT inference pipeline
+└── outputs/
+    └── ddit_scd_v2/              # Pre-trained DDiT adapter + decoder LoRA
+        ├── ddit_scd_adapter_final.safetensors  (8.4MB)
+        ├── ddit_scd_lora_final.safetensors     (16.8MB)
+        └── ddit_scd_config.json
+```
+
+The integrated inference script in THIS repo (`ltx-trainer/scripts/scd_inference.py`) uses `DDiTAdapter` from ltx-core directly (editable install) rather than importing from sparse-causal-diffusion.
+
+---
 
 ## Dataset Inventory
 

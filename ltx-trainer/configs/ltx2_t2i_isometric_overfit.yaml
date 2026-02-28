@@ -1,29 +1,30 @@
 # =============================================================================
-# LTX-2 T2I LoRA Training — Isometric Frame Overfit
+# LTX-2 T2I LoRA Training — Isometric Frame Overfit v2 (ALL 158 videos)
 # =============================================================================
 #
-# Aggressive overfit on ~1,675 single-frame isometric samples extracted from
-# 67 Grok videos (25 frames each). Continues from the T2V LoRA step 2000.
+# Improved training based on Grok recommendations:
+# - Cosine LR schedule (5e-4 → 1e-5) instead of constant
+# - Larger effective batch (8 vs 4) for smoother gradients
+# - Uniform timestep sampling for better style coverage across noise levels
+# - Light weight decay (1e-4) to regularize and prevent mode collapse
+# - 10,000 steps (~20 epochs) for deeper style burn-in
+# - Continues from v1 step 5000 checkpoint
 #
-# Strategy: pure T2I overfit to burn the isometric 3D style into LoRA weights.
-# With ~1,675 samples and 5000 steps (batch_size=1, grad_accum=4):
-#   effective_batch = 4, steps_per_epoch = 1675/4 ≈ 419, epochs ≈ 12
-#
-# Prerequisites:
-#   1. Run extract_frames_for_t2i.py → latents/ + conditions_final/
+# With ~3,950 samples and 10000 steps (batch_size=1, grad_accum=8):
+#   effective_batch = 8, steps_per_epoch = 3950/8 ≈ 494, epochs ≈ 20
 #
 # Usage:
 #   cd ltx-trainer
-#   uv run python scripts/train.py configs/ltx2_t2i_isometric_overfit.yaml
+#   python scripts/train.py configs/ltx2_t2i_isometric_overfit.yaml
 #
 # =============================================================================
 
-# Model — continue from T2V LoRA checkpoint
+# Model — continue from T2I v1 checkpoint (step 5000)
 model:
   model_path: "/media/2TB/ltx-models/ltx2/ltx-2-19b-dev.safetensors"
   text_encoder_path: "/media/2TB/ltx-models/gemma"
   training_mode: "lora"
-  load_checkpoint: "/media/2TB/omnitransfer/output/t2v_isometric/checkpoints/lora_weights_step_02000.safetensors"
+  load_checkpoint: "/media/2TB/omnitransfer/output/t2i_isometric_overfit_v2/checkpoints/lora_weights_step_02000.safetensors"
 
 # LoRA — must match source checkpoint config
 lora:
@@ -43,23 +44,24 @@ training_strategy:
   log_reconstructions: true
   reconstruction_log_interval: 200
 
-# Optimization — aggressive overfit
+# Optimization — improved per Grok recommendations
 optimization:
-  learning_rate: 5.0e-4            # High LR for hard overfit
-  steps: 5000                      # ~12 epochs over 1,675 samples
+  learning_rate: 5.0e-4            # Peak LR, decays via cosine to eta_min
+  steps: 10000                     # ~20 epochs for deep style burn-in
   batch_size: 1
-  gradient_accumulation_steps: 4   # Effective batch = 4
+  gradient_accumulation_steps: 8   # Effective batch = 8 (smoother gradients)
   max_grad_norm: 1.0
   optimizer_type: "adamw"
-  scheduler_type: "constant"       # No decay — pure overfit
-  scheduler_params: {}
-  weight_decay: 0.0                # No regularization — overfit intentionally
+  scheduler_type: "cosine"         # Cosine annealing: aggressive early, refined late
+  scheduler_params:
+    eta_min: 1.0e-5                # Minimum LR at end of training
+  weight_decay: 1.0e-4             # Light L2 regularization to prevent mode collapse
   enable_gradient_checkpointing: true
 
 # Acceleration
 acceleration:
   mixed_precision_mode: "bf16"
-  quantization: "fp8-quanto"       # Faster than int8 once JIT compiled
+  quantization: "int8-quanto"      # fp8 Marlin kernel JIT fails with CUDA 13
   load_text_encoder_in_8bit: true
 
 # Hardware (dual GPU)
@@ -74,7 +76,7 @@ hardware:
 
 # Data — extracted T2I frames
 data:
-  preprocessed_data_root: "/media/2TB/omnitransfer/data/isometric_t2i"
+  preprocessed_data_root: "/media/2TB/omnitransfer/data/isometric_t2i_all"
   num_dataloader_workers: 4        # More workers — small files, fast loading
   use_cached_final_embeddings: true
   final_embeddings_dir: "conditions_final"
@@ -101,9 +103,9 @@ checkpoints:
   interval: 500
   keep_last_n: 10
 
-# Flow Matching
+# Flow Matching — uniform sampling for better style coverage across noise levels
 flow_matching:
-  timestep_sampling_mode: "shifted_logit_normal"
+  timestep_sampling_mode: "uniform"
   timestep_sampling_params: {}
 
 # Hub
@@ -116,9 +118,9 @@ wandb:
   enabled: true
   project: "t2i-isometric-overfit"
   entity: null
-  tags: ["t2i", "isometric", "grok", "overfit", "lora", "frames"]
+  tags: ["t2i", "isometric", "grok", "overfit", "lora", "v2", "cosine", "uniform"]
   log_validation_videos: false
 
 # General
 seed: 42
-output_dir: "/media/2TB/omnitransfer/output/t2i_isometric_overfit"
+output_dir: "/media/2TB/omnitransfer/output/t2i_isometric_overfit_v2"

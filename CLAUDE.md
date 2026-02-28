@@ -47,6 +47,12 @@ Core Principles
 •No Laziness: Identify root causes. Avoid temporary fixes. Apply senior developer standards.
 •Minimal Impact: Touch only what is necessary. Avoid introducing new bugs.
 
+7. Resolution Matching for Inference
+•ALWAYS match output video resolution to the source training data resolution and orientation.
+•Portrait input data (e.g., 768×1152 Grok isometric) → portrait output MP4 (`--height 1152 --width 768`).
+•Landscape input data → landscape output MP4.
+•NEVER use the default 448×768 landscape when the training data is portrait — it produces aspect-ratio-distorted, low-quality results.
+•Check source latent shape to determine orientation: latent `[C, F, H, W]` where `H > W` = portrait.
 
 
 

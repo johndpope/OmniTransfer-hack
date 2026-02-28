@@ -1386,7 +1386,8 @@ def main() -> None:
     del all_latent
     torch.cuda.empty_cache()
 
-    # Clamp to valid pixel range
+    # Convert from VAE output range [-1, 1] to display range [0, 1]
+    full_video = (full_video + 1.0) / 2.0
     full_video = full_video.clamp(0, 1)
 
     # Trim to target frame count

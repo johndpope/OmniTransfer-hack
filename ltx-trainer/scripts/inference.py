@@ -136,14 +136,14 @@ def main() -> None:  # noqa: PLR0912, PLR0915
     parser.add_argument(
         "--checkpoint",
         type=str,
-        required=True,
+        default="/media/2TB/ltx-models/ltx2/ltx-2-19b-dev.safetensors",
         help="Path to model checkpoint (.safetensors)",
     )
     parser.add_argument(
         "--text-encoder-path",
         type=str,
-        required=True,
-        help="Path to Gemma text encoder directory",
+        default="/media/2TB/ltx-models/gemma",
+        help="Path to Gemma text encoder directory (not needed with --cached-embedding)",
     )
 
     # LoRA arguments
@@ -158,8 +158,8 @@ def main() -> None:  # noqa: PLR0912, PLR0915
     parser.add_argument(
         "--prompt",
         type=str,
-        required=True,
-        help="Text prompt for generation",
+        default="",
+        help="Text prompt for generation (not needed with --cached-embedding)",
     )
     parser.add_argument(
         "--negative-prompt",
@@ -270,6 +270,23 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         help="Output audio path (.wav, optional - if not provided, audio will be embedded in video)",
     )
 
+    # Cached embedding (bypass text encoder)
+    parser.add_argument(
+        "--cached-embedding",
+        type=str,
+        default=None,
+        help="Path to precomputed text embedding .pt file (skips loading Gemma text encoder)",
+    )
+
+    # Quantization
+    parser.add_argument(
+        "--quantization",
+        type=str,
+        default="none",
+        choices=["none", "int8-quanto", "fp8-quanto"],
+        help="Quantize transformer to reduce VRAM (required for 32GB GPUs)",
+    )
+
     # Device arguments
     parser.add_argument(
         "--device",
@@ -286,10 +303,26 @@ def main() -> None:  # noqa: PLR0912, PLR0915
 
     # Validate arguments
     generate_audio = not args.skip_audio
+    use_cached = args.cached_embedding is not None
 
     print("=" * 80)
     print("LTX Video/Audio Generation")
     print("=" * 80)
+
+    # Load cached embeddings if provided (bypasses text encoder entirely)
+    cached_embeddings = None
+    if use_cached:
+        from ltx_trainer.validation_sampler import CachedPromptEmbeddings
+
+        print(f"Loading cached embedding from {args.cached_embedding}...")
+        emb = torch.load(args.cached_embedding, map_location="cpu", weights_only=True)
+        video_embeds = emb["video_prompt_embeds"].unsqueeze(0).to(torch.bfloat16)
+        audio_embeds = emb.get("audio_prompt_embeds", torch.zeros_like(emb["video_prompt_embeds"])).unsqueeze(0).to(torch.bfloat16)
+        cached_embeddings = CachedPromptEmbeddings(
+            video_context_positive=video_embeds,
+            audio_context_positive=audio_embeds,
+        )
+        print(f"  Shape: {video_embeds.shape}")
 
     # Determine if we need VAE encoder (for image or video conditioning)
     need_vae_encoder = args.condition_image is not None or args.reference_video is not None
@@ -302,12 +335,22 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         with_video_vae_decoder=True,
         with_audio_vae_decoder=generate_audio,
         with_vocoder=generate_audio,
-        with_text_encoder=True,
-        text_encoder_path=args.text_encoder_path,
+        with_text_encoder=not use_cached,
+        text_encoder_path=args.text_encoder_path if not use_cached else None,
     )
 
-    # Apply LoRA weights if provided
+    # Quantize transformer if requested (must be done before .to(device) in sampler)
     transformer = components.transformer
+    if args.quantization != "none":
+        from ltx_trainer.quantization import quantize_model
+
+        print(f"Quantizing transformer ({args.quantization})...")
+        transformer = quantize_model(transformer, args.quantization, device=args.device)
+        # Move to device after quantization (sampler's .to() will be a no-op)
+        transformer = transformer.to(args.device)
+        print(f"  GPU memory: {torch.cuda.memory_allocated(0) / 1e9:.1f} GB")
+
+    # Apply LoRA weights if provided
     if args.lora_path is not None:
         transformer = load_lora_weights(transformer, args.lora_path)
 
@@ -384,6 +427,7 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         stg_scale=args.stg_scale,
         stg_blocks=args.stg_blocks,
         stg_mode=args.stg_mode,
+        cached_embeddings=cached_embeddings,
     )
 
     # Generate with progress bar
@@ -412,14 +456,23 @@ def main() -> None:  # noqa: PLR0912, PLR0915
     if audio is not None and components.vocoder is not None:
         audio_sample_rate = components.vocoder.output_sample_rate
 
-    save_video(
-        video_tensor=video,
-        output_path=output_path,
-        fps=args.frame_rate,
-        audio=audio,
-        audio_sample_rate=audio_sample_rate,
-    )
-    print(f"✓ Video saved to {args.output}")
+    # Save as image if single frame + image extension, otherwise video
+    if args.num_frames == 1 and output_path.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp"):
+        from torchvision.utils import save_image
+
+        # video is [C, F, H, W] in [0, 1] — extract first frame as [C, H, W]
+        frame = video[:, 0, :, :] if video.dim() == 4 else video
+        save_image(frame, output_path)
+        print(f"✓ Image saved to {args.output}")
+    else:
+        save_video(
+            video_tensor=video,
+            output_path=output_path,
+            fps=args.frame_rate,
+            audio=audio,
+            audio_sample_rate=audio_sample_rate,
+        )
+        print(f"✓ Video saved to {args.output}")
 
     # Save separate audio file if requested
     if audio is not None and args.audio_output is not None:

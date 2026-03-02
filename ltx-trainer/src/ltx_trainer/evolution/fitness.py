@@ -397,13 +397,14 @@ class ARRolloutEvaluator:
 
             dec_positions = self.get_positions_for_frame(f)
 
+            # Patchify ONCE before denoising loop — avoids accumulated
+            # precision errors from repeated patchify/unpatchify in bfloat16
+            noisy_patches = [self.patchifier.patchify(x) for x in x_t_list]
+
             fm_loss_frame = [0.0] * N
             for step in range(self.num_inference_steps):
                 sigma = sigmas[step]
                 sigma_next = sigmas[step + 1]
-
-                # Patchify all samples
-                noisy_patches = [self.patchifier.patchify(x) for x in x_t_list]
 
                 # Build batched decoder input: [N * cfg_mult, tokens, dim]
                 # Layout: [sample0_cond, sample1_cond, ..., sampleN_cond,
@@ -473,8 +474,16 @@ class ARRolloutEvaluator:
                         fm_loss_step = (velocity_i - v_true).pow(2).mean().item()
                         fm_loss_frame[i] += fm_loss_step
 
-                    vel_unpatch = self.patchifier.unpatchify(velocity_i, output_shape)
-                    x_t_list[i] = x_t_list[i] + (sigma_next - sigma) * vel_unpatch
+                    # Euler step in PATCH SPACE (matches scd_inference.py).
+                    # float32 intermediate avoids bfloat16 accumulation error.
+                    dt = sigma_next - sigma
+                    noisy_patches[i] = (
+                        noisy_patches[i].float() + velocity_i.float() * dt.float()
+                    ).to(self.dtype)
+
+            # Unpatchify ONCE after all denoising steps complete
+            for i in range(N):
+                x_t_list[i] = self.patchifier.unpatchify(noisy_patches[i], output_shape)
 
             # Per-sample: accumulate metrics for this frame
             for i in range(N):

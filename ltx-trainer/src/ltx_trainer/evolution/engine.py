@@ -1114,9 +1114,11 @@ class SCDEvolutionEngine:
 
                 # Decoder: denoise
                 x_t = torch.randn(1, C, 1, H, W, device=self.device, dtype=self.dtype, generator=generator)
+                # Patchify ONCE before denoising loop (avoids grid artifacts
+                # from repeated patchify/unpatchify in bfloat16)
+                noisy_patch = patchifier.patchify(x_t)
                 for step in range(self.evaluator.num_inference_steps):
                     sigma, sigma_next = sigmas[step], sigmas[step + 1]
-                    noisy_patch = patchifier.patchify(x_t)
                     ts = torch.full((1, H * W), sigma.item(), device=self.device, dtype=self.dtype)
                     dec_modality = Modality(
                         enabled=True, latent=noisy_patch, timesteps=ts,
@@ -1143,8 +1145,14 @@ class SCDEvolutionEngine:
                         )
                         velocity = velocity_uncond + self.config.guidance_scale * (velocity - velocity_uncond)
 
-                    vel_unpatch = patchifier.unpatchify(velocity, output_shape)
-                    x_t = x_t + (sigma_next - sigma) * vel_unpatch
+                    # Euler step in PATCH SPACE (float32 intermediate for precision)
+                    dt = sigma_next - sigma
+                    noisy_patch = (
+                        noisy_patch.float() + velocity.float() * dt.float()
+                    ).to(self.dtype)
+
+                # Unpatchify ONCE after all denoising steps
+                x_t = patchifier.unpatchify(noisy_patch, output_shape)
 
                 # Decode both GT and prediction via VAE on cuda:1
                 gt_frame = sample["latent"][:, :, f_idx:f_idx + 1, :, :]

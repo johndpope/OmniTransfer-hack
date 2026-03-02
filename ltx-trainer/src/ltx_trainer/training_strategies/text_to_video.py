@@ -104,10 +104,12 @@ class TextToVideoStrategy(TrainingStrategy):
         latents = batch["latents"]
         video_latents = latents["latents"]
 
-        # Get video dimensions (assume same for all batch elements)
-        num_frames = latents["num_frames"][0].item()
-        height = latents["height"][0].item()
-        width = latents["width"][0].item()
+        # Use actual latent tensor shape for dimensions — metadata num_frames may
+        # contain raw video frame count instead of latent frame count.
+        # video_latents shape: [B, C, F_lat, H_lat, W_lat]
+        num_frames = video_latents.shape[2]
+        height = video_latents.shape[3]
+        width = video_latents.shape[4]
 
         # Patchify latents: [B, C, F, H, W] -> [B, seq_len, C]
         video_latents = self._video_patchifier.patchify(video_latents)

@@ -47,7 +47,14 @@ Core Principles
 •No Laziness: Identify root causes. Avoid temporary fixes. Apply senior developer standards.
 •Minimal Impact: Touch only what is necessary. Avoid introducing new bugs.
 
-7. Resolution Matching for Inference
+7. Checkpoint Resume Policy
+•When launching a new training run on a dataset that already has checkpoints, ALWAYS ask the user whether to resume from the last checkpoint or start fresh.
+•Never silently start from scratch when checkpoints exist — that wastes hours of prior training.
+•Never silently resume without asking — the user may want a fresh start (e.g., after changing config, dataset, or strategy).
+•To resume, set `model.load_checkpoint` in the YAML config to the checkpoint path (e.g., `/media/2TB/omnitransfer/output/<experiment>/checkpoints/lora_weights_step_03000.safetensors`).
+•When resuming, consider whether `optimization.steps` needs increasing (the step counter resets, so to train 3000 MORE steps, keep steps at 3000).
+
+8. Resolution Matching for Inference
 •ALWAYS match output video resolution to the source training data resolution and orientation.
 •Portrait input data (e.g., 768×1152 Grok isometric) → portrait output MP4 (`--height 1152 --width 768`).
 •Landscape input data → landscape output MP4.

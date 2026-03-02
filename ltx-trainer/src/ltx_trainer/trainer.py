@@ -460,19 +460,34 @@ class LtxvTrainer:
         # For SCD strategy: encoder already ran in prepare_training_inputs;
         # here we only run the decoder with encoder features
         if hasattr(model_inputs, "_scd_model") and model_inputs._scd_model is not None:
-            # Pass EditCtrl control signals if available
-            local_control = getattr(model_inputs, "_local_control", None)
-            global_context = getattr(model_inputs, "_global_context", None)
+            # Per-frame decoder: process each frame independently through the decoder,
+            # matching the autoregressive inference setup (1 frame per forward pass).
+            # This prevents the train/inference attention scope mismatch that causes
+            # grid artifacts when the decoder LoRA is trained on multi-frame input
+            # but used on single-frame input at inference.
+            per_frame = getattr(model_inputs, "_per_frame_decoder", False)
+            if per_frame:
+                video_pred, audio_pred = model_inputs._scd_model.forward_decoder_per_frame(
+                    video=model_inputs.video,
+                    encoder_features=model_inputs._encoder_features,
+                    perturbations=None,
+                    tokens_per_frame=model_inputs._tokens_per_frame,
+                    num_frames=model_inputs._num_frames,
+                )
+            else:
+                # Pass EditCtrl control signals if available
+                local_control = getattr(model_inputs, "_local_control", None)
+                global_context = getattr(model_inputs, "_global_context", None)
 
-            video_pred, audio_pred = model_inputs._scd_model.forward_decoder(
-                video=model_inputs.video,
-                encoder_features=model_inputs._encoder_features,
-                audio=model_inputs.audio,
-                perturbations=None,
-                encoder_audio_args=model_inputs._encoder_audio_args,
-                local_control=local_control,
-                global_context=global_context,
-            )
+                video_pred, audio_pred = model_inputs._scd_model.forward_decoder(
+                    video=model_inputs.video,
+                    encoder_features=model_inputs._encoder_features,
+                    audio=model_inputs.audio,
+                    perturbations=None,
+                    encoder_audio_args=model_inputs._encoder_audio_args,
+                    local_control=local_control,
+                    global_context=global_context,
+                )
         else:
             video_pred, audio_pred = self._transformer(
                 video=model_inputs.video,

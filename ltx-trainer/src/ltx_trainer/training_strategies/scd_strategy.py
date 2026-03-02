@@ -137,6 +137,14 @@ class SCDTrainingConfig(TrainingStrategyConfigBase):
         le=1.0,
     )
 
+    per_frame_decoder: bool = Field(
+        default=True,
+        description="Process each frame independently through the decoder during training. "
+        "When True (default), the decoder sees one frame (tokens_per_frame tokens) per forward "
+        "pass, matching autoregressive inference. When False, all frames pass through the decoder "
+        "simultaneously (legacy behavior, causes train/inference mismatch).",
+    )
+
     with_audio: bool = Field(
         default=False,
         description="Whether to include audio in training",
@@ -253,9 +261,12 @@ class SCDTrainingStrategy(TrainingStrategy):
         latents = batch["latents"]
         video_latents = latents["latents"]
 
-        num_frames = latents["num_frames"][0].item()
-        height = latents["height"][0].item()
-        width = latents["width"][0].item()
+        # Use actual latent tensor shape, NOT metadata num_frames which may
+        # contain the raw video frame count (e.g. 25) instead of latent frames (e.g. 4).
+        # video_latents shape: [B, C, F_lat, H_lat, W_lat]
+        num_frames = video_latents.shape[2]
+        height = video_latents.shape[3]
+        width = video_latents.shape[4]
 
         # Patchify: [B, C, F, H, W] -> [B, seq_len, C]
         # With patch_size=1, this flattens spatial+temporal dims into a token sequence.
@@ -581,6 +592,14 @@ class SCDTrainingStrategy(TrainingStrategy):
         model_inputs._encoder_features = shifted_features
         model_inputs._scd_model = self._scd_model
         model_inputs._encoder_audio_args = encoder_audio_args
+
+        # Per-frame decoder metadata: when per_frame_decoder is True, the trainer calls
+        # forward_decoder_per_frame() which processes each frame independently through
+        # the decoder blocks, matching the autoregressive inference setup (1 frame = 336 tokens).
+        # This prevents the train/inference attention scope mismatch that causes grid artifacts.
+        model_inputs._per_frame_decoder = self.config.per_frame_decoder
+        model_inputs._tokens_per_frame = tokens_per_frame
+        model_inputs._num_frames = num_frames
 
         # Store raw latent shape for reconstruction visualization (unpatchification).
         # This is the pre-patchified [B, C, F, H, W] tensor needed to reshape

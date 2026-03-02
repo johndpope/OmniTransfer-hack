@@ -44,6 +44,13 @@ Usage:
         --prompt "A serene mountain landscape with flowing rivers" \
         --num-seconds 30 \
         --output /media/2TB/omnitransfer/inference/scd_30s.mp4
+
+    # Fast 8-step distilled model (~3.75x faster than dev)
+    python scripts/scd_inference.py \
+        --distilled \
+        --cached-embedding /media/2TB/omnitransfer/data/ditto_subset/conditions_final/000000.pt \
+        --num-seconds 10 \
+        --output /media/2TB/omnitransfer/inference/scd_distilled_10s.mp4
 """
 
 from __future__ import annotations
@@ -60,8 +67,17 @@ from peft import LoraConfig, get_peft_model, set_peft_model_state_dict
 from safetensors.torch import load_file
 from tqdm import tqdm
 
+from ltx_core.components.schedulers import LTX2Scheduler
+
 # Set CUDA arch BEFORE importing quanto (needed for fp8-quanto JIT compilation on RTX 5090)
 os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
+
+# Distilled model sigma schedule (from ltx-pipelines constants.py)
+# These are the exact sigma values used by the distilled 8-step model.
+# The schedule is heavily front-loaded: steps 1-4 are tiny deltas (~0.00625),
+# steps 5-8 are large jumps. This preserves the teacher's trajectory quality
+# while requiring only 8 denoising steps instead of 30.
+DISTILLED_SIGMA_VALUES = [1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -227,6 +243,30 @@ def main() -> None:
     parser.add_argument("--quantization", default="fp8-quanto", choices=["fp8-quanto", "int8-quanto", "none"])
     parser.add_argument("--compile", action="store_true", help="torch.compile decoder for ~1.5-2x speedup (warmup takes ~60s)")
 
+    # CFG (Classifier-Free Guidance) — critical for output quality
+    parser.add_argument(
+        "--guidance-scale", type=float, default=4.0,
+        help="Classifier-free guidance scale. 1.0 = no guidance, 4.0 = standard LTX-2 quality. "
+             "Higher values produce sharper but potentially oversaturated output.",
+    )
+
+    # Diagnostic: bypass SCD and run full 48-block model
+    parser.add_argument(
+        "--no-scd",
+        action="store_true",
+        help="[DIAGNOSTIC] Bypass SCD encoder-decoder split. Run the full 48-block model "
+             "on a single frame to verify base denoising works. No LoRA, no SCD wrapping.",
+    )
+
+    # Distilled model support (8-step, CFG=1.0)
+    parser.add_argument(
+        "--distilled",
+        action="store_true",
+        help="Use the distilled 8-step model (ltx-2-19b-distilled.safetensors). "
+             "Overrides --num-inference-steps to 8 with a predefined non-uniform sigma schedule. "
+             "~3.75x faster than the dev 30-step model.",
+    )
+
     # DDiT (Dynamic Patch Scheduling) — reduces decoder tokens for ~2-4x speedup
     # DDiT Paper (arXiv:2602.16968), Section 3: Dynamic Diffusion Transformer reduces
     # computational cost by spatially merging tokens during the decoder's denoising pass.
@@ -308,6 +348,20 @@ def main() -> None:
             print(f"  Note: --split-gpus forces --quantization none (was {args.quantization})")
             args.quantization = "none"
 
+    # ── Handle distilled mode ──
+    if args.distilled:
+        distilled_path = "/media/2TB/ltx-models/ltx2/ltx-2-19b-distilled.safetensors"
+        if args.checkpoint == "/media/2TB/ltx-models/ltx2/ltx-2-19b-dev.safetensors":
+            # Auto-switch to distilled checkpoint (only when using default dev path)
+            if Path(distilled_path).exists():
+                args.checkpoint = distilled_path
+                print(f"  Distilled mode: using {Path(distilled_path).name}")
+            else:
+                print(f"  WARNING: Distilled model not found at {distilled_path}")
+                print(f"  Using dev model with distilled sigma schedule (quality may differ)")
+        args.num_inference_steps = len(DISTILLED_SIGMA_VALUES) - 1  # 8 steps
+        print(f"  Distilled mode: {args.num_inference_steps} steps with predefined sigma schedule")
+
     # ── Validate dimensions ──
     assert args.height % 32 == 0, f"Height {args.height} must be divisible by 32"
     assert args.width % 32 == 0, f"Width {args.width} must be divisible by 32"
@@ -341,6 +395,8 @@ def main() -> None:
     actual_pixel = (actual_latent - 1) * 8 + 1
     actual_duration = actual_pixel / args.fps
 
+    use_cfg = args.guidance_scale > 1.0
+
     print()
     print("=" * 65)
     print("  SCD Video Generation")
@@ -353,8 +409,17 @@ def main() -> None:
     print(f"  Duration:    {actual_duration:.1f}s ({actual_pixel} frames @ {args.fps} fps)")
     print(f"  Latent:      {actual_latent} frames in {num_chunks} chunk(s)")
     print(f"  Tokens/frame:{tokens_per_frame}")
-    print(f"  Steps:       {args.num_inference_steps} per latent frame")
+    if args.distilled:
+        print(f"  Steps:       {args.num_inference_steps} (DISTILLED, non-uniform sigma schedule)")
+    else:
+        # Show the shifted sigma schedule for debugging
+        dummy_latent = torch.empty(1, 1, CHUNK_LATENT, latent_h, latent_w)
+        _preview_sigmas = LTX2Scheduler().execute(steps=args.num_inference_steps, latent=dummy_latent)
+        print(f"  Steps:       {args.num_inference_steps} per latent frame (LTX2Scheduler, shift for {CHUNK_LATENT}×{latent_h}×{latent_w}={CHUNK_LATENT*latent_h*latent_w} tokens)")
+        print(f"  Sigma range: [{_preview_sigmas[0]:.4f} → {_preview_sigmas[-2]:.4f} → {_preview_sigmas[-1]:.4f}]")
+    print(f"  Model:       {'DISTILLED' if args.distilled else 'DEV'} ({Path(args.checkpoint).name})")
     print(f"  LoRA:        {Path(args.lora_path).name if args.lora_path else 'None'}")
+    print(f"  CFG:         {'enabled' if use_cfg else 'disabled'} (guidance_scale={args.guidance_scale})")
     print(f"  Quantization:{args.quantization}")
     print(f"  Compile:     {'yes (first chunk includes JIT warmup)' if args.compile else 'no'}")
     if args.split_gpus:
@@ -413,6 +478,16 @@ def main() -> None:
     prompt_embeds = prompt_embeds.to("cuda:0")
     prompt_mask = prompt_mask.to("cuda:0")
 
+    # Create null (unconditional) embeddings for CFG
+    # CFG formula: v_cfg = v_uncond + guidance_scale * (v_cond - v_uncond)
+    # Null embedding = zeros with full attention mask (all masked out)
+    # Create null (unconditional) embeddings for CFG
+    if use_cfg:
+        null_embeds = torch.zeros_like(prompt_embeds)
+        null_mask = torch.zeros_like(prompt_mask)
+    else:
+        null_embeds = null_mask = None
+
     # ══════════════════════════════════════════════════════════════════════
     # Step 2: Load transformer → quantize → SCD wrap → LoRA
     # ══════════════════════════════════════════════════════════════════════
@@ -441,12 +516,14 @@ def main() -> None:
     # SCD Paper, Section 5.1: LoRA (rank 64) is applied to the full DiT during SCD
     # training. The LoRA adapts both encoder and decoder layers jointly. At inference,
     # we load these weights into the base transformer, then wrap with SCD.
-    if args.lora_path:
+    if args.lora_path and not args.no_scd:
         # PEFT can apply LoRA structure on CPU; weight loading via set_peft_model_state_dict
         # also works on CPU. No need to move to GPU first.
         transformer = load_lora_weights(transformer, args.lora_path, encoder_layers=args.encoder_layers)
         # Unwrap PeftModel → get the modified LTXModel with LoRA layers in-place
         transformer = transformer.get_base_model()
+    elif args.no_scd:
+        print("  [NO-SCD MODE] Skipping LoRA — running raw base model")
 
     # SCD Paper, Section 3.2: LTXSCDModel wraps the base DiT by creating aliased views:
     #   encoder_blocks = transformer_blocks[0:encoder_layers]      (causal attention)
@@ -551,6 +628,9 @@ def main() -> None:
         prompt_mask_dec = prompt_mask.to("cuda:1")
         prompt_embeds = prompt_embeds.to("cuda:0")
         prompt_mask = prompt_mask.to("cuda:0")
+        if use_cfg:
+            null_embeds_dec = null_embeds.to("cuda:1")
+            null_mask_dec = null_mask.to("cuda:1")
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -1071,6 +1151,12 @@ def main() -> None:
                         device=dec_device, dtype=dtype,
                     )
 
+                if chunk_idx == 0 and f_idx <= 1:
+                    print(f"  [DEBUG] Frame {f_idx}: enc_features mean={current_enc.float().mean().item():.4f} "
+                          f"std={current_enc.float().std().item():.4f} | "
+                          f"dec_ctx mean={dec_enc_ctx.float().mean().item():.4f} "
+                          f"std={dec_enc_ctx.float().std().item():.4f}")
+
                 # ══════════════════════════════════════════════════════════════
                 # DECODER: Denoise one new frame (full denoising trajectory)
                 # ══════════════════════════════════════════════════════════════
@@ -1091,17 +1177,30 @@ def main() -> None:
                     device=device, dtype=dtype, generator=generator,
                 )
 
-                # Adaptation: LTX-2 uses a linear sigma schedule from 1.0 to 0.0.
-                # This follows the flow matching convention where sigma=1 is pure noise
-                # and sigma=0 is the clean data distribution. The LTX2Scheduler typically
-                # provides more sophisticated schedules, but linear works well for SCD
-                # since each frame is denoised independently.
-                sigmas = torch.linspace(1.0, 0.0, args.num_inference_steps + 1, device=device)
-                # SCD Paper, Section 3.2: The decoder processes exactly 1 frame per call.
-                # Position embeddings are always for temporal position 0 (the decoder sees
-                # each frame in isolation; temporal context comes from encoder features).
-                # Cache decoder positions (same for every step — always 1 frame at pos 0)
-                dec_positions = get_positions(1)
+                # Sigma schedule depends on model type:
+                # - Dev model: LTX2Scheduler with token-count-dependent shift (matches training)
+                #   The shift is computed from the TRAINING WINDOW token count (CHUNK_LATENT
+                #   frames × H × W), matching the ShiftedLogitNormalTimestepSampler used
+                #   during training. A simple linear schedule DOES NOT WORK — the model was
+                #   trained with shifted logit-normal sigmas and cannot denoise linear sigmas.
+                # - Distilled model: Non-uniform predefined schedule (8 steps, heavily front-loaded)
+                if args.distilled:
+                    sigmas = torch.tensor(DISTILLED_SIGMA_VALUES, device=device, dtype=dtype)
+                else:
+                    # Create dummy latent matching training window for correct shift computation
+                    dummy_latent = torch.empty(1, 1, CHUNK_LATENT, latent_h, latent_w)
+                    scheduler = LTX2Scheduler()
+                    sigmas = scheduler.execute(
+                        steps=args.num_inference_steps, latent=dummy_latent,
+                    ).to(device=device, dtype=dtype)
+                # Decoder positions: Use the CORRECT temporal position for each frame.
+                # During training, the decoder sees all frames with their actual temporal
+                # positions (frame 0 at t~0.0, frame 1 at t~0.33, etc.). Using position 0
+                # for every frame creates a train/inference mismatch in RoPE embeddings.
+                # frame_pos was already incremented after encoder call, so the frame being
+                # decoded is at temporal index (frame_pos - 1).
+                dec_frame_idx = frame_pos - 1
+                dec_positions = get_positions_for_frame(dec_frame_idx, target_device=dec_device)
 
                 # DDiT Paper (arXiv:2602.16968), Section 3.2, Algorithm 1:
                 # Reset the dynamic scheduler's trajectory history for each new frame.
@@ -1111,6 +1210,7 @@ def main() -> None:
                     ddit_wrapper.scheduler.reset()
 
                 # ── Denoising loop: Euler ODE solver from sigma_max to sigma_min ──
+                _debug_first_frame = (f_idx == 0 and chunk_idx == 0)
                 for step in range(args.num_inference_steps):
                     # Sigma schedule: sigma decreases from 1.0 (pure noise) to 0.0 (clean).
                     # Each step moves from sigma to sigma_next along the ODE trajectory.
@@ -1244,6 +1344,24 @@ def main() -> None:
                                 perturbations=None,
                             )
 
+                            # CFG: run unconditional pass and apply guidance
+                            if use_cfg:
+                                uncond_modality = Modality(
+                                    enabled=True,
+                                    latent=noisy_patch,
+                                    timesteps=torch.full((1, dec_seq), sigma.item(), device=dec_device, dtype=dtype),
+                                    positions=dec_positions,
+                                    context=null_embeds,
+                                    context_mask=null_mask,
+                                )
+                                velocity_uncond, _ = scd_model.forward_decoder(
+                                    video=uncond_modality,
+                                    encoder_features=dec_enc_ctx,
+                                    audio=None,
+                                    perturbations=None,
+                                )
+                                velocity = velocity_uncond + args.guidance_scale * (velocity - velocity_uncond)
+
                     # ── Euler ODE Step ──
                     # DDiT Paper (arXiv:2602.16968), Eq. 3 / SCD Paper (arXiv:2602.10095), Section 3.1:
                     # Flow matching Euler step along the probability flow ODE:
@@ -1256,8 +1374,22 @@ def main() -> None:
                     # The velocity v_pred is the decoder's output — it predicts the instantaneous
                     # direction of the denoising trajectory in latent space.
                     # Euler step: x_{t+dt} = x_t + v * dt
+                    # Use float32 for accumulation to avoid bfloat16 precision loss over 30 steps
+                    # (matches EulerDiffusionStep in ltx-core which casts to float32)
                     dt = sigma_next - sigma
-                    noisy_patch = noisy_patch + velocity * dt
+                    if _debug_first_frame and step in (0, 1, 5, 14, 28, 29):
+                        v_mean = velocity.float().mean().item()
+                        v_std = velocity.float().std().item()
+                        x_mean = noisy_patch.float().mean().item()
+                        x_std = noisy_patch.float().std().item()
+                        print(f"    [DEBUG step {step:2d}] sigma={sigma.item():.4f}→{sigma_next.item():.4f} "
+                              f"dt={dt.item():.4f} | v: mean={v_mean:.4f} std={v_std:.4f} "
+                              f"| x_t: mean={x_mean:.4f} std={x_std:.4f}")
+                    noisy_patch = (noisy_patch.float() + velocity.float() * dt.float()).to(dtype)
+                    if _debug_first_frame and step in (0, 1, 5, 14, 28, 29):
+                        x_after = noisy_patch.float().mean().item()
+                        x_after_std = noisy_patch.float().std().item()
+                        print(f"              after: x_t: mean={x_after:.4f} std={x_after_std:.4f}")
 
                     # Unpatchify back to spatial format for the next iteration
                     # [1, H*W, 128] → [1, 128, 1, H, W]

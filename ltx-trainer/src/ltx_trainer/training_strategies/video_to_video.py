@@ -76,15 +76,16 @@ class VideoToVideoStrategy(TrainingStrategy):
         target_latents = latents["latents"]
         ref_latents = batch["ref_latents"]["latents"]
 
-        # Get dimensions
-        num_frames = latents["num_frames"][0].item()
-        height = latents["height"][0].item()
-        width = latents["width"][0].item()
+        # Use actual latent tensor shape — metadata num_frames may contain raw
+        # video frame count instead of latent frame count.
+        num_frames = target_latents.shape[2]
+        height = target_latents.shape[3]
+        width = target_latents.shape[4]
 
         ref_latents_info = batch["ref_latents"]
-        ref_frames = ref_latents_info["num_frames"][0].item()
-        ref_height = ref_latents_info["height"][0].item()
-        ref_width = ref_latents_info["width"][0].item()
+        ref_frames = ref_latents.shape[2]
+        ref_height = ref_latents.shape[3]
+        ref_width = ref_latents.shape[4]
 
         # Patchify latents: [B, C, F, H, W] -> [B, seq_len, C]
         target_latents = self._video_patchifier.patchify(target_latents)

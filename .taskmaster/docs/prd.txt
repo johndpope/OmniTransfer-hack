@@ -1,0 +1,516 @@
+# Product Requirements Document: Video Effect Upgrade
+# Grok Dataset Builder Chrome Extension + OmniTransfer Backend
+
+## 1. Overview
+
+### 1.1 Product Vision
+Add real-time video effect capabilities to the Grok Dataset Builder Chrome Extension (v3.8.0+) by integrating the OmniTransfer inference backend. Users will be able to apply style transfer, identity preservation, motion transfer, and video effects to their collected Grok videos directly from the extension sidepanel — with results stored in their cloud library alongside originals.
+
+### 1.2 Problem Statement
+Today the Grok Dataset Builder is a **collection and organization** tool only. Users harvest videos from Grok Imagine, organize them into lists, and export JSONL for training. There is no way to:
+- Apply trained OmniTransfer models to transform collected videos
+- Preview style-transferred or effect-applied results before training
+- Build curated datasets of paired original→transformed videos
+- Use reference videos from their library as style/identity sources
+
+### 1.3 Target Users
+- **AI video researchers** who train and iterate on OmniTransfer/LoRA models
+- **Creative professionals** who want to apply trained style/effect models to Grok content
+- **Dataset builders** who need paired (source, transformed) video datasets for training
+
+### 1.4 Success Metrics
+- Users can apply an effect to a video and see the result within 60 seconds (for 25-frame clips)
+- At least 3 effect types available at launch (style transfer, identity preservation, motion transfer)
+- Transformed videos stored in R2 with full cloud sync (same pipeline as originals)
+- Effect history preserved per item (which model, which reference, which parameters)
+
+---
+
+## 2. Architecture
+
+### 2.1 System Components
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Chrome Extension (Flutter Web)                                  │
+│  ┌──────────┐  ┌──────────┐  ┌──────────────────────────────┐  │
+│  │ Favorites │  │ Effects  │  │ Effect Preview               │  │
+│  │ Tab       │→ │ Tab      │→ │ - Reference picker           │  │
+│  │ (existing)│  │ (NEW)    │  │ - Effect type selector       │  │
+│  └──────────┘  └──────────┘  │ - Parameter controls          │  │
+│                               │ - Before/After comparison     │  │
+│                               └──────────────────────────────┘  │
+│                                          │                       │
+│  ┌──────────────────────────────────────┐│                       │
+│  │ EffectService (NEW)                  ││                       │
+│  │ - Submit effect jobs                 ││                       │
+│  │ - Poll job status                    ││                       │
+│  │ - Download results                   ││                       │
+│  └──────────────────────────────────────┘│                       │
+└──────────────────────────────────────────┼───────────────────────┘
+                                           │ HTTPS (REST API)
+                                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Supabase Edge Function: "effect-inference" (NEW)                │
+│  - Authenticates user via JWT                                    │
+│  - Validates job parameters                                      │
+│  - Writes job to `effect_jobs` table                             │
+│  - Returns job_id for polling                                    │
+└──────────────────────────────────────────┬───────────────────────┘
+                                           │ Postgres NOTIFY / polling
+                                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Inference Worker (Python, runs on GPU server)                   │
+│  ┌─────────────────────────────────────────────────────────────┐│
+│  │ Worker Loop                                                  ││
+│  │ 1. Poll `effect_jobs` WHERE status='pending'                 ││
+│  │ 2. Download source video from R2 (presigned GET)             ││
+│  │ 3. Download reference video/image from R2                    ││
+│  │ 4. Run OmniTransfer inference (omnitransfer_inference.py)    ││
+│  │ 5. Upload result to R2 (presigned PUT)                       ││
+│  │ 6. Update job status → 'completed' with result URL           ││
+│  └─────────────────────────────────────────────────────────────┘│
+│                                                                  │
+│  Uses: LTX-2 + LoRA checkpoints + ConceptEmbedding + TMA        │
+│  GPU: RTX 5090 (32GB) or cloud GPU                               │
+│  Models: /media/2TB/omnitransfer/output/*/checkpoints/           │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 2.2 Data Flow
+
+```
+User selects video → Picks effect type → Picks reference (optional)
+    → Extension calls Edge Function with: {source_url, ref_url, effect_type, model_id, params}
+    → Edge Function creates job in `effect_jobs` table
+    → Worker picks up job, runs inference, uploads result to R2
+    → Extension polls job status, shows progress
+    → On completion: shows before/after, saves to library with effect metadata
+```
+
+### 2.3 Key Design Decisions
+
+1. **Async job queue** (not real-time WebSocket): Inference takes 30-120s per video. A polling-based job queue is simpler, more reliable, and survives browser tab restarts.
+
+2. **R2 for all media**: Source videos, references, and results all live in R2. The worker downloads from R2 and uploads results back — no direct GPU↔extension connection needed.
+
+3. **Edge Function as gateway**: All job creation goes through Supabase Edge Functions for auth, validation, and rate limiting. The worker only talks to Supabase DB + R2.
+
+4. **Model registry in Supabase**: Available models (checkpoints) are registered in a `effect_models` table so the extension can show a model picker without hardcoding paths.
+
+---
+
+## 3. Database Schema (New Tables)
+
+### 3.1 effect_models
+
+Stores available OmniTransfer checkpoints that users can select.
+
+```sql
+CREATE TABLE effect_models (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name TEXT NOT NULL,                    -- "Isometric 3D Style v1"
+    description TEXT,                       -- Human-readable description
+    effect_type TEXT NOT NULL,              -- "style_transfer" | "identity_preservation" | "motion_transfer" | "video_effect"
+    checkpoint_path TEXT NOT NULL,          -- "/media/2TB/omnitransfer/output/.../lora_weights_step_02000.safetensors"
+    model_config JSONB DEFAULT '{}',       -- {lora_rank: 64, enable_tpb: true, enable_rcl: true, ...}
+    thumbnail_url TEXT,                     -- Preview image for model picker
+    is_public BOOLEAN DEFAULT false,        -- Available to all users
+    owner_id UUID REFERENCES auth.users(id), -- NULL for system models
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+### 3.2 effect_jobs
+
+Job queue for inference requests.
+
+```sql
+CREATE TABLE effect_jobs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES auth.users(id),
+    model_id UUID NOT NULL REFERENCES effect_models(id),
+
+    -- Input
+    source_video_url TEXT NOT NULL,         -- R2 URL of source video
+    reference_url TEXT,                      -- R2 URL of reference video/image (NULL for some effects)
+    prompt TEXT DEFAULT '',                  -- Text prompt (neutral for style transfer)
+    effect_params JSONB DEFAULT '{}',       -- {num_frames: 25, guidance_scale: 4.0, seed: 42, ...}
+
+    -- Output
+    result_url TEXT,                         -- R2 URL of transformed video
+    result_thumbnail_url TEXT,               -- R2 URL of result thumbnail
+
+    -- Status
+    status TEXT NOT NULL DEFAULT 'pending',  -- pending | processing | completed | failed | cancelled
+    progress FLOAT DEFAULT 0.0,             -- 0.0 to 1.0 for progress bar
+    error_message TEXT,                      -- Error details if failed
+    worker_id TEXT,                          -- Which worker picked this up
+
+    -- Timing
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+
+    -- Link back to library
+    source_item_id UUID REFERENCES grok_sync_videos(id),  -- Original item in user's library
+    result_item_id UUID REFERENCES grok_sync_videos(id)    -- Created item for the result
+);
+
+CREATE INDEX idx_effect_jobs_status ON effect_jobs(status) WHERE status = 'pending';
+CREATE INDEX idx_effect_jobs_user ON effect_jobs(user_id, created_at DESC);
+```
+
+### 3.3 effect_history
+
+Links original items to their transformed versions for lineage tracking.
+
+```sql
+CREATE TABLE effect_history (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    source_item_id UUID NOT NULL REFERENCES grok_sync_videos(id),
+    result_item_id UUID NOT NULL REFERENCES grok_sync_videos(id),
+    job_id UUID NOT NULL REFERENCES effect_jobs(id),
+    effect_type TEXT NOT NULL,
+    model_name TEXT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+---
+
+## 4. Supabase Edge Function: effect-inference
+
+### 4.1 Create Job
+
+```
+POST /functions/v1/effect-inference
+Authorization: Bearer <jwt>
+
+{
+    "source_video_url": "https://playpen.r2.dev/user123/favorites/abc.mp4",
+    "reference_url": "https://playpen.r2.dev/user123/favorites/ref.mp4",
+    "model_id": "uuid-of-model",
+    "prompt": "a cinematic scene",
+    "params": {
+        "num_frames": 25,
+        "guidance_scale": 4.0,
+        "inference_steps": 30,
+        "seed": 42
+    }
+}
+
+Response 201:
+{
+    "job_id": "uuid-of-job",
+    "status": "pending",
+    "estimated_seconds": 60
+}
+```
+
+### 4.2 Poll Status
+
+```
+GET /functions/v1/effect-inference?job_id=<uuid>
+Authorization: Bearer <jwt>
+
+Response 200:
+{
+    "job_id": "uuid",
+    "status": "processing",
+    "progress": 0.45,
+    "started_at": "2026-02-21T10:00:00Z"
+}
+
+-- or when completed:
+{
+    "job_id": "uuid",
+    "status": "completed",
+    "result_url": "https://playpen.r2.dev/user123/effects/result_abc.mp4",
+    "result_thumbnail_url": "https://playpen.r2.dev/user123/effects/result_abc_thumb.jpg",
+    "completed_at": "2026-02-21T10:01:05Z"
+}
+```
+
+### 4.3 Rate Limiting
+- Free tier: 5 jobs/day, max 25 frames, max 768x512 resolution
+- Premium tier: 50 jobs/day, max 97 frames, max 1152x768 resolution
+- Rate limits enforced in Edge Function by counting recent jobs per user
+
+---
+
+## 5. Inference Worker
+
+### 5.1 Worker Architecture
+
+The worker is a Python script that runs on the GPU server alongside the training pipeline. It reuses the existing `omnitransfer_inference.py` script.
+
+```python
+# worker/effect_worker.py
+"""
+OmniTransfer effect inference worker.
+
+Polls Supabase `effect_jobs` for pending jobs, runs inference,
+uploads results to R2, updates job status.
+
+Usage:
+    python worker/effect_worker.py --poll-interval 5
+"""
+```
+
+### 5.2 Worker Loop
+
+```
+while True:
+    1. Query: SELECT * FROM effect_jobs WHERE status='pending' ORDER BY created_at LIMIT 1
+    2. If no job: sleep(poll_interval), continue
+    3. UPDATE status='processing', worker_id=hostname, started_at=now()
+    4. Download source video from R2 to /tmp/
+    5. Download reference from R2 to /tmp/ (if provided)
+    6. Load model checkpoint (cached in memory across jobs of same model)
+    7. Run inference:
+       - Load LTX-2 base + LoRA checkpoint
+       - Load ConceptEmbedding + TMA params from checkpoint
+       - Run denoising loop with OmniTransfer strategy
+       - Save output video to /tmp/
+    8. Upload result to R2 via presigned URL
+    9. Generate thumbnail from first frame, upload to R2
+    10. UPDATE status='completed', result_url=..., completed_at=now()
+    11. Create new grok_sync_videos entry for the result (linked to original)
+    12. Insert into effect_history
+```
+
+### 5.3 Model Caching
+
+Loading LTX-2 + quantization takes ~3 minutes. The worker keeps the model in GPU memory between jobs:
+- If next job uses same model_id → reuse loaded model (fast path, ~30s inference)
+- If different model_id → unload, reload new checkpoint (~3min + 30s)
+
+### 5.4 Error Handling
+
+- If inference fails: status='failed', error_message=traceback
+- If worker crashes: jobs stuck in 'processing' for >10min are reset to 'pending' by a cron job
+- If R2 upload fails: retry 3x with exponential backoff
+
+---
+
+## 6. Chrome Extension Changes (Flutter)
+
+### 6.1 New Files
+
+| File | Purpose |
+|------|---------|
+| `lib/views/effects_tab.dart` | Main effects tab with model browser and job history |
+| `lib/views/effect_preview.dart` | Before/after comparison view for completed effects |
+| `lib/views/effect_config_sheet.dart` | Bottom sheet for configuring effect parameters |
+| `lib/services/effect_service.dart` | REST client for Edge Function (create job, poll status) |
+| `lib/providers/effects_provider.dart` | Riverpod provider for effect jobs and models |
+| `lib/providers/effect_models_provider.dart` | Fetches available models from Supabase |
+| `lib/models/effect_job.dart` | Data model for effect jobs |
+| `lib/models/effect_model.dart` | Data model for available effect models |
+| `lib/widgets/effect_progress_card.dart` | Job progress card with cancel button |
+| `lib/widgets/before_after_slider.dart` | Interactive before/after image comparison |
+| `lib/widgets/model_picker.dart` | Grid of available effect models with thumbnails |
+
+### 6.2 Modified Files
+
+| File | Change |
+|------|--------|
+| `lib/views/app_shell.dart` | Add Effects tab to navigation (new icon: auto_fix_high) |
+| `lib/views/detail_view.dart` | Add "Apply Effect" button to video detail view |
+| `lib/views/favorites_tab.dart` | Add effect badge on items that have transformations |
+| `lib/models/favorite_item.dart` | Add `effect_history` field linking to transformed versions |
+| `web/manifest.json` | No changes needed (already has required permissions) |
+
+### 6.3 Effects Tab Layout
+
+```
+┌─────────────────────────────────────┐
+│  Effects                    [Models]│  ← Tab header with model browser toggle
+├─────────────────────────────────────┤
+│  ┌─ Active Jobs ──────────────────┐ │
+│  │ 🔄 "Isometric Style" on vid_1 │ │  ← Progress card with cancel
+│  │    ████████░░░░ 67%  ~20s left │ │
+│  └────────────────────────────────┘ │
+│                                     │
+│  ┌─ Recent Results ───────────────┐ │
+│  │ ┌──────┐ ┌──────┐             │ │  ← Grid of completed effects
+│  │ │Before│→│After │ "Iso v1"    │ │
+│  │ │ 🎬   │ │ 🎬   │ 2m ago     │ │
+│  │ └──────┘ └──────┘             │ │
+│  │ ┌──────┐ ┌──────┐             │ │
+│  │ │Before│→│After │ "ID Pres"   │ │
+│  │ │ 🎬   │ │ 🎬   │ 1h ago     │ │
+│  │ └──────┘ └──────┘             │ │
+│  └────────────────────────────────┘ │
+│                                     │
+│  [+ New Effect]                     │  ← FAB to start new effect
+└─────────────────────────────────────┘
+```
+
+### 6.4 Effect Creation Flow (User Journey)
+
+1. **Entry point A**: User taps "Apply Effect" on a video in detail view
+2. **Entry point B**: User taps "+ New Effect" in Effects tab, picks source video from library
+3. **Step 1 - Pick Model**: Grid of available models with thumbnails and descriptions
+4. **Step 2 - Pick Reference** (if needed): Browse library for reference video/image
+   - Style transfer: pick the style source video
+   - Identity preservation: pick the identity reference
+   - Motion transfer: pick the motion source
+5. **Step 3 - Configure**: Bottom sheet with:
+   - Prompt text field (pre-filled with neutral prompt for style transfer)
+   - Number of frames (9, 17, 25)
+   - Guidance scale slider (1.0-7.0, default 4.0)
+   - Seed (random or fixed)
+6. **Step 4 - Submit**: Creates job, shows progress card in Effects tab
+7. **Step 5 - Result**: Notification when complete, before/after comparison view
+
+### 6.5 Before/After Comparison Widget
+
+Interactive slider that shows source and result side-by-side:
+- Horizontal swipe divider that reveals before/after
+- Tap to toggle full-screen before or after
+- Play button to see both videos playing synchronized
+- Save to library button (creates new grok_sync_videos entry)
+- Share button (copy R2 URL)
+
+---
+
+## 7. Available Effect Types at Launch
+
+### 7.1 Style Transfer (Diorama)
+- **Model**: Phase 1-3 diorama checkpoints
+- **Reference**: User picks a style source video from library
+- **Prompt**: Auto-filled neutral ("a cinematic scene")
+- **Use case**: Transform realistic videos into isometric/diorama style
+
+### 7.2 Identity Preservation (Isometric)
+- **Model**: Isometric OmniTransfer Stage 1 checkpoint
+- **Reference**: User picks a video with the identity to preserve
+- **Prompt**: Describes the desired scene
+- **Use case**: Generate new scenes with a consistent character/style
+
+### 7.3 Motion Transfer
+- **Model**: Future checkpoint (requires temporal training data)
+- **Reference**: User picks a video with the desired motion
+- **Prompt**: Not applicable (first frame conditioning)
+- **Use case**: Transfer dance/action from reference to new subject
+
+---
+
+## 8. Inference Worker Configuration
+
+### 8.1 GPU Requirements
+
+| Configuration | VRAM | Inference Time (25 frames) |
+|--------------|------|---------------------------|
+| int8-quanto + RTX 5090 | ~20GB | ~45s |
+| bf16 + A100 80GB | ~40GB | ~30s |
+| int8-quanto + RTX 4090 | ~20GB | ~60s |
+
+### 8.2 Environment Variables
+
+```bash
+# Worker config
+SUPABASE_URL=https://sjhimebeoulzexcdcxln.supabase.co
+SUPABASE_SERVICE_KEY=<service_role_key>  # NOT anon key — needs insert/update
+R2_PRESIGN_FUNCTION_URL=https://sjhimebeoulzexcdcxln.supabase.co/functions/v1/s3-presign
+
+# Model paths
+LTX2_MODEL_PATH=/media/2TB/ltx-models/ltx2/ltx-2-19b-dev.safetensors
+LTX2_TEXT_ENCODER_PATH=/media/2TB/ltx-models/gemma
+
+# GPU config
+CUDA_VISIBLE_DEVICES=0
+QUANTIZATION=int8-quanto
+TRANSFORMER_DEVICE=cuda:0
+VAE_DEVICE=cuda:1
+
+# Worker behavior
+POLL_INTERVAL=5        # seconds between job checks
+MAX_CONCURRENT=1       # one job at a time (GPU bound)
+JOB_TIMEOUT=300        # max seconds per job before auto-fail
+```
+
+---
+
+## 9. Implementation Phases
+
+### Phase 1: Backend Infrastructure (Week 1-2)
+- [ ] Create `effect_models` and `effect_jobs` tables in Supabase
+- [ ] Create `effect-inference` Edge Function (create job, poll status)
+- [ ] Build Python inference worker (`worker/effect_worker.py`)
+- [ ] Register initial models (diorama phase 1-2, isometric omnitransfer)
+- [ ] Test end-to-end: create job via curl → worker processes → result in R2
+
+### Phase 2: Extension UI - Effects Tab (Week 2-3)
+- [ ] Add `EffectService` and `EffectsProvider` to extension
+- [ ] Create Effects tab with job list and progress cards
+- [ ] Create model picker widget
+- [ ] Create effect configuration bottom sheet
+- [ ] Implement job polling and status updates
+
+### Phase 3: Effect Preview & Integration (Week 3-4)
+- [ ] Build before/after comparison widget
+- [ ] Add "Apply Effect" button to detail view
+- [ ] Save results to user's library (new grok_sync_videos entry)
+- [ ] Add effect badge/icon on transformed items in favorites grid
+- [ ] Effect history view per item
+
+### Phase 4: Polish & Scale (Week 4-5)
+- [ ] Rate limiting and usage tracking
+- [ ] Error handling and retry UI
+- [ ] Model thumbnail generation
+- [ ] Push notification when job completes (Chrome notification API)
+- [ ] Queue position indicator when multiple jobs pending
+- [ ] Cancel job support
+
+---
+
+## 10. Security Considerations
+
+1. **Auth required**: All effect operations require Supabase JWT
+2. **User isolation**: Jobs scoped to user_id, R2 paths scoped to user folder
+3. **No GPU server exposure**: Worker only talks to Supabase DB and R2 — no public endpoints
+4. **Service role key**: Worker uses service_role key (server-side only, never in extension)
+5. **Rate limiting**: Edge Function enforces per-user daily limits
+6. **Input validation**: Edge Function validates URLs are R2 paths (no arbitrary URL fetching)
+7. **Job timeout**: Worker auto-fails jobs exceeding timeout to prevent GPU resource exhaustion
+
+---
+
+## 11. Future Enhancements (Post-MVP)
+
+- **Custom model upload**: Users train their own LoRA and upload checkpoint
+- **Batch effects**: Apply same effect to entire list of videos
+- **Effect presets**: Save parameter combinations as reusable presets
+- **Real-time preview**: Low-res preview stream during inference (WebSocket)
+- **Multi-reference**: MovieWeaver-style multi-concept effects (R1=face, R2=body)
+- **Effect chains**: Pipeline multiple effects sequentially
+- **Community models**: Share trained models with other users
+- **Cloud GPU**: Burst to cloud GPUs (Lambda, RunPod) when local GPU is busy
+- **Mobile app**: Port effect preview to Flutter mobile (iOS/Android)
+
+---
+
+## 12. Dependencies & Risks
+
+| Risk | Mitigation |
+|------|-----------|
+| GPU server uptime | Worker auto-restarts via systemd; job queue survives restarts |
+| Inference too slow (>2min) | Lower resolution/frames for free tier; cache models in memory |
+| R2 storage costs | 10GB free tier; user quotas prevent abuse |
+| Model quality varies | Curate initial model set; show quality ratings from users |
+| Chrome extension size limit (CWS) | No model weights in extension — all inference is server-side |
+| Worker OOM on 32GB GPU | int8-quanto + inference_mode keeps peak at ~20GB |
+
+---
+
+## 13. Open Questions
+
+1. Should the worker run as a systemd service or inside a Docker container?
+2. Do we need WebSocket for real-time progress, or is polling every 3s sufficient?
+3. Should users be able to provide their own checkpoints (upload .safetensors)?
+4. Should we support video-to-video AND image-to-image effects, or video only?
+5. What's the pricing model for inference compute? Free tier + paid? Credits?
+6. Should results auto-add to the user's favorites list, or require explicit save?

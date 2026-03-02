@@ -851,9 +851,11 @@ class EditCtrlSCDTrainingStrategy(SCDTrainingStrategy):
         latents = batch["latents"]
         video_latents = latents["latents"]  # [B, C, F, H, W]
 
-        num_frames = latents["num_frames"][0].item()
-        height = latents["height"][0].item()
-        width = latents["width"][0].item()
+        # Use actual latent tensor shape — metadata num_frames may contain raw
+        # video frame count instead of latent frame count.
+        num_frames = video_latents.shape[2]
+        height = video_latents.shape[3]
+        width = video_latents.shape[4]
 
         # Patchify: [B, C, F, H, W] -> [B, seq_len, C]
         # Flattens spatial+temporal dims into a token sequence.

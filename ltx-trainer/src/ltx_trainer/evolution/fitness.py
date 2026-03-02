@@ -13,8 +13,8 @@ Pixel-space (optional, requires VAE decoder on secondary GPU):
   4. LPIPS — perceptual similarity (requires lpips package)
   5. SSIM — structural similarity
 
-Multi-sample batch evaluation: evaluates the same perturbation against
-multiple dataset samples and averages, reducing noise in the fitness signal.
+GPU-batched evaluation: batches CFG conditional+unconditional passes AND
+multiple samples in a single decoder forward for maximum throughput.
 """
 
 from __future__ import annotations
@@ -84,7 +84,8 @@ class ARRolloutEvaluator:
     """Evaluates SCD decoder quality via autoregressive rollout against GT.
 
     Supports dual-GPU: transformer on cuda:0, VAE decoder on cuda:1.
-    Supports batch evaluation: average fitness over multiple samples per perturbation.
+    Supports GPU-batched evaluation: batches CFG passes and multiple samples
+    in a single decoder forward call for maximum throughput.
     """
 
     def __init__(
@@ -106,6 +107,7 @@ class ARRolloutEvaluator:
         device: torch.device | str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
         distilled: bool = False,
+        guidance_scale: float = 1.0,
         # Dual-GPU / pixel metrics
         vae_decoder: torch.nn.Module | None = None,
         vae_device: torch.device | str | None = None,
@@ -136,6 +138,10 @@ class ARRolloutEvaluator:
         self.device = torch.device(device)
         self.dtype = dtype
         self.distilled = distilled
+
+        # CFG (Classifier-Free Guidance)
+        self.guidance_scale = guidance_scale
+        self.use_cfg = guidance_scale > 1.0
 
         # Fitness normalization (set after first baseline evaluation)
         self.normalization: FitnessNormalization | None = None
@@ -231,198 +237,15 @@ class ARRolloutEvaluator:
         )
         return ssim_map.mean().item()
 
-    @torch.inference_mode()
-    def evaluate(
+    def _compute_fitness_score(
         self,
-        gt_latents: Tensor,
-        prompt_embeds: Tensor,
-        prompt_mask: Tensor | None,
-        seed: int = 0,
-    ) -> FitnessResult:
-        """Run AR rollout and compute fitness vs ground truth.
-
-        Args:
-            gt_latents: Ground truth video latents [1, C, F, H, W] where F >= ar_frames.
-            prompt_embeds: Text embeddings [1, seq_len, dim].
-            prompt_mask: Attention mask for prompt [1, seq_len] or None.
-            seed: Random seed for noise generation.
-
-        Returns:
-            FitnessResult with combined and component scores.
-        """
-        from ltx_core.components.patchifiers import VideoLatentShape
-        from ltx_core.model.transformer.modality import Modality
-        from ltx_core.model.transformer.scd_model import KVCache
-
-        sigmas = self._get_sigmas()
-        generator = torch.Generator(device=self.device).manual_seed(seed)
-
-        kv_cache = KVCache.empty()
-        kv_cache.is_cache_step = True
-
-        prev_enc_features: Tensor | None = None
-        generated: list[Tensor] = []
-
-        total_fm_loss = 0.0
-        total_recon_loss = 0.0
-        gt_cos_sims: list[float] = []
-        gen_cos_sims: list[float] = []
-        total_lpips = 0.0
-        total_ssim = 0.0
-
-        output_shape = VideoLatentShape(
-            batch=1,
-            channels=self.latent_channels,
-            frames=1,
-            height=self.latent_h,
-            width=self.latent_w,
-        )
-
-        for f in range(self.ar_frames):
-            # ── ENCODER: process previous frame (clean, sigma=0) ──
-            if f == 0:
-                enc_latent = torch.zeros(
-                    1, self.latent_channels, 1, self.latent_h, self.latent_w,
-                    device=self.device, dtype=self.dtype,
-                )
-            else:
-                enc_latent = generated[-1]
-
-            patchified_enc = self.patchifier.patchify(enc_latent)
-            enc_modality = Modality(
-                enabled=True,
-                latent=patchified_enc,
-                timesteps=torch.zeros(
-                    1, self.tokens_per_frame, device=self.device, dtype=self.dtype
-                ),
-                positions=self.get_positions_for_frame(f),
-                context=prompt_embeds,
-                context_mask=prompt_mask,
-            )
-
-            enc_out, _ = self.scd_model.forward_encoder(
-                video=enc_modality,
-                audio=None,
-                perturbations=None,
-                kv_cache=kv_cache,
-                tokens_per_frame=self.tokens_per_frame,
-            )
-            current_enc = enc_out.x.detach()
-
-            # Shift-by-1: decoder uses PREVIOUS encoder features
-            if prev_enc_features is not None:
-                dec_enc_ctx = prev_enc_features
-            else:
-                dec_enc_ctx = torch.zeros(
-                    1, self.tokens_per_frame, current_enc.shape[-1],
-                    device=self.device, dtype=self.dtype,
-                )
-            prev_enc_features = current_enc
-
-            # ── DECODER: denoise from noise -> clean frame ──
-            x_t = torch.randn(
-                1, self.latent_channels, 1, self.latent_h, self.latent_w,
-                device=self.device, dtype=self.dtype, generator=generator,
-            )
-
-            dec_positions = self.get_positions_for_frame(f)
-
-            fm_loss_frame = 0.0
-            for step in range(self.num_inference_steps):
-                sigma = sigmas[step]
-                sigma_next = sigmas[step + 1]
-
-                noisy_patch = self.patchifier.patchify(x_t)
-                ts = torch.full(
-                    (1, self.tokens_per_frame), sigma.item(),
-                    device=self.device, dtype=self.dtype,
-                )
-                dec_modality = Modality(
-                    enabled=True,
-                    latent=noisy_patch,
-                    timesteps=ts,
-                    positions=dec_positions,
-                    context=prompt_embeds,
-                    context_mask=prompt_mask,
-                )
-
-                velocity, _ = self.scd_model.forward_decoder(
-                    video=dec_modality,
-                    encoder_features=dec_enc_ctx,
-                    audio=None,
-                    perturbations=None,
-                )
-
-                # FM velocity MSE against GT-derived true velocity
-                gt_frame = gt_latents[:, :, f : f + 1, :, :]
-                gt_patch = self.patchifier.patchify(gt_frame)
-
-                if sigma.item() > 1e-6:
-                    noise_est = (noisy_patch - (1.0 - sigma) * gt_patch) / sigma
-                    v_true = gt_patch - noise_est
-                    fm_loss_step = (velocity - v_true).pow(2).mean().item()
-                    fm_loss_frame += fm_loss_step
-
-                # Euler ODE step
-                vel_unpatch = self.patchifier.unpatchify(velocity, output_shape)
-                x_t = x_t + (sigma_next - sigma) * vel_unpatch
-
-            generated.append(x_t.detach())
-            total_fm_loss += fm_loss_frame / self.num_inference_steps
-
-            # Latent reconstruction MSE
-            gt_frame = gt_latents[:, :, f : f + 1, :, :]
-            total_recon_loss += (x_t - gt_frame).pow(2).mean().item()
-
-            # Pixel-space metrics (VAE decode on secondary GPU)
-            if self.use_pixel_metrics and self.vae_decoder is not None:
-                gen_pixels = self._decode_latent_to_pixels(x_t)
-                gt_pixels = self._decode_latent_to_pixels(gt_frame)
-
-                if self.w_lpips > 0 and self.lpips_net is not None:
-                    lpips_val = self.lpips_net(gen_pixels, gt_pixels).item()
-                    total_lpips += lpips_val
-
-                if self.w_ssim > 0:
-                    ssim_val = self._compute_ssim(gen_pixels, gt_pixels)
-                    total_ssim += ssim_val
-
-            # Temporal coherence: cosine similarity between consecutive frames
-            if f > 0:
-                gt_prev = gt_latents[:, :, f - 1 : f, :, :].flatten()
-                gt_curr = gt_latents[:, :, f : f + 1, :, :].flatten()
-                gt_cos = torch.nn.functional.cosine_similarity(
-                    gt_prev.unsqueeze(0), gt_curr.unsqueeze(0)
-                ).item()
-                gt_cos_sims.append(gt_cos)
-
-                gen_prev = generated[-2].flatten()
-                gen_curr = generated[-1].flatten()
-                gen_cos = torch.nn.functional.cosine_similarity(
-                    gen_prev.unsqueeze(0), gen_curr.unsqueeze(0)
-                ).item()
-                gen_cos_sims.append(gen_cos)
-
-        # Aggregate fitness
-        n = self.ar_frames
-        avg_fm = total_fm_loss / n
-        avg_recon = total_recon_loss / n
-        avg_lpips = total_lpips / n if self.use_pixel_metrics else 0.0
-        avg_ssim = total_ssim / n if self.use_pixel_metrics else 1.0
-
-        if gt_cos_sims:
-            temporal_gap = sum(
-                abs(g - gt) for g, gt in zip(gen_cos_sims, gt_cos_sims)
-            ) / len(gt_cos_sims)
-        else:
-            temporal_gap = 0.0
-
-        # Combined fitness (higher = better):
-        # Negate losses (lower is better → higher negative = worse → higher total = better)
-        # SSIM is already higher=better, so add it directly
-        #
-        # With normalization: each raw metric is scaled so baseline ≈ 1.0,
-        # ensuring all objectives contribute equally to the ES gradient.
+        avg_fm: float,
+        avg_recon: float,
+        temporal_gap: float,
+        avg_lpips: float,
+        avg_ssim: float,
+    ) -> float:
+        """Compute combined fitness score from component metrics."""
         norm = self.normalization
         if norm is not None:
             total = -(
@@ -442,14 +265,35 @@ class ARRolloutEvaluator:
             )
             if self.w_ssim > 0:
                 total += self.w_ssim * avg_ssim
+        return total
 
-        return FitnessResult(
-            total=total,
-            fm_loss=avg_fm,
-            latent_recon=avg_recon,
-            temporal_coh=temporal_gap,
-            pixel_lpips=avg_lpips,
-            pixel_ssim=avg_ssim,
+    @torch.inference_mode()
+    def evaluate(
+        self,
+        gt_latents: Tensor,
+        prompt_embeds: Tensor,
+        prompt_mask: Tensor | None,
+        seed: int = 0,
+    ) -> FitnessResult:
+        """Run AR rollout and compute fitness vs ground truth (single sample).
+
+        Args:
+            gt_latents: Ground truth video latents [1, C, F, H, W] where F >= ar_frames.
+            prompt_embeds: Text embeddings [1, seq_len, dim].
+            prompt_mask: Attention mask for prompt [1, seq_len] or None.
+            seed: Random seed for noise generation.
+
+        Returns:
+            FitnessResult with combined and component scores.
+        """
+        # Delegate to batched version with a single sample
+        return self.evaluate_batch(
+            samples=[{
+                "latent": gt_latents,
+                "prompt_embeds": prompt_embeds,
+                "prompt_mask": prompt_mask,
+            }],
+            seed_base=seed,
         )
 
     @torch.inference_mode()
@@ -458,21 +302,244 @@ class ARRolloutEvaluator:
         samples: list[dict[str, Tensor]],
         seed_base: int = 0,
     ) -> FitnessResult:
-        """Evaluate fitness over multiple samples and average.
+        """Evaluate fitness over multiple samples with GPU-batched decoder.
+
+        Batches both CFG (cond+uncond) and multiple samples into single decoder
+        forward calls. Encoder stays sequential (KV-cache is per-sample).
 
         Each sample dict has keys: "latent", "prompt_embeds", "prompt_mask".
-        This reduces noise in the fitness signal.
         """
-        results: list[FitnessResult] = []
-        for i, sample in enumerate(samples):
-            r = self.evaluate(
-                gt_latents=sample["latent"],
-                prompt_embeds=sample["prompt_embeds"],
-                prompt_mask=sample.get("prompt_mask"),
-                seed=seed_base + i * 7919,
-            )
-            results.append(r)
+        from ltx_core.components.patchifiers import VideoLatentShape
+        from ltx_core.model.transformer.modality import Modality
+        from ltx_core.model.transformer.scd_model import KVCache
 
+        sigmas = self._get_sigmas()
+        N = len(samples)  # Number of samples to batch
+        C = self.latent_channels
+        H, W = self.latent_h, self.latent_w
+        tpf = self.tokens_per_frame
+
+        # CFG multiplier: 2 if using CFG (cond + uncond), 1 otherwise
+        cfg_mult = 2 if self.use_cfg else 1
+
+        output_shape = VideoLatentShape(
+            batch=1, channels=C, frames=1, height=H, width=W,
+        )
+
+        # Per-sample state (encoder is sequential due to KV-cache)
+        per_sample_enc_features: list[Tensor | None] = [None] * N
+        per_sample_generated: list[list[Tensor]] = [[] for _ in range(N)]
+        per_sample_kv_cache: list = []
+        per_sample_generators: list[torch.Generator] = []
+
+        for i in range(N):
+            kv = KVCache.empty()
+            kv.is_cache_step = True
+            per_sample_kv_cache.append(kv)
+            per_sample_generators.append(
+                torch.Generator(device=self.device).manual_seed(seed_base + i * 7919)
+            )
+
+        # Accumulators per sample
+        fm_losses = [0.0] * N
+        recon_losses = [0.0] * N
+        gt_cos_per_sample: list[list[float]] = [[] for _ in range(N)]
+        gen_cos_per_sample: list[list[float]] = [[] for _ in range(N)]
+        lpips_per_sample = [0.0] * N
+        ssim_per_sample = [0.0] * N
+
+        for f in range(self.ar_frames):
+            # ── ENCODER: sequential per sample (KV-cache is per-sample) ──
+            enc_features_list: list[Tensor] = []
+            for i in range(N):
+                if f == 0:
+                    enc_latent = torch.zeros(
+                        1, C, 1, H, W, device=self.device, dtype=self.dtype,
+                    )
+                else:
+                    enc_latent = per_sample_generated[i][-1]
+
+                patchified_enc = self.patchifier.patchify(enc_latent)
+                enc_modality = Modality(
+                    enabled=True,
+                    latent=patchified_enc,
+                    timesteps=torch.zeros(1, tpf, device=self.device, dtype=self.dtype),
+                    positions=self.get_positions_for_frame(f),
+                    context=samples[i]["prompt_embeds"],
+                    context_mask=samples[i].get("prompt_mask"),
+                )
+
+                enc_out, _ = self.scd_model.forward_encoder(
+                    video=enc_modality, audio=None, perturbations=None,
+                    kv_cache=per_sample_kv_cache[i],
+                    tokens_per_frame=tpf,
+                )
+                current_enc = enc_out.x.detach()
+
+                # Shift-by-1: decoder uses PREVIOUS encoder features
+                if per_sample_enc_features[i] is not None:
+                    enc_features_list.append(per_sample_enc_features[i])
+                else:
+                    enc_features_list.append(torch.zeros(
+                        1, tpf, current_enc.shape[-1],
+                        device=self.device, dtype=self.dtype,
+                    ))
+                per_sample_enc_features[i] = current_enc
+
+            # ── DECODER: GPU-batched across samples (+ CFG) ──
+            # Initialize noise per sample
+            x_t_list = []
+            for i in range(N):
+                x_t_list.append(torch.randn(
+                    1, C, 1, H, W, device=self.device, dtype=self.dtype,
+                    generator=per_sample_generators[i],
+                ))
+
+            dec_positions = self.get_positions_for_frame(f)
+
+            fm_loss_frame = [0.0] * N
+            for step in range(self.num_inference_steps):
+                sigma = sigmas[step]
+                sigma_next = sigmas[step + 1]
+
+                # Patchify all samples
+                noisy_patches = [self.patchifier.patchify(x) for x in x_t_list]
+
+                # Build batched decoder input: [N * cfg_mult, tokens, dim]
+                # Layout: [sample0_cond, sample1_cond, ..., sampleN_cond,
+                #          sample0_uncond, sample1_uncond, ..., sampleN_uncond]
+                batched_latent = torch.cat(noisy_patches, dim=0)  # [N, tpf, patch_dim]
+                batched_ts = torch.full(
+                    (N, tpf), sigma.item(), device=self.device, dtype=self.dtype,
+                )
+                batched_positions = dec_positions.expand(N, -1, -1, -1)
+                batched_context = torch.cat(
+                    [s["prompt_embeds"] for s in samples], dim=0,
+                )  # [N, seq, dim]
+                batched_mask = None
+                if samples[0].get("prompt_mask") is not None:
+                    batched_mask = torch.cat(
+                        [s["prompt_mask"] for s in samples], dim=0,
+                    )
+                batched_enc_ctx = torch.cat(enc_features_list, dim=0)  # [N, tpf, hidden]
+
+                if self.use_cfg:
+                    # Append unconditional: same latent/ts/positions/enc_ctx, zero context
+                    null_context = torch.zeros_like(batched_context)
+                    null_mask = torch.zeros_like(batched_mask) if batched_mask is not None else None
+
+                    batched_latent = torch.cat([batched_latent, batched_latent], dim=0)
+                    batched_ts = torch.cat([batched_ts, batched_ts], dim=0)
+                    batched_positions = torch.cat([batched_positions, batched_positions], dim=0)
+                    batched_context = torch.cat([batched_context, null_context], dim=0)
+                    if batched_mask is not None and null_mask is not None:
+                        batched_mask = torch.cat([batched_mask, null_mask], dim=0)
+                    batched_enc_ctx = torch.cat([batched_enc_ctx, batched_enc_ctx], dim=0)
+
+                # Single batched decoder forward: [N * cfg_mult, tpf, dim]
+                batched_modality = Modality(
+                    enabled=True,
+                    latent=batched_latent,
+                    timesteps=batched_ts,
+                    positions=batched_positions,
+                    context=batched_context,
+                    context_mask=batched_mask,
+                )
+
+                velocity_batched, _ = self.scd_model.forward_decoder(
+                    video=batched_modality,
+                    encoder_features=batched_enc_ctx,
+                    audio=None,
+                    perturbations=None,
+                )
+
+                # Split and apply CFG
+                if self.use_cfg:
+                    vel_cond = velocity_batched[:N]      # [N, tpf, dim]
+                    vel_uncond = velocity_batched[N:]     # [N, tpf, dim]
+                    velocity_batched = vel_uncond + self.guidance_scale * (vel_cond - vel_uncond)
+                # velocity_batched is now [N, tpf, dim]
+
+                # Per-sample: FM loss + Euler step
+                for i in range(N):
+                    velocity_i = velocity_batched[i : i + 1]  # [1, tpf, dim]
+
+                    gt_frame = samples[i]["latent"][:, :, f : f + 1, :, :]
+                    gt_patch = self.patchifier.patchify(gt_frame)
+
+                    if sigma.item() > 1e-6:
+                        noise_est = (noisy_patches[i] - (1.0 - sigma) * gt_patch) / sigma
+                        v_true = gt_patch - noise_est
+                        fm_loss_step = (velocity_i - v_true).pow(2).mean().item()
+                        fm_loss_frame[i] += fm_loss_step
+
+                    vel_unpatch = self.patchifier.unpatchify(velocity_i, output_shape)
+                    x_t_list[i] = x_t_list[i] + (sigma_next - sigma) * vel_unpatch
+
+            # Per-sample: accumulate metrics for this frame
+            for i in range(N):
+                per_sample_generated[i].append(x_t_list[i].detach())
+                fm_losses[i] += fm_loss_frame[i] / self.num_inference_steps
+
+                gt_frame = samples[i]["latent"][:, :, f : f + 1, :, :]
+                recon_losses[i] += (x_t_list[i] - gt_frame).pow(2).mean().item()
+
+                # Pixel-space metrics
+                if self.use_pixel_metrics and self.vae_decoder is not None:
+                    gen_pixels = self._decode_latent_to_pixels(x_t_list[i])
+                    gt_pixels = self._decode_latent_to_pixels(gt_frame)
+
+                    if self.w_lpips > 0 and self.lpips_net is not None:
+                        lpips_per_sample[i] += self.lpips_net(gen_pixels, gt_pixels).item()
+                    if self.w_ssim > 0:
+                        ssim_per_sample[i] += self._compute_ssim(gen_pixels, gt_pixels)
+
+                # Temporal coherence
+                if f > 0:
+                    gt_prev = samples[i]["latent"][:, :, f - 1 : f, :, :].flatten()
+                    gt_curr = samples[i]["latent"][:, :, f : f + 1, :, :].flatten()
+                    gt_cos = torch.nn.functional.cosine_similarity(
+                        gt_prev.unsqueeze(0), gt_curr.unsqueeze(0),
+                    ).item()
+                    gt_cos_per_sample[i].append(gt_cos)
+
+                    gen_prev = per_sample_generated[i][-2].flatten()
+                    gen_curr = per_sample_generated[i][-1].flatten()
+                    gen_cos = torch.nn.functional.cosine_similarity(
+                        gen_prev.unsqueeze(0), gen_curr.unsqueeze(0),
+                    ).item()
+                    gen_cos_per_sample[i].append(gen_cos)
+
+        # Aggregate: average across samples
+        n_frames = self.ar_frames
+        results: list[FitnessResult] = []
+        for i in range(N):
+            avg_fm = fm_losses[i] / n_frames
+            avg_recon = recon_losses[i] / n_frames
+            avg_lpips = lpips_per_sample[i] / n_frames if self.use_pixel_metrics else 0.0
+            avg_ssim = ssim_per_sample[i] / n_frames if self.use_pixel_metrics else 1.0
+
+            if gt_cos_per_sample[i]:
+                temporal_gap = sum(
+                    abs(g - gt)
+                    for g, gt in zip(gen_cos_per_sample[i], gt_cos_per_sample[i])
+                ) / len(gt_cos_per_sample[i])
+            else:
+                temporal_gap = 0.0
+
+            total = self._compute_fitness_score(
+                avg_fm, avg_recon, temporal_gap, avg_lpips, avg_ssim,
+            )
+            results.append(FitnessResult(
+                total=total,
+                fm_loss=avg_fm,
+                latent_recon=avg_recon,
+                temporal_coh=temporal_gap,
+                pixel_lpips=avg_lpips,
+                pixel_ssim=avg_ssim,
+            ))
+
+        # Average across samples
         n = len(results)
         return FitnessResult(
             total=sum(r.total for r in results) / n,

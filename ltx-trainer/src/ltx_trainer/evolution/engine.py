@@ -96,6 +96,10 @@ class EvolutionConfig:
     data_root: str = "/media/2TB/omnitransfer/data/ditto_subset"
     conditions_dir: str = "conditions_final"
 
+    # Hybrid: Backprop warmup before evolution (PixelGen pattern)
+    warmup_steps: int = 0  # 0 = skip warmup, >0 = backprop for N steps
+    warmup_lr: float = 1e-4  # Learning rate for warmup phase
+
     # Evolution
     population_size: int = 4  # Number of antithetic pairs
     num_generations: int = 200
@@ -108,6 +112,7 @@ class EvolutionConfig:
     # AR Rollout
     ar_frames: int = 4
     num_inference_steps: int = 15
+    guidance_scale: float = 4.0  # CFG scale (1.0 = disabled, 4.0 = matches scd_inference.py)
 
     # Fitness weights (latent-space)
     w_fm_loss: float = 0.5
@@ -145,6 +150,7 @@ class EvolutionState:
     current_noise_scale: float = 0.005
     fitness_history: list[float] = field(default_factory=list)
     generations_without_improvement: int = 0
+    warmup_completed: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -153,6 +159,7 @@ class EvolutionState:
             "current_noise_scale": self.current_noise_scale,
             "fitness_history": self.fitness_history[-100:],
             "generations_without_improvement": self.generations_without_improvement,
+            "warmup_completed": self.warmup_completed,
         }
 
     @classmethod
@@ -163,6 +170,7 @@ class EvolutionState:
             current_noise_scale=d["current_noise_scale"],
             fitness_history=d.get("fitness_history", []),
             generations_without_improvement=d.get("generations_without_improvement", 0),
+            warmup_completed=d.get("warmup_completed", False),
         )
 
 
@@ -181,6 +189,7 @@ class SCDEvolutionEngine:
         self.evaluator: ARRolloutEvaluator | None = None
         self.dataset_samples: list[dict] | None = None
         self.wandb_run = None
+        self._wandb_step_offset = 0  # Offset for W&B steps after warmup
 
     def setup(self) -> None:
         """Initialize model, dataset, perturbation handler, and evaluator."""
@@ -516,10 +525,173 @@ class SCDEvolutionEngine:
             device=self.device,
             dtype=self.dtype,
             distilled=self.config.distilled,
+            guidance_scale=self.config.guidance_scale,
             vae_decoder=self.vae_decoder,
             vae_device=self.config.vae_device if self.config.use_vae_decoder else None,
             lpips_net=self.lpips_net,
         )
+
+    def _backprop_warmup(self) -> None:
+        """Phase 1: Backprop warmup to get decoder LoRA producing coherent frames.
+
+        Runs per-frame flow matching training on decoder LoRA parameters only.
+        This bootstraps the decoder from "mush" to "coherent" before evolution
+        takes over for multi-objective AR quality optimization.
+
+        Adapted from PixelGen's train_hybrid.py pattern.
+        """
+        from dataclasses import replace as dc_replace
+
+        from ltx_core.components.patchifiers import VideoLatentPatchifier, VideoLatentShape
+        from ltx_core.model.transformer.modality import Modality
+        from ltx_core.model.transformer.scd_model import KVCache
+
+        steps = self.config.warmup_steps
+        lr = self.config.warmup_lr
+
+        logger.info("=" * 60)
+        logger.info("PHASE 1: BACKPROP WARMUP (per-frame flow matching)")
+        logger.info(f"  Steps: {steps}")
+        logger.info(f"  Learning rate: {lr}")
+        logger.info("=" * 60)
+
+        # Collect decoder LoRA parameters (lora_A, lora_B in blocks >= encoder_layers)
+        trainable_params = []
+        for name, param in self.scd_model.named_parameters():
+            param.requires_grad = False  # Freeze everything first
+        for name, param in self.perturbation_handler.evolvable_params.items():
+            param.requires_grad = True
+            trainable_params.append(param)
+
+        num_trainable = sum(p.numel() for p in trainable_params)
+        logger.info(f"  Trainable params: {num_trainable:,} ({len(trainable_params)} tensors)")
+
+        optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=0.01)
+        scheduler_lr = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, steps, eta_min=lr * 0.1)
+
+        patchifier = VideoLatentPatchifier(patch_size=1)
+        C, num_frames, H, W = self._latent_shape
+        tpf = H * W  # tokens per frame
+
+        losses = []
+        for step in range(steps):
+            # Random sample
+            idx = random.randint(0, len(self.dataset_samples) - 1)
+            sample = self._load_sample(idx)
+            gt_latent = sample["latent"]  # [1, C, F, H, W]
+            prompt_embeds = sample["prompt_embeds"]
+            prompt_mask = sample.get("prompt_mask")
+
+            # Random frame index (per-frame training — matches AR inference)
+            f_idx = random.randint(0, min(num_frames - 1, self.config.ar_frames - 1))
+
+            # Encoder pass (no grad — frozen encoder LoRA + we only train decoder)
+            with torch.no_grad():
+                # For frame 0, encoder gets zeros; for later frames, use GT (teacher forcing)
+                if f_idx == 0:
+                    enc_input = torch.zeros(1, C, 1, H, W, device=self.device, dtype=self.dtype)
+                else:
+                    enc_input = gt_latent[:, :, f_idx - 1 : f_idx, :, :]
+
+                enc_patch = patchifier.patchify(enc_input)
+                enc_modality = Modality(
+                    enabled=True,
+                    latent=enc_patch,
+                    timesteps=torch.zeros(1, tpf, device=self.device, dtype=self.dtype),
+                    positions=self.evaluator.get_positions_for_frame(f_idx),
+                    context=prompt_embeds,
+                    context_mask=prompt_mask,
+                )
+                kv_cache = KVCache.empty()
+                kv_cache.is_cache_step = True
+                enc_out, _ = self.scd_model.forward_encoder(
+                    video=enc_modality, audio=None, perturbations=None,
+                    kv_cache=kv_cache, tokens_per_frame=tpf,
+                )
+                enc_features = enc_out.x.detach()
+
+            # Decoder pass (with grad — training decoder LoRA)
+            gt_frame = gt_latent[:, :, f_idx : f_idx + 1, :, :]  # [1, C, 1, H, W]
+
+            # Sample random timestep (log-normal like flow matching)
+            t = torch.sigmoid(torch.randn(1, device=self.device) * 0.8 - 0.8).item()
+            t = max(0.001, min(0.999, t))
+
+            # Noisy target: x_t = (1 - t) * x_0 + t * noise
+            noise = torch.randn_like(gt_frame)
+            x_t = (1.0 - t) * gt_frame + t * noise
+
+            # Target velocity: v = noise - x_0 (for flow matching)
+            target_velocity = noise - gt_frame
+
+            # Patchify noisy input
+            noisy_patch = patchifier.patchify(x_t)
+            ts = torch.full((1, tpf), t, device=self.device, dtype=self.dtype)
+
+            dec_modality = Modality(
+                enabled=True,
+                latent=noisy_patch,
+                timesteps=ts,
+                positions=self.evaluator.get_positions_for_frame(f_idx),
+                context=prompt_embeds,
+                context_mask=prompt_mask,
+            )
+
+            pred_velocity, _ = self.scd_model.forward_decoder(
+                video=dec_modality,
+                encoder_features=enc_features,
+                audio=None,
+                perturbations=None,
+            )
+
+            # Unpatchify prediction to match target shape
+            output_shape = VideoLatentShape(batch=1, channels=C, frames=1, height=H, width=W)
+            pred_unpatch = patchifier.unpatchify(pred_velocity, output_shape)
+
+            # Flow matching loss
+            loss = F.mse_loss(pred_unpatch.float(), target_velocity.float())
+
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+            optimizer.step()
+            scheduler_lr.step()
+
+            losses.append(loss.item())
+
+            if step % 10 == 0 or step == steps - 1:
+                avg_loss = sum(losses[-10:]) / len(losses[-10:])
+                current_lr = scheduler_lr.get_last_lr()[0]
+                logger.info(
+                    f"  Warmup step {step:4d}/{steps} | loss={avg_loss:.4f} | lr={current_lr:.6f}"
+                )
+                if self.wandb_run:
+                    self.wandb_run.log(
+                        {"warmup/loss": avg_loss, "warmup/lr": current_lr},
+                        step=step,
+                    )
+
+        # Freeze all params again (evolution is gradient-free)
+        for param in trainable_params:
+            param.requires_grad = False
+
+        # Update perturbation handler's original_values to the warmed-up weights
+        for name in self.perturbation_handler.evolvable_params:
+            self.perturbation_handler.original_values[name] = (
+                self.perturbation_handler.evolvable_params[name].data.clone().detach()
+            )
+
+        final_loss = sum(losses[-50:]) / min(50, len(losses))
+        logger.info(f"Warmup complete! Final avg loss: {final_loss:.4f}")
+        logger.info("=" * 60)
+
+        # Set W&B step offset so evolution steps continue after warmup
+        self._wandb_step_offset = steps
+        self.state.warmup_completed = True
+
+        # Save warmup checkpoint
+        self.save_checkpoint("warmup_done")
+        self.save_full_lora("lora_warmup_done")
 
     def _init_wandb(self) -> None:
         """Initialize W&B logging if enabled."""
@@ -546,6 +718,7 @@ class SCDEvolutionEngine:
                     "w_pixel_lpips": self.config.w_pixel_lpips,
                     "w_pixel_ssim": self.config.w_pixel_ssim,
                     "eval_batch_size": self.config.eval_batch_size,
+                    "guidance_scale": self.config.guidance_scale,
                     "use_vae_decoder": self.config.use_vae_decoder,
                     "encoder_layers": self.config.encoder_layers,
                     "decoder_combine": self.config.decoder_combine,
@@ -620,8 +793,41 @@ class SCDEvolutionEngine:
             seed=self.config.seed,
         )
 
+    @staticmethod
+    def _fitness_shape(fitness_diffs: dict[int, float]) -> dict[int, float]:
+        """Apply rank-based fitness shaping (CMA-ES style utilities).
+
+        Transforms raw fitness differences into rank-based utilities so the
+        ES gradient is scale-invariant and robust to outliers. Top-ranked
+        perturbations get positive weight, bottom-ranked get zero.
+
+        Returns shaped diffs with the same keys but utility-based values.
+        """
+        import math
+
+        items = sorted(fitness_diffs.items(), key=lambda x: x[1], reverse=True)
+        n = len(items)
+        if n == 0:
+            return fitness_diffs
+
+        # CMA-ES log-linear utilities: max(0, log(n/2 + 1) - log(rank))
+        log_n_half = math.log(n / 2.0 + 1.0)
+        raw_utilities = [max(0.0, log_n_half - math.log(i + 1)) for i in range(n)]
+
+        # Normalize to zero-mean (so bottom half contributes zero, not negative)
+        total = sum(raw_utilities)
+        if total < 1e-8:
+            return {seed: 0.0 for seed, _ in items}
+
+        utilities = [(u / total) - (1.0 / n) for u in raw_utilities]
+
+        return {seed: utility for (seed, _), utility in zip(items, utilities)}
+
     def run_generation(self) -> dict:
         """Run one generation: evaluate antithetic pairs, update weights.
+
+        Uses fitness shaping (rank-based utilities) and Adam momentum for
+        stable, efficient gradient estimation across generations.
 
         Returns dict with generation stats.
         """
@@ -685,10 +891,14 @@ class SCDEvolutionEngine:
             del samples
             torch.cuda.empty_cache()
 
-        # ES gradient update
+        # Fitness shaping: transform raw diffs to rank-based utilities
+        raw_mean_diff = sum(abs(d) for d in fitness_diffs.values()) / len(fitness_diffs)
+        shaped_diffs = self._fitness_shape(fitness_diffs)
+
+        # ES gradient update (with Adam momentum in perturbation handler)
         num_updates = self.perturbation_handler.update_from_votes(
             seeds=seeds,
-            fitness_diffs=fitness_diffs,
+            fitness_diffs=shaped_diffs,
             update_scale=self.config.update_scale,
             noise_scale=self.state.current_noise_scale,
         )
@@ -717,7 +927,7 @@ class SCDEvolutionEngine:
             "best_fitness": self.state.best_fitness,
             "mean_pos_fitness": sum(all_pos_fitness) / len(all_pos_fitness),
             "mean_neg_fitness": sum(all_neg_fitness) / len(all_neg_fitness),
-            "mean_fitness_diff": sum(abs(d) for d in fitness_diffs.values()) / len(fitness_diffs),
+            "mean_fitness_diff": raw_mean_diff,
             "num_updates": num_updates,
             "noise_scale": self.state.current_noise_scale,
             "gens_no_improve": self.state.generations_without_improvement,
@@ -737,8 +947,9 @@ class SCDEvolutionEngine:
         save_dict = {k: v.float().cpu() for k, v in evolved_state.items()}
         save_file(save_dict, str(param_path))
 
-        # Save evolution state (includes normalization for resumption)
+        # Save evolution state (includes normalization + adam_step for resumption)
         state_dict = self.state.to_dict()
+        state_dict["adam_step"] = self.perturbation_handler.adam_step
         if self.evaluator and self.evaluator.normalization:
             norm = self.evaluator.normalization
             state_dict["normalization"] = {
@@ -824,6 +1035,16 @@ class SCDEvolutionEngine:
                 )
                 logger.info("Restored fitness normalization from checkpoint")
 
+            # Restore Adam step counter
+            if "adam_step" in state_data:
+                self.perturbation_handler.adam_step = state_data["adam_step"]
+                logger.info(f"Restored Adam step: {state_data['adam_step']}")
+
+            # Restore W&B step offset if warmup was previously completed
+            if self.state.warmup_completed and self.config.warmup_steps > 0:
+                self._wandb_step_offset = self.config.warmup_steps
+                logger.info(f"W&B step offset set to {self._wandb_step_offset} (warmup was completed)")
+
     @torch.inference_mode()
     def _log_reconstruction_images(self, gen: int) -> None:
         """Log GT vs predicted frame images to W&B for visual quality tracking.
@@ -831,7 +1052,7 @@ class SCDEvolutionEngine:
         Runs a short AR rollout (2 frames), decodes via VAE on cuda:1, and logs
         a side-by-side comparison grid: [GT Frame 0 | Pred Frame 0 | GT Frame 1 | Pred Frame 1].
         """
-        if not self.wandb_run or not self.vae_decoder:
+        if not self.vae_decoder:
             return
 
         try:
@@ -855,6 +1076,12 @@ class SCDEvolutionEngine:
             prev_enc_features = None
             gt_frames_decoded = []
             pred_frames_decoded = []
+
+            # CFG: create null embeddings for unconditional pass
+            use_cfg = self.config.guidance_scale > 1.0
+            if use_cfg:
+                null_embeds = torch.zeros_like(sample["prompt_embeds"])
+                null_mask = torch.zeros_like(sample["prompt_mask"]) if sample.get("prompt_mask") is not None else None
 
             output_shape = VideoLatentShape(batch=1, channels=C, frames=1, height=H, width=W)
             num_vis_frames = min(2, self.config.ar_frames)
@@ -901,6 +1128,21 @@ class SCDEvolutionEngine:
                         video=dec_modality, encoder_features=dec_enc_ctx,
                         audio=None, perturbations=None,
                     )
+
+                    # CFG: unconditional pass + guided combination
+                    if use_cfg:
+                        uncond_modality = Modality(
+                            enabled=True, latent=noisy_patch, timesteps=ts,
+                            positions=self.evaluator.get_positions_for_frame(f_idx),
+                            context=null_embeds,
+                            context_mask=null_mask,
+                        )
+                        velocity_uncond, _ = self.scd_model.forward_decoder(
+                            video=uncond_modality, encoder_features=dec_enc_ctx,
+                            audio=None, perturbations=None,
+                        )
+                        velocity = velocity_uncond + self.config.guidance_scale * (velocity - velocity_uncond)
+
                     vel_unpatch = patchifier.unpatchify(velocity, output_shape)
                     x_t = x_t + (sigma_next - sigma) * vel_unpatch
 
@@ -927,24 +1169,35 @@ class SCDEvolutionEngine:
                 pred_frames_decoded.append(to_numpy(pred_pixels))
 
             # Build side-by-side grids per frame and log
+            from PIL import Image as PILImage
+
             images = {}
+            all_grids = []
             for i in range(num_vis_frames):
                 gt_img = gt_frames_decoded[i]
                 pred_img = pred_frames_decoded[i]
                 # Horizontal concat: [GT | Prediction]
                 grid = np.concatenate([gt_img, pred_img], axis=1)
+                all_grids.append(grid)
                 images[f"recon/frame_{i}_GT_vs_Pred"] = wandb.Image(
                     grid, caption=f"Gen {gen} | Frame {i} | Left=GT Right=Pred"
                 )
 
-            self.wandb_run.log(images, step=gen + 1)
-            logger.info(f"Logged reconstruction images for gen {gen}")
+            # Save locally: vertical stack of all frame grids
+            full_grid = np.concatenate(all_grids, axis=0)
+            local_path = Path(self.config.output_dir) / f"debug_recon_gen_{gen:04d}.png"
+            PILImage.fromarray(full_grid).save(local_path)
+            logger.info(f"Saved local debug image: {local_path}")
+
+            if self.wandb_run:
+                self.wandb_run.log(images, step=self._wandb_step_offset + gen + 1)
+            logger.info(f"Saved debug image gen {gen}")
 
         except Exception as e:
             logger.warning(f"Failed to log reconstruction images: {e}")
 
     def run(self) -> None:
-        """Full evolution loop."""
+        """Full hybrid loop: optional backprop warmup → evolution."""
         logger.info("=" * 60)
         logger.info("SCD Evolution — Starting")
         logger.info(f"  Population: {self.config.population_size} pairs")
@@ -952,7 +1205,15 @@ class SCDEvolutionEngine:
         logger.info(f"  AR frames: {self.config.ar_frames}")
         logger.info(f"  Inference steps: {self.config.num_inference_steps}")
         logger.info(f"  Evolved params: {self.perturbation_handler.num_params:,}")
+        if self.config.warmup_steps > 0:
+            logger.info(f"  Warmup steps: {self.config.warmup_steps} (lr={self.config.warmup_lr})")
         logger.info("=" * 60)
+
+        # Phase 1: Backprop warmup (if configured and not already done)
+        if self.config.warmup_steps > 0 and not self.state.warmup_completed:
+            self._backprop_warmup()
+            # Log debug image after warmup to show improvement
+            self._log_reconstruction_images(-1)  # gen=-1 → debug_recon_gen_-001.png
 
         # Evaluate baseline (unperturbed) and compute normalization
         baseline = self._evaluate_baseline()
@@ -979,7 +1240,7 @@ class SCDEvolutionEngine:
                     "baseline/latent_recon": baseline.latent_recon,
                     "baseline/temporal_coh": baseline.temporal_coh,
                 },
-                step=0,
+                step=self._wandb_step_offset,
             )
 
         start_gen = self.state.generation
@@ -1015,7 +1276,7 @@ class SCDEvolutionEngine:
                         "evolution/gens_no_improve": stats["gens_no_improve"],
                         "evolution/time_per_gen": elapsed,
                     },
-                    step=gen + 1,
+                    step=self._wandb_step_offset + gen + 1,
                 )
 
             # Checkpoint
@@ -1023,9 +1284,8 @@ class SCDEvolutionEngine:
                 self.save_checkpoint(f"gen_{gen + 1:04d}")
                 self.save_full_lora(f"lora_evolved_gen_{gen + 1:04d}")
 
-            # Log reconstruction images to W&B
-            if (gen + 1) % self.config.image_log_every == 0:
-                self._log_reconstruction_images(gen)
+            # Log reconstruction images: local + W&B every gen
+            self._log_reconstruction_images(gen)
 
             # Early stopping (50 generations without improvement)
             if self.state.generations_without_improvement >= 50:
@@ -1053,6 +1313,6 @@ class SCDEvolutionEngine:
                     "final/temporal_coh": final.temporal_coh,
                     "final/improvement": final.total - baseline.total,
                 },
-                step=self.state.generation,
+                step=self._wandb_step_offset + self.state.generation,
             )
             self.wandb_run.finish()

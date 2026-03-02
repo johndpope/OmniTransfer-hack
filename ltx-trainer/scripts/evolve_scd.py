@@ -74,6 +74,10 @@ def parse_args() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
     )
     p.add_argument("--conditions-dir", default="conditions_final")
 
+    # Hybrid warmup
+    p.add_argument("--warmup-steps", type=int, default=0, help="Backprop warmup steps (0=skip)")
+    p.add_argument("--warmup-lr", type=float, default=1e-4, help="Learning rate for warmup phase")
+
     # Evolution
     p.add_argument("--population-size", type=int, default=4, help="Antithetic pairs per generation")
     p.add_argument("--num-generations", type=int, default=200)
@@ -91,6 +95,7 @@ def parse_args() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
     # AR Rollout
     p.add_argument("--ar-frames", type=int, default=4, help="Frames per AR evaluation")
     p.add_argument("--num-inference-steps", type=int, default=15, help="Denoising steps (30→15 for speed)")
+    p.add_argument("--guidance-scale", type=float, default=4.0, help="CFG scale (1.0=disabled, 4.0=matches scd_inference)")
 
     # Fitness weights
     p.add_argument("--w-fm-loss", type=float, default=0.5, help="Weight for FM velocity MSE")
@@ -156,6 +161,9 @@ def main() -> None:
         "root": "data_root",
         "data_root": "data_root",
         "conditions_dir": "conditions_dir",
+        "steps": "warmup_steps",
+        "warmup_steps": "warmup_steps",
+        "warmup_lr": "warmup_lr",
         "population_size": "population_size",
         "num_generations": "num_generations",
         "noise_scale": "noise_scale",
@@ -165,6 +173,7 @@ def main() -> None:
         "eval_batch_size": "eval_batch_size",
         "ar_frames": "ar_frames",
         "num_inference_steps": "num_inference_steps",
+        "guidance_scale": "guidance_scale",
         "w_fm_loss": "w_fm_loss",
         "w_latent_recon": "w_latent_recon",
         "w_temporal_coherence": "w_temporal_coherence",
@@ -202,6 +211,8 @@ def main() -> None:
         "quantization": "quantization",
         "data_root": "data_root",
         "conditions_dir": "conditions_dir",
+        "warmup_steps": "warmup_steps",
+        "warmup_lr": "warmup_lr",
         "population_size": "population_size",
         "num_generations": "num_generations",
         "noise_scale": "noise_scale",
@@ -211,6 +222,7 @@ def main() -> None:
         "eval_batch_size": "eval_batch_size",
         "ar_frames": "ar_frames",
         "num_inference_steps": "num_inference_steps",
+        "guidance_scale": "guidance_scale",
         "w_fm_loss": "w_fm_loss",
         "w_latent_recon": "w_latent_recon",
         "w_temporal_coherence": "w_temporal_coherence",
@@ -267,10 +279,13 @@ def main() -> None:
     print(f"  Data:            {config.data_root}")
     print(f"  Output:          {config.output_dir}")
     print(f"  Quantization:    {config.quantization}")
+    if config.warmup_steps > 0:
+        print(f"  Warmup:          {config.warmup_steps} steps (lr={config.warmup_lr})")
     print(f"  Population:      {config.population_size} pairs")
     print(f"  Generations:     {config.num_generations}")
     print(f"  AR frames:       {config.ar_frames}")
     print(f"  Inference steps: {config.num_inference_steps}")
+    print(f"  Guidance scale:  {config.guidance_scale}")
     print(f"  Eval batch size: {config.eval_batch_size}")
     print(f"  Noise:           {config.noise_scale} (decay={config.noise_decay})")
     print(f"  Update scale:    {config.update_scale}")

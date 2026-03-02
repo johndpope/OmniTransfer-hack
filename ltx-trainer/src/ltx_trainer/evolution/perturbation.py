@@ -131,6 +131,7 @@ class SelectiveLoRAPerturbation:
 
     Only targets lora_A / lora_B weights in decoder blocks (index >= encoder_layers).
     Stores original parameter values for revert / ES gradient update.
+    Uses Adam-style momentum for gradient smoothing across generations.
     """
 
     def __init__(
@@ -140,12 +141,21 @@ class SelectiveLoRAPerturbation:
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
         use_gaussian: bool = True,
+        adam_beta1: float = 0.9,
+        adam_beta2: float = 0.999,
+        adam_eps: float = 1e-8,
     ):
         self.model = model
         self.encoder_layers = encoder_layers
         self.device = device
         self.dtype = dtype
         self.use_gaussian = use_gaussian
+
+        # Adam hyperparameters
+        self.beta1 = adam_beta1
+        self.beta2 = adam_beta2
+        self.adam_eps = adam_eps
+        self.adam_step = 0  # For bias correction
 
         # Find decoder LoRA parameters
         self.evolvable_params: dict[str, nn.Parameter] = {}
@@ -159,6 +169,13 @@ class SelectiveLoRAPerturbation:
         # Noise cache: seed → {param_name → noise_tensor}
         # Populated during apply_perturbation, consumed in update_from_votes
         self._noise_cache: dict[int, dict[str, torch.Tensor]] = {}
+
+        # Adam state: first and second moment estimates per parameter
+        self._m: dict[str, torch.Tensor] = {}  # First moment (momentum)
+        self._v: dict[str, torch.Tensor] = {}  # Second moment (RMS)
+        for name, val in self.original_values.items():
+            self._m[name] = torch.zeros_like(val)
+            self._v[name] = torch.zeros_like(val)
 
         self.num_params = sum(p.numel() for p in self.evolvable_params.values())
         logger.info(
@@ -206,7 +223,10 @@ class SelectiveLoRAPerturbation:
         update_scale: float,
         noise_scale: float,
     ) -> int:
-        """Apply ES gradient update: w += lr * sum((F+ - F-) * eps / (2*sigma)).
+        """Apply ES gradient update with Adam momentum.
+
+        Computes raw ES gradient: g = sum((F+ - F-) * eps / (2*sigma)),
+        then applies Adam-style momentum/RMS for smoothing across generations.
 
         Uses cached noise from apply_perturbation when available, falling back
         to regeneration from hash seeds. Caching avoids ~768 × len(seeds)
@@ -215,6 +235,7 @@ class SelectiveLoRAPerturbation:
         Args:
             seeds: Seeds that were evaluated this generation.
             fitness_diffs: Map seed -> (fitness_pos - fitness_neg).
+                Should be pre-shaped (rank-based utilities) for best results.
             update_scale: Learning rate for weight update.
             noise_scale: Perturbation scale (sigma) for gradient normalization.
 
@@ -254,15 +275,38 @@ class SelectiveLoRAPerturbation:
         self._noise_cache.clear()
 
         if num_contributing > 0:
-            lr = update_scale / num_contributing
+            # Normalize raw gradient by number of contributing seeds
+            for name in gradient_estimate:
+                gradient_estimate[name] /= num_contributing
+
+            # Adam update
+            self.adam_step += 1
+            t = self.adam_step
+            bc1 = 1.0 - self.beta1 ** t  # Bias correction for first moment
+            bc2 = 1.0 - self.beta2 ** t  # Bias correction for second moment
+
             for name in self.evolvable_params.keys():
                 grad = gradient_estimate[name]
-                # Clip gradient to prevent explosion
-                grad_norm = torch.norm(grad).item()
-                if grad_norm > 1.0:
-                    grad = grad * (1.0 / grad_norm)
-                # Gradient ASCENT (higher fitness = better)
-                self.original_values[name] += lr * grad
+
+                # Update moments
+                self._m[name].mul_(self.beta1).add_(grad, alpha=1.0 - self.beta1)
+                self._v[name].mul_(self.beta2).addcmul_(grad, grad, value=1.0 - self.beta2)
+
+                # Bias-corrected estimates
+                m_hat = self._m[name] / bc1
+                v_hat = self._v[name] / bc2
+
+                # Adam step (gradient ASCENT — higher fitness = better)
+                step = update_scale * m_hat / (v_hat.sqrt() + self.adam_eps)
+
+                # Clip step to prevent explosion
+                step_norm = torch.norm(step).item()
+                param_norm = torch.norm(self.original_values[name]).item()
+                max_step = max(param_norm * 0.1, 1e-3)  # Cap at 10% of param magnitude
+                if step_norm > max_step:
+                    step = step * (max_step / step_norm)
+
+                self.original_values[name] += step
 
             # Copy updated originals to model
             for name, param in self.evolvable_params.items():
@@ -271,13 +315,26 @@ class SelectiveLoRAPerturbation:
         return num_contributing
 
     def state_dict(self) -> dict[str, torch.Tensor]:
-        """Return evolved parameter values (for checkpointing)."""
-        return {name: val.clone() for name, val in self.original_values.items()}
+        """Return evolved parameter values + Adam state (for checkpointing)."""
+        sd = {name: val.clone() for name, val in self.original_values.items()}
+        # Save Adam state with prefixed keys
+        for name in self._m:
+            sd[f"__adam_m__{name}"] = self._m[name].clone()
+            sd[f"__adam_v__{name}"] = self._v[name].clone()
+        return sd
 
     def load_state_dict(self, state_dict: dict[str, torch.Tensor]) -> None:
-        """Load previously evolved parameter values."""
+        """Load previously evolved parameter values + Adam state."""
         for name, val in state_dict.items():
-            if name in self.original_values:
+            if name.startswith("__adam_m__"):
+                param_name = name[len("__adam_m__"):]
+                if param_name in self._m:
+                    self._m[param_name].copy_(val)
+            elif name.startswith("__adam_v__"):
+                param_name = name[len("__adam_v__"):]
+                if param_name in self._v:
+                    self._v[param_name].copy_(val)
+            elif name in self.original_values:
                 self.original_values[name].copy_(val)
         for name, param in self.evolvable_params.items():
             param.data.copy_(self.original_values[name])

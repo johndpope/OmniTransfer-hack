@@ -126,6 +126,7 @@ class EvolutionConfig:
     output_dir: str = "/media/2TB/omnitransfer/output/scd_evolution"
     checkpoint_every: int = 25
     log_every: int = 5
+    image_log_every: int = 25  # Log reconstruction images to W&B every N generations
 
     # W&B
     wandb_enabled: bool = True
@@ -823,6 +824,125 @@ class SCDEvolutionEngine:
                 )
                 logger.info("Restored fitness normalization from checkpoint")
 
+    @torch.inference_mode()
+    def _log_reconstruction_images(self, gen: int) -> None:
+        """Log GT vs predicted frame images to W&B for visual quality tracking.
+
+        Runs a short AR rollout (2 frames), decodes via VAE on cuda:1, and logs
+        a side-by-side comparison grid: [GT Frame 0 | Pred Frame 0 | GT Frame 1 | Pred Frame 1].
+        """
+        if not self.wandb_run or not self.vae_decoder:
+            return
+
+        try:
+            import wandb
+            import numpy as np
+
+            sample_idx = random.randint(0, len(self.dataset_samples) - 1)
+            sample = self._load_sample(sample_idx)
+
+            from ltx_core.components.patchifiers import VideoLatentPatchifier, VideoLatentShape
+            from ltx_core.model.transformer.modality import Modality
+            from ltx_core.model.transformer.scd_model import KVCache
+
+            patchifier = VideoLatentPatchifier(patch_size=1)
+            C, F, H, W = self._latent_shape
+            sigmas = self.evaluator._get_sigmas()
+            generator = torch.Generator(device=self.device).manual_seed(self.config.seed + gen)
+
+            kv_cache = KVCache.empty()
+            kv_cache.is_cache_step = True
+            prev_enc_features = None
+            gt_frames_decoded = []
+            pred_frames_decoded = []
+
+            output_shape = VideoLatentShape(batch=1, channels=C, frames=1, height=H, width=W)
+            num_vis_frames = min(2, self.config.ar_frames)
+
+            for f_idx in range(num_vis_frames):
+                # Encoder
+                if f_idx == 0:
+                    enc_latent = torch.zeros(1, C, 1, H, W, device=self.device, dtype=self.dtype)
+                else:
+                    enc_latent = x_t  # AR: use own prediction
+
+                patchified_enc = patchifier.patchify(enc_latent)
+                enc_modality = Modality(
+                    enabled=True,
+                    latent=patchified_enc,
+                    timesteps=torch.zeros(1, H * W, device=self.device, dtype=self.dtype),
+                    positions=self.evaluator.get_positions_for_frame(f_idx),
+                    context=sample["prompt_embeds"],
+                    context_mask=sample.get("prompt_mask"),
+                )
+                enc_out, _ = self.scd_model.forward_encoder(
+                    video=enc_modality, audio=None, perturbations=None,
+                    kv_cache=kv_cache, tokens_per_frame=H * W,
+                )
+                current_enc = enc_out.x.detach()
+                dec_enc_ctx = prev_enc_features if prev_enc_features is not None else torch.zeros(
+                    1, H * W, current_enc.shape[-1], device=self.device, dtype=self.dtype,
+                )
+                prev_enc_features = current_enc
+
+                # Decoder: denoise
+                x_t = torch.randn(1, C, 1, H, W, device=self.device, dtype=self.dtype, generator=generator)
+                for step in range(self.evaluator.num_inference_steps):
+                    sigma, sigma_next = sigmas[step], sigmas[step + 1]
+                    noisy_patch = patchifier.patchify(x_t)
+                    ts = torch.full((1, H * W), sigma.item(), device=self.device, dtype=self.dtype)
+                    dec_modality = Modality(
+                        enabled=True, latent=noisy_patch, timesteps=ts,
+                        positions=self.evaluator.get_positions_for_frame(f_idx),
+                        context=sample["prompt_embeds"],
+                        context_mask=sample.get("prompt_mask"),
+                    )
+                    velocity, _ = self.scd_model.forward_decoder(
+                        video=dec_modality, encoder_features=dec_enc_ctx,
+                        audio=None, perturbations=None,
+                    )
+                    vel_unpatch = patchifier.unpatchify(velocity, output_shape)
+                    x_t = x_t + (sigma_next - sigma) * vel_unpatch
+
+                # Decode both GT and prediction via VAE on cuda:1
+                gt_frame = sample["latent"][:, :, f_idx:f_idx + 1, :, :]
+                vae_device = torch.device(self.config.vae_device)
+
+                gt_pixels = self.vae_decoder(gt_frame.to(vae_device, self.dtype))
+                pred_pixels = self.vae_decoder(x_t.to(vae_device, self.dtype))
+
+                # [1, C, 1, pH, pW] or [1, 3, pH, pW]
+                if gt_pixels.dim() == 5:
+                    gt_pixels = gt_pixels[:, :, 0]
+                if pred_pixels.dim() == 5:
+                    pred_pixels = pred_pixels[:, :, 0]
+
+                # Normalize [-1,1] → [0,255] uint8
+                def to_numpy(t: torch.Tensor) -> np.ndarray:
+                    img = t[0].clamp(-1, 1).float().cpu().numpy()
+                    img = ((img + 1) / 2 * 255).clip(0, 255).astype(np.uint8)
+                    return img.transpose(1, 2, 0)  # CHW → HWC
+
+                gt_frames_decoded.append(to_numpy(gt_pixels))
+                pred_frames_decoded.append(to_numpy(pred_pixels))
+
+            # Build side-by-side grids per frame and log
+            images = {}
+            for i in range(num_vis_frames):
+                gt_img = gt_frames_decoded[i]
+                pred_img = pred_frames_decoded[i]
+                # Horizontal concat: [GT | Prediction]
+                grid = np.concatenate([gt_img, pred_img], axis=1)
+                images[f"recon/frame_{i}_GT_vs_Pred"] = wandb.Image(
+                    grid, caption=f"Gen {gen} | Frame {i} | Left=GT Right=Pred"
+                )
+
+            self.wandb_run.log(images, step=gen + 1)
+            logger.info(f"Logged reconstruction images for gen {gen}")
+
+        except Exception as e:
+            logger.warning(f"Failed to log reconstruction images: {e}")
+
     def run(self) -> None:
         """Full evolution loop."""
         logger.info("=" * 60)
@@ -902,6 +1022,10 @@ class SCDEvolutionEngine:
             if (gen + 1) % self.config.checkpoint_every == 0:
                 self.save_checkpoint(f"gen_{gen + 1:04d}")
                 self.save_full_lora(f"lora_evolved_gen_{gen + 1:04d}")
+
+            # Log reconstruction images to W&B
+            if (gen + 1) % self.config.image_log_every == 0:
+                self._log_reconstruction_images(gen)
 
             # Early stopping (50 generations without improvement)
             if self.state.generations_without_improvement >= 50:

@@ -110,6 +110,7 @@ def parse_args() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
     )
     p.add_argument("--checkpoint-every", type=int, default=25)
     p.add_argument("--log-every", type=int, default=5)
+    p.add_argument("--image-log-every", type=int, default=25, help="Log reconstruction images every N gens")
 
     # W&B
     p.add_argument("--wandb-project", default="scd-evolution")
@@ -175,6 +176,7 @@ def main() -> None:
         "output_dir": "output_dir",
         "checkpoint_every": "checkpoint_every",
         "log_every": "log_every",
+        "image_log_every": "image_log_every",
         "enabled": "wandb_enabled",
         "wandb_enabled": "wandb_enabled",
         "project": "wandb_project",
@@ -218,6 +220,7 @@ def main() -> None:
         "output_dir": "output_dir",
         "checkpoint_every": "checkpoint_every",
         "log_every": "log_every",
+        "image_log_every": "image_log_every",
         "wandb_project": "wandb_project",
         "seed": "seed",
     }

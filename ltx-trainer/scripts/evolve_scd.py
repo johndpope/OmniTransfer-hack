@@ -41,7 +41,7 @@ import yaml
 os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
     p = argparse.ArgumentParser(
         description="SCD Evolution — gradient-free AR quality fine-tuning",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -121,11 +121,11 @@ def parse_args() -> argparse.Namespace:
     # Misc
     p.add_argument("--seed", type=int, default=42)
 
-    return p.parse_args()
+    return p.parse_args(), p
 
 
 def main() -> None:
-    args = parse_args()
+    args, p = parse_args()
 
     # Load YAML config if provided
     yaml_config = {}
@@ -187,44 +187,58 @@ def main() -> None:
         if yaml_key in flat:
             config_kwargs[field_name] = flat[yaml_key]
 
-    # CLI overrides (only set if explicitly provided)
-    cli_overrides = {
-        "checkpoint": args.checkpoint,
-        "lora_path": args.lora_path,
-        "encoder_layers": args.encoder_layers,
-        "decoder_combine": args.decoder_combine,
-        "quantization": args.quantization,
-        "distilled": args.distilled,
-        "data_root": args.data_root,
-        "conditions_dir": args.conditions_dir,
-        "population_size": args.population_size,
-        "num_generations": args.num_generations,
-        "noise_scale": args.noise_scale,
-        "noise_decay": args.noise_decay,
-        "noise_min": args.noise_min,
-        "update_scale": args.update_scale,
-        "eval_batch_size": args.eval_batch_size,
-        "ar_frames": args.ar_frames,
-        "num_inference_steps": args.num_inference_steps,
-        "w_fm_loss": args.w_fm_loss,
-        "w_latent_recon": args.w_latent_recon,
-        "w_temporal_coherence": args.w_temporal_coherence,
-        "w_pixel_lpips": args.w_pixel_lpips,
-        "w_pixel_ssim": args.w_pixel_ssim,
-        "use_vae_decoder": args.use_vae_decoder,
-        "vae_device": args.vae_device,
-        "output_dir": args.output_dir,
-        "checkpoint_every": args.checkpoint_every,
-        "log_every": args.log_every,
-        "wandb_enabled": not args.no_wandb,
-        "wandb_project": args.wandb_project,
-        "seed": args.seed,
+    # CLI overrides — only apply if the user EXPLICITLY provided the argument.
+    # argparse defaults are always non-None, so we compare against the parser's defaults
+    # to distinguish "user provided" from "default value".
+    defaults = p.parse_args([])  # Parse with no args to get defaults
+
+    cli_map = {
+        "checkpoint": "checkpoint",
+        "lora_path": "lora_path",
+        "encoder_layers": "encoder_layers",
+        "decoder_combine": "decoder_combine",
+        "quantization": "quantization",
+        "data_root": "data_root",
+        "conditions_dir": "conditions_dir",
+        "population_size": "population_size",
+        "num_generations": "num_generations",
+        "noise_scale": "noise_scale",
+        "noise_decay": "noise_decay",
+        "noise_min": "noise_min",
+        "update_scale": "update_scale",
+        "eval_batch_size": "eval_batch_size",
+        "ar_frames": "ar_frames",
+        "num_inference_steps": "num_inference_steps",
+        "w_fm_loss": "w_fm_loss",
+        "w_latent_recon": "w_latent_recon",
+        "w_temporal_coherence": "w_temporal_coherence",
+        "w_pixel_lpips": "w_pixel_lpips",
+        "w_pixel_ssim": "w_pixel_ssim",
+        "vae_device": "vae_device",
+        "output_dir": "output_dir",
+        "checkpoint_every": "checkpoint_every",
+        "log_every": "log_every",
+        "wandb_project": "wandb_project",
+        "seed": "seed",
     }
 
-    # Only override if CLI provided non-default values
-    for key, val in cli_overrides.items():
-        if val is not None:
-            config_kwargs[key] = val
+    for cli_attr, config_field in cli_map.items():
+        cli_val = getattr(args, cli_attr)
+        default_val = getattr(defaults, cli_attr)
+        if cli_val != default_val:
+            config_kwargs[config_field] = cli_val
+
+    # Boolean flags: only override if explicitly set on CLI
+    if args.distilled:
+        config_kwargs["distilled"] = True
+    if args.use_vae_decoder:
+        config_kwargs["use_vae_decoder"] = True
+    if args.no_wandb:
+        config_kwargs["wandb_enabled"] = False
+
+    # lora_path via CLI always overrides (it's commonly passed explicitly)
+    if args.lora_path is not None:
+        config_kwargs["lora_path"] = args.lora_path
 
     config = EvolutionConfig(**config_kwargs)
 

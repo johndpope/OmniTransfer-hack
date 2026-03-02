@@ -28,6 +28,34 @@ from ltx_trainer import logger
 
 
 @dataclass
+class FitnessNormalization:
+    """Per-component scale factors so each metric contributes ~1.0 at baseline.
+
+    Computed from baseline evaluation; applied in fitness total computation.
+    Without normalization, fm_loss (~5.0) dominates recon (~2.0) and tcoh (~0.8),
+    meaning the ES gradient mostly optimizes for flow matching and ignores
+    temporal coherence and perceptual quality.
+    """
+
+    fm_scale: float = 1.0
+    recon_scale: float = 1.0
+    tcoh_scale: float = 1.0
+    lpips_scale: float = 1.0
+    ssim_scale: float = 1.0
+
+    @classmethod
+    def from_baseline(cls, baseline: "FitnessResult") -> "FitnessNormalization":
+        """Compute normalization so each raw metric maps to ~1.0."""
+        return cls(
+            fm_scale=1.0 / max(baseline.fm_loss, 1e-6),
+            recon_scale=1.0 / max(baseline.latent_recon, 1e-6),
+            tcoh_scale=1.0 / max(baseline.temporal_coh, 1e-6),
+            lpips_scale=1.0 / max(baseline.pixel_lpips, 1e-6) if baseline.pixel_lpips > 0 else 1.0,
+            ssim_scale=1.0 / max(baseline.pixel_ssim, 1e-6) if baseline.pixel_ssim > 0 else 1.0,
+        )
+
+
+@dataclass
 class FitnessResult:
     """Combined fitness score from AR rollout evaluation."""
 
@@ -77,6 +105,7 @@ class ARRolloutEvaluator:
         w_pixel_ssim: float = 0.0,
         device: torch.device | str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
+        distilled: bool = False,
         # Dual-GPU / pixel metrics
         vae_decoder: torch.nn.Module | None = None,
         vae_device: torch.device | str | None = None,
@@ -89,7 +118,11 @@ class ARRolloutEvaluator:
         self.latent_h = latent_h
         self.latent_w = latent_w
         self.latent_channels = latent_channels
-        self.num_inference_steps = num_inference_steps
+        # Distilled model has a fixed 8-step schedule
+        if distilled:
+            self.num_inference_steps = 8
+        else:
+            self.num_inference_steps = num_inference_steps
         self.ar_frames = ar_frames
 
         # Fitness weights
@@ -102,6 +135,10 @@ class ARRolloutEvaluator:
 
         self.device = torch.device(device)
         self.dtype = dtype
+        self.distilled = distilled
+
+        # Fitness normalization (set after first baseline evaluation)
+        self.normalization: FitnessNormalization | None = None
 
         # Dual-GPU: VAE decoder on secondary GPU
         self.vae_decoder = vae_decoder
@@ -121,17 +158,33 @@ class ARRolloutEvaluator:
         self._sigmas: Tensor | None = None
 
     def _get_sigmas(self) -> Tensor:
-        """Lazily compute sigma schedule matching training distribution."""
+        """Lazily compute sigma schedule matching training/inference distribution."""
         if self._sigmas is not None:
             return self._sigmas
 
-        from ltx_core.components.schedulers import LTX2Scheduler
+        if self.distilled:
+            # Distilled model uses a predefined 8-step schedule (from ltx-pipelines).
+            # This schedule is heavily front-loaded: steps 1-4 are tiny deltas,
+            # steps 5-8 are large jumps, matching the teacher's trajectory.
+            DISTILLED_SIGMA_VALUES = [
+                1.0, 0.99375, 0.9875, 0.98125, 0.975,
+                0.909375, 0.725, 0.421875, 0.0,
+            ]
+            self._sigmas = torch.tensor(
+                DISTILLED_SIGMA_VALUES, device=self.device, dtype=self.dtype,
+            )
+        else:
+            from ltx_core.components.schedulers import LTX2Scheduler
 
-        dummy_latent = torch.empty(1, 1, self.ar_frames, self.latent_h, self.latent_w)
-        scheduler = LTX2Scheduler()
-        self._sigmas = scheduler.execute(
-            steps=self.num_inference_steps, latent=dummy_latent
-        ).to(device=self.device, dtype=self.dtype)
+            # Use frames=1 because SCD denoises one frame at a time.
+            # The LTX2Scheduler applies a token-count-dependent sigma shift,
+            # so the dummy latent shape must match the single-frame decode.
+            dummy_latent = torch.empty(1, 1, 1, self.latent_h, self.latent_w)
+            scheduler = LTX2Scheduler()
+            self._sigmas = scheduler.execute(
+                steps=self.num_inference_steps, latent=dummy_latent,
+            ).to(device=self.device, dtype=self.dtype)
+
         return self._sigmas
 
     def _decode_latent_to_pixels(self, latent: Tensor) -> Tensor:
@@ -367,14 +420,28 @@ class ARRolloutEvaluator:
         # Combined fitness (higher = better):
         # Negate losses (lower is better → higher negative = worse → higher total = better)
         # SSIM is already higher=better, so add it directly
-        total = -(
-            self.w_fm * avg_fm
-            + self.w_recon * avg_recon
-            + self.w_tcoh * temporal_gap
-            + self.w_lpips * avg_lpips
-        )
-        if self.w_ssim > 0:
-            total += self.w_ssim * avg_ssim  # SSIM: higher = better
+        #
+        # With normalization: each raw metric is scaled so baseline ≈ 1.0,
+        # ensuring all objectives contribute equally to the ES gradient.
+        norm = self.normalization
+        if norm is not None:
+            total = -(
+                self.w_fm * (avg_fm * norm.fm_scale)
+                + self.w_recon * (avg_recon * norm.recon_scale)
+                + self.w_tcoh * (temporal_gap * norm.tcoh_scale)
+                + self.w_lpips * (avg_lpips * norm.lpips_scale)
+            )
+            if self.w_ssim > 0:
+                total += self.w_ssim * (avg_ssim * norm.ssim_scale)
+        else:
+            total = -(
+                self.w_fm * avg_fm
+                + self.w_recon * avg_recon
+                + self.w_tcoh * temporal_gap
+                + self.w_lpips * avg_lpips
+            )
+            if self.w_ssim > 0:
+                total += self.w_ssim * avg_ssim
 
         return FitnessResult(
             total=total,

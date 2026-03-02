@@ -2,7 +2,7 @@
 SCD Evolution Engine — gradient-free fine-tuning for autoregressive quality.
 
 Orchestrates the evolution loop:
-  1. Load model (transformer → quantize → LoRA → SCD wrap)
+  1. Load model (transformer → quantize → SCD wrap → inject manual LoRA)
   2. Load precomputed dataset (latents + conditions)
   3. For each generation:
      a. Generate antithetic perturbation pairs
@@ -10,26 +10,74 @@ Orchestrates the evolution loop:
      c. Compute ES gradient and update decoder LoRA weights
      d. Anneal noise scale
   4. Save evolved checkpoint
+
+NOTE: Uses manual LoRA injection (not PEFT) to avoid the PEFT+quanto circular
+dependency. PEFT can't wrap QLinear (quantized); quanto quantizes LoRA's
+nn.Linear adapters. Manual LoRA wraps quantized modules with bfloat16 params.
 """
 
 from __future__ import annotations
 
 import json
 import random
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from ltx_trainer import logger
-from ltx_trainer.evolution.fitness import ARRolloutEvaluator, FitnessResult
+from ltx_trainer.evolution.fitness import ARRolloutEvaluator, FitnessNormalization, FitnessResult
 from ltx_trainer.evolution.perturbation import (
     HashPerturbation,
     SelectiveLoRAPerturbation,
     generate_perturbation_seeds,
 )
+
+
+# ── Manual LoRA (PEFT-free, works with quantized modules) ──
+
+
+class ManualLoRA(nn.Module):
+    """Lightweight LoRA wrapper compatible with quantized (QLinear) base modules.
+
+    Unlike PEFT, this doesn't replace the base module's type — it wraps it.
+    The base module (possibly quantized) handles the main computation, and
+    the LoRA params (always bfloat16) add a low-rank update on top.
+
+    Parameter naming for perturbation handler compatibility:
+      {parent_path}.lora_A  — nn.Parameter [rank, in_features]
+      {parent_path}.lora_B  — nn.Parameter [out_features, rank]
+    """
+
+    def __init__(
+        self,
+        base_module: nn.Module,
+        rank: int,
+        alpha: int | None = None,
+        dtype: torch.dtype = torch.bfloat16,
+    ):
+        super().__init__()
+        self.base = base_module
+        in_features = base_module.in_features
+        out_features = base_module.out_features
+        self.lora_A = nn.Parameter(torch.zeros(rank, in_features, dtype=dtype))
+        self.lora_B = nn.Parameter(torch.zeros(out_features, rank, dtype=dtype))
+        self.scaling = (alpha or rank) / rank
+
+        # Preserve attributes that downstream code may check
+        self.in_features = in_features
+        self.out_features = out_features
+
+    def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        base_out = self.base(x, *args, **kwargs)
+        # LoRA path in bfloat16: (x @ A^T) @ B^T * scaling
+        x_f = x.to(self.lora_A.dtype)
+        lora_out = F.linear(F.linear(x_f, self.lora_A), self.lora_B) * self.scaling
+        return base_out + lora_out.to(base_out.dtype)
 
 
 @dataclass
@@ -144,7 +192,20 @@ class SCDEvolutionEngine:
         self._init_output_dir()
 
     def _load_model(self) -> None:
-        """Load transformer → quantize → apply LoRA → wrap with SCD."""
+        """Load transformer → quantize → SCD wrap → inject manual LoRA.
+
+        Order of operations (avoids PEFT+quanto circular dependency):
+          1. Load bf16 transformer to CPU
+          2. Read patchify_proj dimensions (before quantization changes types)
+          3. Quantize with quanto (plain nn.Linear → QLinear)
+          4. Move to GPU
+          5. Wrap with LTXSCDModel (encoder/decoder split)
+          6. Inject ManualLoRA on decoder attention layers
+          7. Load LoRA weights from checkpoint
+
+        This bypasses PEFT entirely. ManualLoRA wraps QLinear modules with
+        bfloat16 low-rank parameters that the perturbation handler can evolve.
+        """
         from ltx_core.model.transformer.scd_model import LTXSCDModel
 
         from ltx_trainer.model_loader import load_transformer
@@ -152,19 +213,21 @@ class SCDEvolutionEngine:
         logger.info(f"Loading transformer from {self.config.checkpoint}")
         transformer = load_transformer(self.config.checkpoint, device="cpu", dtype=self.dtype)
 
-        # Quantize if requested
+        # Read dimensions before quantization (patchify_proj may lose .in_features after quanto)
+        if hasattr(transformer, "patchify_proj"):
+            self._latent_channels = transformer.patchify_proj.in_features
+        else:
+            self._latent_channels = 128  # LTX-2 default
+
+        # Quantize (no LoRA yet — plain nn.Linear modules, quanto handles them cleanly)
         if self.config.quantization != "none":
             from ltx_trainer.quantization import quantize_model
 
             logger.info(f"Quantizing with {self.config.quantization}")
             transformer = quantize_model(transformer, self.config.quantization, device="cuda:0")
-        else:
-            transformer = transformer.to(self.device)
 
-        # Apply LoRA checkpoint
-        if self.config.lora_path:
-            logger.info(f"Loading LoRA from {self.config.lora_path}")
-            self._apply_lora(transformer)
+        # Move to primary device
+        transformer = transformer.to(self.device)
 
         # Wrap with SCD
         self.scd_model = LTXSCDModel(
@@ -174,8 +237,9 @@ class SCDEvolutionEngine:
         )
         self.scd_model.eval()
 
-        # Get model dimensions
-        self._latent_channels = transformer.patchify_proj.in_features  # 128
+        # Inject ManualLoRA on decoder blocks and load checkpoint weights
+        if self.config.lora_path:
+            self._inject_manual_lora()
 
         logger.info(
             f"SCD model ready: {self.config.encoder_layers} encoder + "
@@ -211,68 +275,126 @@ class SCDEvolutionEngine:
                 logger.warning("lpips package not installed, disabling LPIPS metric")
                 self.config.w_pixel_lpips = 0.0
 
-    def _apply_lora(self, transformer: nn.Module) -> None:
-        """Apply a saved LoRA checkpoint to the transformer."""
-        from peft import PeftModel, LoraConfig as PeftLoraConfig
+    def _inject_manual_lora(self) -> None:
+        """Inject ManualLoRA wrappers on decoder blocks and load checkpoint weights.
+
+        Parses the PEFT-format LoRA checkpoint to determine:
+          - rank (from lora_A tensor shape)
+          - which modules to wrap (from checkpoint keys)
+          - weight values (loaded into ManualLoRA.lora_A / lora_B)
+
+        Works AFTER quantization — ManualLoRA wraps QLinear modules cleanly.
+        """
         from safetensors.torch import load_file
 
         state_dict = load_file(self.config.lora_path)
+        logger.info(f"Loading LoRA from {self.config.lora_path} ({len(state_dict)} tensors)")
 
-        # Detect LoRA rank from state dict
+        # Detect LoRA rank from any lora_A weight
         rank = None
+        alpha = None
         for key, tensor in state_dict.items():
-            if "lora_A" in key:
+            if "lora_A" in key and "weight" in key:
+                rank = tensor.shape[0]
+                break
+            elif "lora_A" in key and tensor.dim() == 2:
                 rank = tensor.shape[0]
                 break
 
         if rank is None:
             raise ValueError(f"Could not detect LoRA rank from {self.config.lora_path}")
 
-        logger.info(f"Detected LoRA rank={rank}")
+        alpha = rank  # Assume alpha == rank (standard for SCD training)
+        logger.info(f"Detected LoRA rank={rank}, alpha={alpha}")
 
-        # Collect target modules from state dict
-        target_modules = set()
-        for key in state_dict.keys():
-            # Extract module path between "base_model.model." and ".lora_A/B"
-            parts = key.split(".")
-            for i, p in enumerate(parts):
-                if p in ("lora_A", "lora_B"):
-                    target_modules.add(parts[i - 1])
-                    break
-
-        lora_config = PeftLoraConfig(
-            r=rank,
-            lora_alpha=rank,
-            target_modules=list(target_modules),
-            lora_dropout=0.0,
-            bias="none",
+        # Parse checkpoint keys to build (block_idx, module_path) → (lora_A, lora_B) mapping
+        # SCD training saves keys in multiple formats:
+        #   diffusion_model.base_model.transformer_blocks.{idx}.{path}.lora_A.weight
+        #   diffusion_model.encoder_blocks.{idx}.{path}.lora_A.weight  (duplicates)
+        #   diffusion_model.decoder_blocks.{idx}.{path}.lora_A.weight  (duplicates)
+        #   base_model.model.transformer_blocks.{idx}.{path}.lora_A.default.weight  (PEFT)
+        # We only use transformer_blocks.N keys (canonical), ignore encoder/decoder duplicates.
+        _KEY_PATTERN = re.compile(
+            r"(?:diffusion_model\.)?(?:base_model\.(?:model\.)?)?transformer_blocks\.(\d+)\."
+            r"(.*?)\.lora_([AB])(?:\.default)?\.weight$"
+        )
+        # Also match keys without .weight suffix (raw param format)
+        _KEY_PATTERN_RAW = re.compile(
+            r"(?:diffusion_model\.)?(?:base_model\.(?:model\.)?)?transformer_blocks\.(\d+)\."
+            r"(.*?)\.lora_([AB])$"
         )
 
-        # Wrap with PEFT
-        transformer = PeftModel(transformer, lora_config)
+        lora_weights: dict[tuple[int, str], dict[str, torch.Tensor]] = {}
+        for key, tensor in state_dict.items():
+            m = _KEY_PATTERN.match(key) or _KEY_PATTERN_RAW.match(key)
+            if m is None:
+                continue
+            block_idx = int(m.group(1))
+            module_path = m.group(2)  # e.g. "attn.to_q"
+            ab = m.group(3)  # "A" or "B"
 
-        # Normalize state dict keys (SCD training may save with various prefixes)
-        normalized = {}
-        for key, val in state_dict.items():
-            # Strip "base_model.model." prefix if present
-            nk = key
-            if nk.startswith("base_model.model."):
-                nk = nk[len("base_model.model."):]
-            # Re-add PEFT prefix
-            if not nk.startswith("base_model.model."):
-                nk = f"base_model.model.{nk}"
-            normalized[nk] = val.to(self.device)
+            pair_key = (block_idx, module_path)
+            if pair_key not in lora_weights:
+                lora_weights[pair_key] = {}
+            lora_weights[pair_key][f"lora_{ab}"] = tensor
 
-        # Load with strict=False to handle any extra keys
-        missing, unexpected = transformer.load_state_dict(normalized, strict=False)
-        if missing:
-            logger.warning(f"Missing keys during LoRA load: {len(missing)}")
-        if unexpected:
-            logger.warning(f"Unexpected keys during LoRA load: {len(unexpected)}")
+        logger.info(f"Found LoRA weights for {len(lora_weights)} modules")
 
-        # Merge and unload to get a flat model with LoRA baked in, then re-apply
-        # Actually, for evolution we need the LoRA params separate and trainable.
-        # Keep the PeftModel as-is — evolution will perturb lora_A/lora_B in-place.
+        # Filter to decoder blocks only (>= encoder_layers)
+        decoder_start = self.config.encoder_layers
+        decoder_pairs = {k: v for k, v in lora_weights.items() if k[0] >= decoder_start}
+        encoder_pairs = {k: v for k, v in lora_weights.items() if k[0] < decoder_start}
+
+        logger.info(
+            f"  Decoder blocks ({decoder_start}-47): {len(decoder_pairs)} modules"
+        )
+        if encoder_pairs:
+            logger.info(
+                f"  Encoder blocks (0-{decoder_start - 1}): {len(encoder_pairs)} modules (loaded but not evolved)"
+            )
+
+        # Inject ManualLoRA wrappers — both encoder and decoder blocks get LoRA
+        # (encoder LoRA contributes to quality; only decoder LoRA is perturbed)
+        injected = 0
+        for (block_idx, module_path), weights in sorted(lora_weights.items()):
+            if "lora_A" not in weights or "lora_B" not in weights:
+                logger.warning(f"Skipping incomplete LoRA pair: block {block_idx}, {module_path}")
+                continue
+
+            # Navigate to the target module inside the SCD model
+            # Path: scd_model.base_model.transformer_blocks[block_idx].{module_path}
+            try:
+                block = self.scd_model.base_model.transformer_blocks[block_idx]
+                parts = module_path.split(".")
+                parent = block
+                for p in parts[:-1]:
+                    parent = getattr(parent, p)
+                child_name = parts[-1]
+                base_module = getattr(parent, child_name)
+            except (AttributeError, IndexError) as e:
+                logger.warning(f"Could not find module: block {block_idx}, {module_path}: {e}")
+                continue
+
+            # Create ManualLoRA wrapper
+            lora = ManualLoRA(
+                base_module=base_module,
+                rank=rank,
+                alpha=alpha,
+                dtype=self.dtype,
+            )
+
+            # Load weights (move to same device as model)
+            lora.lora_A.data.copy_(weights["lora_A"].to(self.dtype))
+            lora.lora_B.data.copy_(weights["lora_B"].to(self.dtype))
+
+            # Move entire ManualLoRA to model device
+            lora = lora.to(self.device)
+
+            # Replace the module in the block
+            setattr(parent, child_name, lora)
+            injected += 1
+
+        logger.info(f"Injected {injected} ManualLoRA wrappers (rank={rank})")
 
     def _load_dataset(self) -> None:
         """Load precomputed latents + conditions from data_root."""
@@ -303,9 +425,17 @@ class SCDEvolutionEngine:
             raise ValueError(f"No matching latent/condition pairs found in {data_root}")
 
         # Probe first sample for dimensions
-        sample_latent = torch.load(self.dataset_samples[0]["latent_path"], weights_only=True)
-        if isinstance(sample_latent, dict):
-            sample_latent = sample_latent.get("latent", sample_latent.get("video_latent", next(iter(sample_latent.values()))))
+        sample_data = torch.load(self.dataset_samples[0]["latent_path"], weights_only=True)
+        if isinstance(sample_data, dict):
+            # Try common key names: "latents" (ditto), "latent", "video_latent"
+            for key in ("latents", "latent", "video_latent"):
+                if key in sample_data:
+                    sample_latent = sample_data[key]
+                    break
+            else:
+                sample_latent = next(v for v in sample_data.values() if hasattr(v, "shape") and v.dim() >= 4)
+        else:
+            sample_latent = sample_data
 
         # Expected shape: [C, F, H, W] or [1, C, F, H, W]
         if sample_latent.dim() == 5:
@@ -384,6 +514,7 @@ class SCDEvolutionEngine:
             w_pixel_ssim=self.config.w_pixel_ssim,
             device=self.device,
             dtype=self.dtype,
+            distilled=self.config.distilled,
             vae_decoder=self.vae_decoder,
             vae_device=self.config.vae_device if self.config.use_vae_decoder else None,
             lpips_net=self.lpips_net,
@@ -438,15 +569,29 @@ class SCDEvolutionEngine:
         """Load a single dataset sample to GPU."""
         sample = self.dataset_samples[idx]
 
-        latent = torch.load(sample["latent_path"], weights_only=True)
-        if isinstance(latent, dict):
-            latent = latent.get("latent", latent.get("video_latent", next(iter(latent.values()))))
+        latent_data = torch.load(sample["latent_path"], weights_only=True)
+        if isinstance(latent_data, dict):
+            # Try common key names: "latents" (ditto/scrya), "latent", "video_latent"
+            for key in ("latents", "latent", "video_latent"):
+                if key in latent_data:
+                    latent = latent_data[key]
+                    break
+            else:
+                latent = next(v for v in latent_data.values() if hasattr(v, "shape") and v.dim() >= 4)
+        else:
+            latent = latent_data
         if latent.dim() == 4:
             latent = latent.unsqueeze(0)  # [C,F,H,W] -> [1,C,F,H,W]
 
         condition = torch.load(sample["condition_path"], weights_only=True)
         if isinstance(condition, dict):
-            prompt_embeds = condition["prompt_embeds"]
+            # Try common key names: "video_prompt_embeds" (ditto/scrya), "prompt_embeds"
+            prompt_embeds = condition.get(
+                "video_prompt_embeds",
+                condition.get("prompt_embeds", next(
+                    v for v in condition.values() if hasattr(v, "shape") and v.dim() >= 2
+                )),
+            )
             prompt_mask = condition.get("prompt_attention_mask", None)
         else:
             prompt_embeds = condition
@@ -591,28 +736,55 @@ class SCDEvolutionEngine:
         save_dict = {k: v.float().cpu() for k, v in evolved_state.items()}
         save_file(save_dict, str(param_path))
 
-        # Save evolution state
+        # Save evolution state (includes normalization for resumption)
+        state_dict = self.state.to_dict()
+        if self.evaluator and self.evaluator.normalization:
+            norm = self.evaluator.normalization
+            state_dict["normalization"] = {
+                "fm_scale": norm.fm_scale,
+                "recon_scale": norm.recon_scale,
+                "tcoh_scale": norm.tcoh_scale,
+                "lpips_scale": norm.lpips_scale,
+                "ssim_scale": norm.ssim_scale,
+            }
+
         state_path = out / f"{name}_state.json"
         with open(state_path, "w") as f:
-            json.dump(self.state.to_dict(), f, indent=2)
+            json.dump(state_dict, f, indent=2)
 
         logger.info(f"Checkpoint saved: {param_path}")
 
     def save_full_lora(self, name: str) -> None:
-        """Save a full LoRA checkpoint (all params, not just evolved ones).
+        """Save a full LoRA checkpoint in PEFT-compatible format.
 
-        This produces a checkpoint directly loadable by scd_inference.py.
+        Converts ManualLoRA parameter names to PEFT format so the checkpoint
+        is directly loadable by scd_inference.py (which uses PEFT):
+
+        ManualLoRA: base_model.transformer_blocks.32.attn.to_q.lora_A
+        PEFT:       base_model.model.transformer_blocks.32.attn.to_q.lora_A.default.weight
         """
         out = Path(self.config.output_dir) / "checkpoints"
         path = out / f"{name}.safetensors"
 
         from safetensors.torch import save_file
 
-        # Collect all LoRA parameters from the model
+        # Collect all LoRA parameters and convert to PEFT key format
         lora_state = {}
         for pname, param in self.scd_model.named_parameters():
-            if "lora_A" in pname or "lora_B" in pname:
-                lora_state[pname] = param.data.float().cpu()
+            if "lora_A" not in pname and "lora_B" not in pname:
+                continue
+            # Skip base module params inside ManualLoRA (e.g. .base.weight)
+            if ".base." in pname:
+                continue
+
+            # Convert: base_model.transformer_blocks.N.X.lora_A
+            #       → base_model.model.transformer_blocks.N.X.lora_A.default.weight
+            peft_key = pname
+            if peft_key.startswith("base_model."):
+                peft_key = "base_model.model." + peft_key[len("base_model."):]
+            peft_key = peft_key + ".default.weight"
+
+            lora_state[peft_key] = param.data.float().cpu()
 
         save_file(lora_state, str(path))
         logger.info(f"Full LoRA checkpoint saved: {path} ({len(lora_state)} tensors)")
@@ -635,8 +807,21 @@ class SCDEvolutionEngine:
 
         if state_path.exists():
             with open(state_path) as f:
-                self.state = EvolutionState.from_dict(json.load(f))
+                state_data = json.load(f)
+            self.state = EvolutionState.from_dict(state_data)
             logger.info(f"Loaded evolution state: gen={self.state.generation}")
+
+            # Restore normalization if saved
+            if "normalization" in state_data and self.evaluator:
+                nd = state_data["normalization"]
+                self.evaluator.normalization = FitnessNormalization(
+                    fm_scale=nd["fm_scale"],
+                    recon_scale=nd["recon_scale"],
+                    tcoh_scale=nd["tcoh_scale"],
+                    lpips_scale=nd.get("lpips_scale", 1.0),
+                    ssim_scale=nd.get("ssim_scale", 1.0),
+                )
+                logger.info("Restored fitness normalization from checkpoint")
 
     def run(self) -> None:
         """Full evolution loop."""
@@ -649,14 +834,27 @@ class SCDEvolutionEngine:
         logger.info(f"  Evolved params: {self.perturbation_handler.num_params:,}")
         logger.info("=" * 60)
 
-        # Evaluate baseline (unperturbed)
+        # Evaluate baseline (unperturbed) and compute normalization
         baseline = self._evaluate_baseline()
-        logger.info(f"Baseline fitness: {baseline}")
+        logger.info(f"Baseline fitness (raw): {baseline}")
+
+        # Compute normalization from baseline so each component ≈ 1.0
+        norm = FitnessNormalization.from_baseline(baseline)
+        self.evaluator.normalization = norm
+        logger.info(
+            f"Fitness normalization: fm×{norm.fm_scale:.3f}, recon×{norm.recon_scale:.3f}, "
+            f"tcoh×{norm.tcoh_scale:.3f}, lpips×{norm.lpips_scale:.3f}, ssim×{norm.ssim_scale:.3f}"
+        )
+
+        # Re-evaluate baseline WITH normalization to show calibrated starting point
+        baseline_normed = self._evaluate_baseline()
+        logger.info(f"Baseline fitness (normalized): {baseline_normed}")
 
         if self.wandb_run:
             self.wandb_run.log(
                 {
-                    "baseline/total": baseline.total,
+                    "baseline/total": baseline_normed.total,
+                    "baseline/total_raw": baseline.total,
                     "baseline/fm_loss": baseline.fm_loss,
                     "baseline/latent_recon": baseline.latent_recon,
                     "baseline/temporal_coh": baseline.temporal_coh,

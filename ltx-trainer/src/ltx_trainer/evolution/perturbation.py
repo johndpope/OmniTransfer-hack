@@ -156,6 +156,10 @@ class SelectiveLoRAPerturbation:
                 self.evolvable_params[name] = param
                 self.original_values[name] = param.data.clone().detach()
 
+        # Noise cache: seed → {param_name → noise_tensor}
+        # Populated during apply_perturbation, consumed in update_from_votes
+        self._noise_cache: dict[int, dict[str, torch.Tensor]] = {}
+
         self.num_params = sum(p.numel() for p in self.evolvable_params.values())
         logger.info(
             f"[SelectiveLoRAPerturbation] Evolving {len(self.evolvable_params)} "
@@ -163,17 +167,32 @@ class SelectiveLoRAPerturbation:
         )
 
     def apply_perturbation(self, perturbation: HashPerturbation) -> None:
-        """Apply perturbation to all evolvable parameters in-place."""
+        """Apply perturbation to all evolvable parameters in-place.
+
+        Caches the unit noise (direction-independent) for reuse in update_from_votes.
+        Only the +ε direction's noise is cached (noise is symmetric for antithetic pairs).
+        """
+        cache_noise = perturbation.direction > 0  # Only cache for +ε (first of pair)
+        seed_cache: dict[str, torch.Tensor] = {}
+
         for i, (name, param) in enumerate(self.evolvable_params.items()):
             param_seed = perturbation.seed + i * 10007
-            perturbed = apply_perturbation_to_param(
-                self.original_values[name],
-                param_seed,
-                perturbation.scale,
-                perturbation.direction,
-                self.use_gaussian,
+            flat_size = self.original_values[name].numel()
+            idx = torch.arange(flat_size, device=param.device, dtype=torch.int64)
+            noise = (
+                gaussian_from_hash(param_seed, idx)
+                if self.use_gaussian
+                else noise_from_hash(param_seed, idx)
             )
-            param.data.copy_(perturbed)
+            noise = noise.view(self.original_values[name].shape).to(self.original_values[name].dtype)
+
+            if cache_noise:
+                seed_cache[name] = noise  # Unit noise (no scale/direction)
+
+            param.data.copy_(self.original_values[name] + noise * perturbation.scale * perturbation.direction)
+
+        if cache_noise:
+            self._noise_cache[perturbation.seed] = seed_cache
 
     def revert_to_original(self) -> None:
         """Revert all parameters to their pre-perturbation values."""
@@ -188,6 +207,10 @@ class SelectiveLoRAPerturbation:
         noise_scale: float,
     ) -> int:
         """Apply ES gradient update: w += lr * sum((F+ - F-) * eps / (2*sigma)).
+
+        Uses cached noise from apply_perturbation when available, falling back
+        to regeneration from hash seeds. Caching avoids ~768 × len(seeds)
+        redundant GPU noise generation calls per generation.
 
         Args:
             seeds: Seeds that were evaluated this generation.
@@ -209,17 +232,26 @@ class SelectiveLoRAPerturbation:
                 continue
             num_contributing += 1
 
+            # Try to use cached noise first (much faster than regenerating)
+            cached = self._noise_cache.get(seed)
+
             for i, name in enumerate(self.evolvable_params.keys()):
-                param_seed = seed + i * 10007
-                flat_size = self.original_values[name].numel()
-                idx = torch.arange(flat_size, device=self.device, dtype=torch.int64)
-                noise = (
-                    gaussian_from_hash(param_seed, idx)
-                    if self.use_gaussian
-                    else noise_from_hash(param_seed, idx)
-                )
-                noise = noise.view(self.original_values[name].shape).to(self.original_values[name].dtype)
+                if cached is not None and name in cached:
+                    noise = cached[name]
+                else:
+                    param_seed = seed + i * 10007
+                    flat_size = self.original_values[name].numel()
+                    idx = torch.arange(flat_size, device=self.device, dtype=torch.int64)
+                    noise = (
+                        gaussian_from_hash(param_seed, idx)
+                        if self.use_gaussian
+                        else noise_from_hash(param_seed, idx)
+                    )
+                    noise = noise.view(self.original_values[name].shape).to(self.original_values[name].dtype)
                 gradient_estimate[name] += diff * noise / (2.0 * noise_scale)
+
+        # Clear cache after use
+        self._noise_cache.clear()
 
         if num_contributing > 0:
             lr = update_scale / num_contributing

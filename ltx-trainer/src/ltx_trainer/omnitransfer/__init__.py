@@ -60,6 +60,18 @@ from ltx_trainer.omnitransfer.geometric_decoder import (
     GeometricDecoder,
     compute_geometric_loss,
 )
+from ltx_trainer.omnitransfer.depth_3d_losses import (
+    compute_depth_3d_loss,
+    normal_loss,
+    edge_loss,
+    depth_scale_invariant_loss,
+    confidence_weighted_mse,
+)
+from ltx_trainer.omnitransfer.geometric_3d_encoder import Geometric3DEncoder
+from ltx_trainer.omnitransfer.geometric_3d_decoder import (
+    Geometric3DDecoder,
+    compute_geo_3d_decoder_loss,
+)
 
 # Qwen VL integration for TMA (optional, requires transformers>=4.43)
 try:
@@ -115,6 +127,15 @@ __all__ = [
     "MotionAugmenter",
     "GeometricDecoder",
     "compute_geometric_loss",
+    # AMB3R 3D Reconstruction (arXiv:2511.20343)
+    "compute_depth_3d_loss",
+    "normal_loss",
+    "edge_loss",
+    "depth_scale_invariant_loss",
+    "confidence_weighted_mse",
+    "Geometric3DEncoder",
+    "Geometric3DDecoder",
+    "compute_geo_3d_decoder_loss",
     # Qwen VL TMA integration (optional)
     "QwenVLConfig",
     "QwenVLFeatureExtractor",

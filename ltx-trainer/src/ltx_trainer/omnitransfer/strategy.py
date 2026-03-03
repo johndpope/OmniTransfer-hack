@@ -674,6 +674,79 @@ class OmniTransferConfig(TrainingStrategyConfigBase):
         le=3,
     )
 
+    # ======================================================================
+    # AMB3R 3D Reconstruction Losses (arXiv:2511.20343)
+    # ======================================================================
+    enable_depth_3d_loss: bool = Field(
+        default=False,
+        description="Enable AMB3R-style 3D reconstruction losses (depth, normal, edge). "
+        "Requires pre-computed depth_3d/ pseudo-GT from frozen AMB3R or DA3.",
+    )
+    depth_3d_loss_weight: float = Field(
+        default=0.05,
+        description="Weight for depth consistency loss (scale-invariant).",
+        ge=0.0,
+    )
+    normal_3d_loss_weight: float = Field(
+        default=0.03,
+        description="Weight for surface normal consistency loss.",
+        ge=0.0,
+    )
+    edge_3d_loss_weight: float = Field(
+        default=0.02,
+        description="Weight for edge direction consistency loss.",
+        ge=0.0,
+    )
+    depth_3d_loss_anneal_steps: int = Field(
+        default=15000,
+        description="Steps over which 3D losses are annealed to zero.",
+        ge=1,
+    )
+    depth_3d_pseudo_gt_dir: str = Field(
+        default="depth_3d",
+        description="Directory for pre-computed AMB3R depth/points/confidence .pt files.",
+    )
+    use_confidence_weighted_mse: bool = Field(
+        default=False,
+        description="Use AMB3R confidence maps to weight the main flow-matching MSE loss. "
+        "Focuses training on high-confidence regions.",
+    )
+
+    # AMB3R 3D Geometric Token Encoder
+    enable_geometric_3d_encoder: bool = Field(
+        default=False,
+        description="Enable 3D geometric token encoder. Produces K tokens from pre-computed "
+        "AMB3R features, injected via cross-attention alongside text/motion tokens.",
+    )
+    geometric_3d_num_tokens: int = Field(
+        default=8,
+        description="Number of 3D geometric query tokens.",
+        ge=1,
+    )
+    geometric_3d_hidden_dim: int = Field(
+        default=512,
+        description="Internal hidden dimension of geometric 3D encoder.",
+    )
+    geometric_3d_num_layers: int = Field(
+        default=4,
+        description="Number of transformer layers in geometric 3D encoder.",
+        ge=1,
+    )
+    geometric_3d_feature_dim: int = Field(
+        default=7,
+        description="Per-frame feature dimension from pseudo-GT (depth=1 + normal=3 + confidence=1 + mean_point=2 = 7 or configurable).",
+    )
+    geometric_3d_decoder_loss_weight: float = Field(
+        default=0.05,
+        description="Weight for auxiliary geometric 3D decoder loss.",
+        ge=0.0,
+    )
+    geometric_3d_decoder_anneal_steps: int = Field(
+        default=15000,
+        description="Steps over which geometric 3D decoder loss anneals to zero.",
+        ge=1,
+    )
+
     _task_step_counter: int = 0  # For round-robin sampling
 
     @property
@@ -756,6 +829,10 @@ class OmniTransferModelInputs(ModelInputs):
     # 3DiMo motion encoder outputs (for geometric decoder loss)
     motion_hidden: Tensor | None = None        # [B, K, 512] hidden states for geometric decoder
     geometric_pseudo_gt: dict | None = None    # Precomputed SMPL/MANO from skeleton cache
+
+    # AMB3R 3D reconstruction outputs (arXiv:2511.20343)
+    geo_3d_hidden: Tensor | None = None        # [B, K, hidden_dim] from Geometric3DEncoder
+    depth_3d_pseudo_gt: dict | None = None     # Pre-computed depth/points/confidence/normals
 
 
 class OmniTransferStrategy(TrainingStrategy):
@@ -938,6 +1015,37 @@ class OmniTransferStrategy(TrainingStrategy):
                 f"tokens={total_tokens}, hidden={config.motion_encoder_hidden_dim}, "
                 f"layers={config.motion_encoder_num_layers}, params={param_count:,}"
                 f"{aug_info}{geo_info}"
+            )
+
+        # ======================================================================
+        # AMB3R 3D Reconstruction Components (arXiv:2511.20343)
+        # ======================================================================
+        self._geometric_3d_encoder = None
+        self._geometric_3d_decoder = None
+
+        if config.enable_geometric_3d_encoder:
+            from ltx_trainer.omnitransfer.geometric_3d_encoder import Geometric3DEncoder
+            self._geometric_3d_encoder = Geometric3DEncoder(
+                feature_dim=config.geometric_3d_feature_dim,
+                hidden_dim=config.geometric_3d_hidden_dim,
+                output_dim=3840,
+                num_tokens=config.geometric_3d_num_tokens,
+                num_layers=config.geometric_3d_num_layers,
+            )
+
+            if config.geometric_3d_decoder_loss_weight > 0:
+                from ltx_trainer.omnitransfer.geometric_3d_decoder import Geometric3DDecoder
+                self._geometric_3d_decoder = Geometric3DDecoder(
+                    hidden_dim=config.geometric_3d_hidden_dim,
+                    num_tokens=config.geometric_3d_num_tokens,
+                )
+
+            param_count = sum(p.numel() for p in self._geometric_3d_encoder.parameters())
+            dec_info = ", +Decoder" if self._geometric_3d_decoder else ""
+            logger.info(
+                f"Initialized AMB3R Geometric3DEncoder: "
+                f"tokens={config.geometric_3d_num_tokens}, hidden={config.geometric_3d_hidden_dim}, "
+                f"layers={config.geometric_3d_num_layers}, params={param_count:,}{dec_info}"
             )
 
         # Log I2V mode if enabled
@@ -1514,6 +1622,10 @@ class OmniTransferStrategy(TrainingStrategy):
         if self.config.enable_motion_encoder and self.config.enable_geometric_supervision:
             sources[self.config.geometric_pseudo_gt_dir] = "skeleton"
 
+        # AMB3R 3D reconstruction pseudo-GT
+        if self.config.enable_depth_3d_loss or self.config.enable_geometric_3d_encoder:
+            sources[self.config.depth_3d_pseudo_gt_dir] = "depth_3d"
+
         return sources
 
     def _apply_augmentations(
@@ -1789,6 +1901,55 @@ class OmniTransferStrategy(TrainingStrategy):
                     logger.warning(f"Failed to load skeleton pseudo-GT: {e}")
                     geometric_pseudo_gt = None
 
+        # ======================================================================
+        # AMB3R 3D Geometric Encoder Processing (arXiv:2511.20343)
+        # ======================================================================
+        geo_3d_hidden = None
+        depth_3d_pseudo_gt = None
+
+        # Load 3D pseudo-GT if available
+        if (self.config.enable_depth_3d_loss or self._geometric_3d_encoder is not None) and "depth_3d" in batch:
+            try:
+                d3d = batch["depth_3d"]
+                depth_3d_pseudo_gt = {
+                    k: v.to(device=device, dtype=dtype) if isinstance(v, Tensor) else v
+                    for k, v in d3d.items()
+                    if k in ("depth", "points", "confidence", "normals", "pose", "frame_features")
+                }
+            except Exception as e:
+                logger.debug(f"Failed to load depth_3d pseudo-GT: {e}")
+                depth_3d_pseudo_gt = None
+
+        # Encode 3D geometry into tokens for cross-attention
+        if self._geometric_3d_encoder is not None and depth_3d_pseudo_gt is not None:
+            if not hasattr(self, '_geo_3d_encoder_device_set'):
+                self._geometric_3d_encoder.to(device=device, dtype=dtype)
+                self._geo_3d_encoder_device_set = True
+                if self._geometric_3d_decoder is not None:
+                    self._geometric_3d_decoder.to(device=device, dtype=dtype)
+                logger.info(f"AMB3R Geometric3DEncoder moved to {device}")
+
+            # Extract per-frame features from pseudo-GT
+            frame_features = depth_3d_pseudo_gt.get("frame_features")  # [B, F, feature_dim]
+            if frame_features is not None:
+                geo_tokens, geo_3d_hidden = self._geometric_3d_encoder(frame_features)
+                # geo_tokens: [B, K, 3840]
+
+                if not hasattr(self, '_logged_geo3d_shape'):
+                    logger.info(
+                        f"AMB3R geo_tokens: {geo_tokens.shape} "
+                        f"(prepended to prompt_embeds for cross-attention)"
+                    )
+                    self._logged_geo3d_shape = True
+
+                # Prepend to prompt_embeds (before motion tokens if present)
+                prompt_embeds = torch.cat([geo_tokens, prompt_embeds], dim=1)
+                geo_mask = torch.ones(
+                    batch_size, geo_tokens.shape[1],
+                    device=device, dtype=prompt_attention_mask.dtype,
+                )
+                prompt_attention_mask = torch.cat([geo_mask, prompt_attention_mask], dim=1)
+
         # 3DiMo self-reconstruction mode: target == driving video
         if self.config.motion_self_reconstruction and self._motion_encoder is not None:
             import random as _random
@@ -2030,6 +2191,9 @@ class OmniTransferStrategy(TrainingStrategy):
             # 3DiMo motion encoder outputs (NOT detached - geometric loss needs gradients)
             motion_hidden=motion_hidden if motion_hidden is not None else None,
             geometric_pseudo_gt=geometric_pseudo_gt,
+            # AMB3R 3D reconstruction outputs (NOT detached - decoder loss needs gradients)
+            geo_3d_hidden=geo_3d_hidden if geo_3d_hidden is not None else None,
+            depth_3d_pseudo_gt=depth_3d_pseudo_gt,
         )
 
     def compute_loss(
@@ -2161,6 +2325,41 @@ class OmniTransferStrategy(TrainingStrategy):
                         f"3DiMo geometric loss: {geo_loss.item():.4f} "
                         f"(weight={weight:.4f}, step={self._current_step})"
                     )
+
+        # ======================================================================
+        # AMB3R 3D Reconstruction Losses (arXiv:2511.20343)
+        # ======================================================================
+        if self.config.enable_depth_3d_loss and inputs.depth_3d_pseudo_gt is not None and compute_perceptual:
+            from ltx_trainer.omnitransfer.depth_3d_losses import compute_depth_3d_loss
+            d3d_loss = compute_depth_3d_loss(
+                target_pred=target_pred,
+                inputs=inputs,
+                step=self._current_step,
+                depth_weight=self.config.depth_3d_loss_weight,
+                normal_weight=self.config.normal_3d_loss_weight,
+                edge_weight=self.config.edge_3d_loss_weight,
+                anneal_steps=self.config.depth_3d_loss_anneal_steps,
+            )
+            if d3d_loss is not None:
+                loss = loss + d3d_loss * self.config.perceptual_loss_interval
+
+        # AMB3R Geometric 3D Decoder auxiliary loss
+        if (
+            self._geometric_3d_decoder is not None
+            and inputs.geo_3d_hidden is not None
+            and inputs.depth_3d_pseudo_gt is not None
+        ):
+            from ltx_trainer.omnitransfer.geometric_3d_decoder import compute_geo_3d_decoder_loss
+            geo_3d_dec_loss = compute_geo_3d_decoder_loss(
+                decoder=self._geometric_3d_decoder,
+                hidden=inputs.geo_3d_hidden.to(device=loss.device),
+                pseudo_gt=inputs.depth_3d_pseudo_gt,
+                step=self._current_step,
+                initial_weight=self.config.geometric_3d_decoder_loss_weight,
+                anneal_steps=self.config.geometric_3d_decoder_anneal_steps,
+            )
+            if geo_3d_dec_loss is not None:
+                loss = loss + geo_3d_dec_loss
 
         return loss
 

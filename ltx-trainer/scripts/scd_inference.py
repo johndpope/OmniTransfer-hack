@@ -60,6 +60,7 @@ import gc
 import os
 import re
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
@@ -78,6 +79,76 @@ os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "12.0")
 # steps 5-8 are large jumps. This preserves the teacher's trajectory quality
 # while requiring only 8 denoising steps instead of 30.
 DISTILLED_SIGMA_VALUES = [1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TeaCache (CVPR 2025) — training-free decoder step caching
+# ─────────────────────────────────────────────────────────────────────────────
+# TeaCache exploits temporal redundancy in the denoising trajectory: consecutive
+# steps at similar sigma values produce nearly identical decoder outputs. By
+# measuring how much the decoder input changes (relative L1 of patchified latent),
+# we cache the velocity and reuse it when the change is below a threshold.
+# Expected ~1.5-2x decoder speedup (stacks with DDiT's 1.25x).
+# Reference: "TeaCache: Timestep-Aware Cache for Diffusion Transformers" (CVPR 2025)
+
+
+@dataclass
+class TeaCacheState:
+    """Per-frame state for TeaCache decoder step-skipping."""
+
+    threshold: float
+    coefficients: list[float] = field(default_factory=lambda: [0.0, 1.0])
+    prev_signal: torch.Tensor | None = field(default=None, repr=False)
+    cached_velocity: torch.Tensor | None = field(default=None, repr=False)
+    accumulated_distance: float = 0.0
+    hits: int = 0
+    misses: int = 0
+
+    def reset(self) -> None:
+        """Reset per-frame state (call at the start of each new frame's denoising)."""
+        self.prev_signal = None
+        self.cached_velocity = None
+        self.accumulated_distance = 0.0
+
+    def should_compute(self, signal: torch.Tensor, force: bool = False) -> bool:
+        """Decide whether to run the decoder or reuse cached velocity.
+
+        Args:
+            signal: Current step's patchified input [1, tpf, C].
+            force: If True, always compute (used for first/last step).
+
+        Returns:
+            True if decoder should be run, False if cache can be reused.
+        """
+        if self.prev_signal is None:
+            # First step of this frame — no history to compare against
+            self.prev_signal = signal.detach()
+            self.misses += 1
+            return True
+
+        # Relative L1 distance: captures both sigma change and content evolution
+        rel_l1 = (signal - self.prev_signal).abs().mean() / (self.prev_signal.abs().mean() + 1e-8)
+        d = rel_l1.item()
+
+        # Polynomial rescaling: d_out = c0 + c1*d + c2*d^2 + ...
+        # Default [0.0, 1.0] = identity (raw L1). Can be calibrated per-model.
+        rescaled = sum(c * (d ** i) for i, c in enumerate(self.coefficients))
+        self.accumulated_distance += rescaled
+        self.prev_signal = signal.detach()
+
+        if force:
+            # Forced compute (first/last step) — reset accumulator
+            self.accumulated_distance = 0.0
+            self.misses += 1
+            return True
+
+        if self.accumulated_distance < self.threshold and self.cached_velocity is not None:
+            self.hits += 1
+            return False  # Cache hit — skip decoder
+        else:
+            self.accumulated_distance = 0.0
+            self.misses += 1
+            return True  # Cache miss — run decoder
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -267,6 +338,15 @@ def main() -> None:
              "~3.75x faster than the dev 30-step model.",
     )
 
+    # BézierFlow — learned sigma schedule (ICLR 2026, arXiv:2512.13255)
+    parser.add_argument(
+        "--bezier-schedule",
+        type=str,
+        default=None,
+        help="Learned Bézier sigma schedule (.pt). Overrides --num-inference-steps "
+             "with the step count the schedule was trained for. Train with train_bezierflow.py.",
+    )
+
     # DDiT (Dynamic Patch Scheduling) — reduces decoder tokens for ~2-4x speedup
     # DDiT Paper (arXiv:2602.16968), Section 3: Dynamic Diffusion Transformer reduces
     # computational cost by spatially merging tokens during the decoder's denoising pass.
@@ -325,6 +405,20 @@ def main() -> None:
              "Default is dynamic (per-step scale selection via 3rd-order trajectory analysis).",
     )
 
+    # TeaCache — training-free decoder step caching (CVPR 2025)
+    # Caches decoder velocity and reuses it when consecutive denoising steps
+    # produce similar outputs. Stacks with DDiT (TeaCache skips steps, DDiT
+    # reduces tokens per step). Expected ~1.5-2x decoder speedup.
+    parser.add_argument(
+        "--teacache-thresh",
+        type=float,
+        default=None,
+        help="Enable TeaCache step-skipping with given threshold. "
+             "Lower = more accurate/slower, higher = faster/lower quality. "
+             "Suggested: 0.05 (conservative, ~30%% hits), 0.10 (balanced, ~50%% hits), "
+             "0.15 (aggressive, ~65%% hits). Default: None (disabled).",
+    )
+
     # Dual-GPU split mode
     # SCD Paper, Section 4.2: The encoder and decoder have asymmetric compute profiles.
     # The encoder processes one clean frame per step (lightweight with KV-cache), while
@@ -361,6 +455,16 @@ def main() -> None:
                 print(f"  Using dev model with distilled sigma schedule (quality may differ)")
         args.num_inference_steps = len(DISTILLED_SIGMA_VALUES) - 1  # 8 steps
         print(f"  Distilled mode: {args.num_inference_steps} steps with predefined sigma schedule")
+
+    # ── Handle BézierFlow schedule ──
+    BEZIER_SIGMA_VALUES = None
+    if args.bezier_schedule:
+        from ltx_trainer.bezierflow import BezierScheduler
+        _bezier = BezierScheduler.load(args.bezier_schedule, device="cpu")
+        # Infer step count from the --num-inference-steps arg (user sets this)
+        BEZIER_SIGMA_VALUES = _bezier.get_sigma_schedule(args.num_inference_steps).tolist()
+        print(f"  BézierFlow: {args.num_inference_steps} steps, σ={[f'{s:.4f}' for s in BEZIER_SIGMA_VALUES]}")
+        del _bezier
 
     # ── Validate dimensions ──
     assert args.height % 32 == 0, f"Height {args.height} must be divisible by 32"
@@ -409,7 +513,10 @@ def main() -> None:
     print(f"  Duration:    {actual_duration:.1f}s ({actual_pixel} frames @ {args.fps} fps)")
     print(f"  Latent:      {actual_latent} frames in {num_chunks} chunk(s)")
     print(f"  Tokens/frame:{tokens_per_frame}")
-    if args.distilled:
+    if BEZIER_SIGMA_VALUES is not None:
+        print(f"  Steps:       {args.num_inference_steps} (BézierFlow learned schedule)")
+        print(f"  Sigma range: [{BEZIER_SIGMA_VALUES[0]:.4f} → {BEZIER_SIGMA_VALUES[-2]:.4f} → {BEZIER_SIGMA_VALUES[-1]:.4f}]")
+    elif args.distilled:
         print(f"  Steps:       {args.num_inference_steps} (DISTILLED, non-uniform sigma schedule)")
     else:
         # Show the shifted sigma schedule for debugging
@@ -432,6 +539,10 @@ def main() -> None:
         print(f"  DDiT adapter:{Path(args.ddit_adapter).name}")
     else:
         print(f"  DDiT:        disabled (use --ddit-adapter to enable)")
+    if args.teacache_thresh is not None:
+        print(f"  TeaCache:    enabled (threshold={args.teacache_thresh})")
+    else:
+        print(f"  TeaCache:    disabled (use --teacache-thresh to enable)")
     print(f"  Output:      {args.output}")
     print("=" * 65)
 
@@ -1058,10 +1169,20 @@ def main() -> None:
     all_latent_frames: list[torch.Tensor] = []  # Each: [1, 128, 1, H, W]
     prev_context: torch.Tensor | None = None  # [1, 128, 1, latent_h, latent_w]
 
+    # ── TeaCache initialization ──
+    tea_cache: TeaCacheState | None = None
+    if args.teacache_thresh is not None:
+        tea_cache = TeaCacheState(
+            threshold=args.teacache_thresh,
+            coefficients=[0.0, 1.0],  # Identity polynomial: rescaled = raw_distance
+        )
+
     gen_start = time.time()
     enc_time_total = 0.0
     dec_time_total = 0.0
     ddit_steps_used = 0  # Accumulates across all frames
+    teacache_total_hits = 0
+    teacache_total_misses = 0
 
     for chunk_idx in tqdm(range(num_chunks), desc="Chunks", unit="chunk"):
         # SCD Paper, Section 4.2: Chunk overlap for temporal continuity.
@@ -1178,13 +1299,16 @@ def main() -> None:
                 )
 
                 # Sigma schedule depends on model type:
+                # - BézierFlow: Learned optimal schedule via Bézier reparameterization
                 # - Dev model: LTX2Scheduler with token-count-dependent shift (matches training)
                 #   The shift is computed from the TRAINING WINDOW token count (CHUNK_LATENT
                 #   frames × H × W), matching the ShiftedLogitNormalTimestepSampler used
                 #   during training. A simple linear schedule DOES NOT WORK — the model was
                 #   trained with shifted logit-normal sigmas and cannot denoise linear sigmas.
                 # - Distilled model: Non-uniform predefined schedule (8 steps, heavily front-loaded)
-                if args.distilled:
+                if BEZIER_SIGMA_VALUES is not None:
+                    sigmas = torch.tensor(BEZIER_SIGMA_VALUES, device=device, dtype=dtype)
+                elif args.distilled:
                     sigmas = torch.tensor(DISTILLED_SIGMA_VALUES, device=device, dtype=dtype)
                 else:
                     # Create dummy latent matching training window for correct shift computation
@@ -1209,6 +1333,10 @@ def main() -> None:
                 if ddit_wrapper is not None and not args.ddit_fixed_schedule:
                     ddit_wrapper.scheduler.reset()
 
+                # Reset TeaCache for this frame's denoising
+                if tea_cache is not None:
+                    tea_cache.reset()
+
                 # ── Denoising loop: Euler ODE solver from sigma_max to sigma_min ──
                 _debug_first_frame = (f_idx == 0 and chunk_idx == 0)
                 for step in range(args.num_inference_steps):
@@ -1221,6 +1349,33 @@ def main() -> None:
                     # [1, 128, 1, H, W] → [1, H*W, 128] (one token per spatial position)
                     noisy_patch = patchifier.patchify(x_t)
                     dec_seq = noisy_patch.shape[1]
+
+                    # ── TeaCache: check if this decoder step can be skipped ──
+                    # TeaCache (CVPR 2025) caches decoder velocity and reuses it when
+                    # consecutive denoising steps produce similar outputs (mid-schedule).
+                    # On cache hit: skip ALL decoder blocks + CFG, use cached velocity.
+                    if tea_cache is not None:
+                        # Always record DDiT trajectory, even on cache hits
+                        if ddit_wrapper is not None and not args.ddit_fixed_schedule:
+                            ddit_wrapper.scheduler.record(noisy_patch)
+
+                        _tc_force = (step == 0) or (step == args.num_inference_steps - 1)
+                        if not tea_cache.should_compute(noisy_patch, force=_tc_force):
+                            # Cache hit — reuse velocity, skip entire decode
+                            velocity = tea_cache.cached_velocity
+                            dt = sigma_next - sigma
+                            if _debug_first_frame and step in (0, 1, 5, 14, 28, 29):
+                                print(f"    [DEBUG step {step:2d}] sigma={sigma.item():.4f}→{sigma_next.item():.4f} "
+                                      f"[TC-HIT] reusing cached velocity")
+                            noisy_patch = (noisy_patch.float() + velocity.float() * dt.float()).to(dtype)
+                            x_t = patchifier.unpatchify(
+                                noisy_patch,
+                                output_shape=VideoLatentShape(
+                                    frames=1, height=latent_h, width=latent_w,
+                                    batch=1, channels=latent_channels,
+                                ),
+                            )
+                            continue  # Skip to next denoising step
 
                     # ── DDiT Dynamic Scale Selection ──
                     # DDiT Paper (arXiv:2602.16968), Section 3.2, Algorithm 1:
@@ -1258,7 +1413,9 @@ def main() -> None:
                             # 3rd-order finite differences. Needs at least 4 samples (steps
                             # 0-2 always run native to build up the trajectory history).
                             # Dynamic scheduler (paper's method): record latent, compute optimal scale
-                            ddit_wrapper.scheduler.record(noisy_patch)
+                            # Skip recording if TeaCache already recorded for this step
+                            if tea_cache is None:
+                                ddit_wrapper.scheduler.record(noisy_patch)
                             ddit_scale = ddit_wrapper.scheduler.compute_schedule(
                                 noisy_patch, step, 1, latent_h, latent_w,
                             )
@@ -1362,6 +1519,10 @@ def main() -> None:
                                 )
                                 velocity = velocity_uncond + args.guidance_scale * (velocity - velocity_uncond)
 
+                    # ── Update TeaCache with freshly computed velocity ──
+                    if tea_cache is not None:
+                        tea_cache.cached_velocity = velocity.detach().clone()
+
                     # ── Euler ODE Step ──
                     # DDiT Paper (arXiv:2602.16968), Eq. 3 / SCD Paper (arXiv:2602.10095), Section 3.1:
                     # Flow matching Euler step along the probability flow ODE:
@@ -1430,11 +1591,22 @@ def main() -> None:
         frames_done = len(all_latent_frames)
         rate = elapsed / frames_done if frames_done > 0 else 0
         remaining = (actual_latent - frames_done) * rate
+        _tc_info = ""
+        if tea_cache is not None:
+            teacache_total_hits += tea_cache.hits
+            teacache_total_misses += tea_cache.misses
+            _chunk_total = tea_cache.hits + tea_cache.misses
+            _chunk_pct = tea_cache.hits / _chunk_total * 100 if _chunk_total > 0 else 0
+            _tc_info = f" | TC: {tea_cache.hits}/{_chunk_total} hits ({_chunk_pct:.0f}%)"
+            # Reset per-chunk counters (per-frame reset happens in the loop)
+            tea_cache.hits = 0
+            tea_cache.misses = 0
+
         tqdm.write(
             f"  Chunk {chunk_idx + 1}/{num_chunks}: "
             f"{len(chunk_generated)} new frames | "
             f"Total: {frames_done}/{actual_latent} | "
-            f"ETA: {remaining / 60:.1f} min"
+            f"ETA: {remaining / 60:.1f} min{_tc_info}"
         )
 
         del chunk_generated, kv_cache
@@ -1463,6 +1635,17 @@ def main() -> None:
             pct = ddit_steps_used / total_steps_all * 100 if total_steps_all > 0 else 0
             print(f"  DDiT: DYNAMIC scheduler — merged {ddit_steps_used}/{total_steps_all} total steps "
                   f"({pct:.0f}%)")
+    if tea_cache is not None:
+        total_steps_all = args.num_inference_steps * actual_latent
+        tc_total = teacache_total_hits + teacache_total_misses
+        tc_pct = teacache_total_hits / tc_total * 100 if tc_total > 0 else 0
+        skipped_calls = teacache_total_hits
+        # Each skipped step saves 1 decoder call (or 2 with CFG: cond + uncond)
+        calls_per_step = 2 if use_cfg else 1
+        saved_decoder_calls = skipped_calls * calls_per_step
+        total_decoder_calls = total_steps_all * calls_per_step
+        print(f"  TeaCache: {teacache_total_hits}/{tc_total} steps cached ({tc_pct:.0f}% hit rate) | "
+              f"{saved_decoder_calls}/{total_decoder_calls} decoder calls saved")
 
     # ── VAE decode ──
     # Adaptation: LTX-2's temporal VAE compresses 8 pixel frames per latent frame, with the

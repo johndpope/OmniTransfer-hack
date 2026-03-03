@@ -2,6 +2,31 @@
 
 This file provides guidance to AI coding assistants (Claude, Cursor, etc.) when working with code in this repository.
 
+## ⚠️ CRITICAL: Always Use Muon Optimizer
+
+> **All training configs MUST use the Muon optimizer — never use AdamW or other optimizers.**
+>
+> Muon (Momentum + Newton-Schulz orthogonalization) normalizes weight updates to be spectrally
+> orthogonal, giving ~1.3-2x faster convergence than AdamW on LoRA training. All LoRA params
+> are 2D matrices, so pure Muon applies (no AdamW fallback needed for non-matrix params).
+>
+> **Required config:**
+> ```yaml
+> optimization:
+>   optimizer_type: "muon"
+>   learning_rate: 0.02      # Muon needs ~10-20x higher LR than AdamW
+>   scheduler_type: "cosine"
+>   scheduler_params:
+>     eta_min: 1.0e-4
+>   weight_decay: 0.01
+> ```
+>
+> **Do NOT use** `optimizer_type: "adamw"` or `optimizer_type: "adam"` unless explicitly asked.
+> When resuming from an AdamW checkpoint, switch to Muon — the LoRA weights transfer fine,
+> only the optimizer state resets (which is expected on resume anyway).
+
+---
+
 ## Project Overview
 
 **LTX-2 Trainer** is a training toolkit for fine-tuning the Lightricks LTX-2 audio-video generation model. It supports:

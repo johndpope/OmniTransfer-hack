@@ -287,14 +287,18 @@ class LtxvTrainer:
 
                     # Log metrics to W&B (only on main process and optimization steps)
                     if IS_MAIN_PROCESS and is_optimization_step:
-                        self._log_metrics(
-                            {
-                                "train/loss": loss.item(),
-                                "train/learning_rate": current_lr,
-                                "train/step_time": step_time,
-                                "train/global_step": self._global_step,
-                            }
-                        )
+                        metrics = {
+                            "train/loss": loss.item(),
+                            "train/learning_rate": current_lr,
+                            "train/step_time": step_time,
+                            "train/global_step": self._global_step,
+                        }
+                        # Log scheduled sampling probability if active
+                        if hasattr(self._training_strategy, "_get_p_ar"):
+                            p_ar = self._training_strategy._get_p_ar()
+                            if p_ar > 0.0 or hasattr(self._training_strategy, "_current_step"):
+                                metrics["train/p_ar"] = p_ar
+                        self._log_metrics(metrics)
 
                         # Save debug image every optimization step (overwrites)
                         if should_save_debug and video_pred is not None and model_inputs is not None:
@@ -452,6 +456,10 @@ class LtxvTrainer:
             conditions["video_prompt_embeds"] = video_embeds
             conditions["audio_prompt_embeds"] = audio_embeds
             conditions["prompt_attention_mask"] = attention_mask
+
+        # Pass current step to strategy (for scheduled sampling curriculum)
+        if hasattr(self._training_strategy, "set_current_step"):
+            self._training_strategy.set_current_step(self._global_step)
 
         # Use strategy to prepare training inputs (returns ModelInputs with Modality objects)
         model_inputs = self._training_strategy.prepare_training_inputs(batch, self._timestep_sampler)
@@ -1060,6 +1068,27 @@ class LtxvTrainer:
             from bitsandbytes.optim import AdamW8bit  # noqa: PLC0415
 
             optimizer = AdamW8bit(self._trainable_params, lr=lr, weight_decay=wd)
+        elif opt_cfg.optimizer_type == "muon":
+            from torch.optim import Muon  # noqa: PLC0415
+
+            # Muon requires 2D+ params; 1D params (biases, norms) fall back to AdamW.
+            muon_params = [p for p in self._trainable_params if p.ndim >= 2]
+            adamw_params = [p for p in self._trainable_params if p.ndim < 2]
+
+            if adamw_params:
+                logger.info(
+                    f"Muon optimizer: {len(muon_params)} params (2D+) via Muon, "
+                    f"{len(adamw_params)} params (1D) via AdamW fallback"
+                )
+                optimizer = Muon(
+                    [
+                        {"params": muon_params, "lr": lr, "weight_decay": wd},
+                        {"params": adamw_params, "lr": lr * 0.1, "weight_decay": wd, "muon": False},
+                    ],
+                )
+            else:
+                logger.info(f"Muon optimizer: {len(muon_params)} params (all 2D+)")
+                optimizer = Muon(self._trainable_params, lr=lr, weight_decay=wd)
         else:
             raise ValueError(f"Unknown optimizer type: {opt_cfg.optimizer_type}")
 

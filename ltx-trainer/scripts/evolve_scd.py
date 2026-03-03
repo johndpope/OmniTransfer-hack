@@ -73,6 +73,7 @@ def parse_args() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
         help="Precomputed dataset root",
     )
     p.add_argument("--conditions-dir", default="conditions_final")
+    p.add_argument("--max-samples", type=int, default=None, help="Limit dataset to first N samples (for overfit testing)")
 
     # Hybrid warmup
     p.add_argument("--warmup-steps", type=int, default=0, help="Backprop warmup steps (0=skip)")
@@ -124,6 +125,13 @@ def parse_args() -> tuple[argparse.Namespace, argparse.ArgumentParser]:
     # Resumption
     p.add_argument("--resume", type=str, help="Checkpoint name to resume from (e.g. 'gen_0050')")
 
+    # Perturbation mode
+    p.add_argument(
+        "--hyperspherical",
+        action="store_true",
+        help="Use hyperspherical (unit-norm direction) perturbations",
+    )
+
     # Misc
     p.add_argument("--seed", type=int, default=42)
 
@@ -161,6 +169,7 @@ def main() -> None:
         "root": "data_root",
         "data_root": "data_root",
         "conditions_dir": "conditions_dir",
+        "max_samples": "max_samples",
         "steps": "warmup_steps",
         "warmup_steps": "warmup_steps",
         "warmup_lr": "warmup_lr",
@@ -190,6 +199,7 @@ def main() -> None:
         "wandb_enabled": "wandb_enabled",
         "project": "wandb_project",
         "wandb_project": "wandb_project",
+        "hyperspherical": "hyperspherical",
         "seed": "seed",
     }
 
@@ -211,6 +221,7 @@ def main() -> None:
         "quantization": "quantization",
         "data_root": "data_root",
         "conditions_dir": "conditions_dir",
+        "max_samples": "max_samples",
         "warmup_steps": "warmup_steps",
         "warmup_lr": "warmup_lr",
         "population_size": "population_size",
@@ -234,6 +245,7 @@ def main() -> None:
         "log_every": "log_every",
         "image_log_every": "image_log_every",
         "wandb_project": "wandb_project",
+        "hyperspherical": "hyperspherical",
         "seed": "seed",
     }
 
@@ -250,6 +262,8 @@ def main() -> None:
         config_kwargs["use_vae_decoder"] = True
     if args.no_wandb:
         config_kwargs["wandb_enabled"] = False
+    if args.hyperspherical:
+        config_kwargs["hyperspherical"] = True
 
     # lora_path via CLI always overrides (it's commonly passed explicitly)
     if args.lora_path is not None:
@@ -277,6 +291,8 @@ def main() -> None:
     print(f"  Checkpoint:      {config.checkpoint}")
     print(f"  LoRA:            {config.lora_path}")
     print(f"  Data:            {config.data_root}")
+    if config.max_samples is not None:
+        print(f"  Max samples:     {config.max_samples} (overfit mode)")
     print(f"  Output:          {config.output_dir}")
     print(f"  Quantization:    {config.quantization}")
     if config.warmup_steps > 0:
@@ -288,6 +304,8 @@ def main() -> None:
     print(f"  Guidance scale:  {config.guidance_scale}")
     print(f"  Eval batch size: {config.eval_batch_size}")
     print(f"  Noise:           {config.noise_scale} (decay={config.noise_decay})")
+    if config.hyperspherical:
+        print(f"  Perturbation:    hyperspherical (unit-norm directions)")
     print(f"  Update scale:    {config.update_scale}")
     print(f"  Fitness weights: fm={config.w_fm_loss}, recon={config.w_latent_recon}, "
           f"tcoh={config.w_temporal_coherence}")

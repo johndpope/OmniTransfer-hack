@@ -145,6 +145,47 @@ class SCDTrainingConfig(TrainingStrategyConfigBase):
         "simultaneously (legacy behavior, causes train/inference mismatch).",
     )
 
+    # AR-aware scheduled sampling (fixes teacher-forcing / inference mismatch)
+    # During training, the encoder always sees clean GT latents (σ=0). But at inference,
+    # the encoder sees model predictions from previous frames (autoregressive rollout).
+    # Scheduled sampling closes this gap by probabilistically replacing GT encoder inputs
+    # with the model's own x̂₀ predictions, following a curriculum from 0 → p_ar_end.
+    scheduled_sampling: bool = Field(
+        default=False,
+        description="Enable AR-aware scheduled sampling. Probabilistically replaces "
+        "GT encoder inputs with model's own x̂₀ predictions to close the "
+        "teacher-forcing / autoregressive inference gap.",
+    )
+    ss_p_ar_start: float = Field(
+        default=0.0,
+        description="Initial probability of using model predictions (start of curriculum).",
+        ge=0.0,
+        le=1.0,
+    )
+    ss_p_ar_end: float = Field(
+        default=0.5,
+        description="Final probability of using model predictions (end of curriculum).",
+        ge=0.0,
+        le=1.0,
+    )
+    ss_warmup_steps: int = Field(
+        default=50,
+        description="Steps before scheduled sampling begins (pure teacher forcing).",
+        ge=0,
+    )
+    ss_ramp_steps: int = Field(
+        default=150,
+        description="Steps over which p_ar ramps from ss_p_ar_start to ss_p_ar_end.",
+        ge=1,
+    )
+    ss_noise_augment: float = Field(
+        default=0.05,
+        description="Small noise added to x̂₀ to prevent overfitting to clean predictions. "
+        "Simulates the slight imperfections of real inference predictions.",
+        ge=0.0,
+        le=0.5,
+    )
+
     with_audio: bool = Field(
         default=False,
         description="Whether to include audio in training",
@@ -197,10 +238,33 @@ class SCDTrainingStrategy(TrainingStrategy):
         # encoder/decoder halves. It is set by the trainer after model creation.
         # When None, we fall back to standard (non-SCD) training as a single pass.
         self._scd_model: LTXSCDModel | None = None
+        # Current training step — updated by the trainer each step for scheduled sampling.
+        self._current_step: int = 0
 
     def set_scd_model(self, model: LTXSCDModel) -> None:
         """Set the SCD model wrapper. Called by the trainer after model creation."""
         self._scd_model = model
+
+    def set_current_step(self, step: int) -> None:
+        """Set the current training step (called by trainer each step)."""
+        self._current_step = step
+
+    def _get_p_ar(self) -> float:
+        """Get current probability of using AR predictions based on curriculum.
+
+        The curriculum has three phases:
+        1. Warmup (step < ss_warmup_steps): p_ar = 0 (pure teacher forcing)
+        2. Ramp (warmup <= step < warmup + ramp): linear interpolation start → end
+        3. Plateau (step >= warmup + ramp): p_ar = ss_p_ar_end (max AR exposure)
+        """
+        cfg = self.config
+        if not cfg.scheduled_sampling:
+            return 0.0
+        step = self._current_step
+        if step < cfg.ss_warmup_steps:
+            return 0.0
+        ramp_progress = min(1.0, (step - cfg.ss_warmup_steps) / cfg.ss_ramp_steps)
+        return cfg.ss_p_ar_start + ramp_progress * (cfg.ss_p_ar_end - cfg.ss_p_ar_start)
 
     @property
     def requires_audio(self) -> bool:
@@ -530,6 +594,31 @@ class SCDTrainingStrategy(TrainingStrategy):
         )
 
         # =================================================================
+        # AR-AWARE SCHEDULED SAMPLING
+        # =================================================================
+        # When enabled, probabilistically replace GT encoder input for some frames
+        # with the model's own x̂₀ predictions, closing the train/inference gap.
+        # This runs under no_grad() — the gradient signal comes from the normal
+        # decoder pass that follows, which now receives AR-contaminated features.
+        p_ar = self._get_p_ar()
+        if p_ar > 0.0 and num_frames > 1:
+            shifted_features = self._apply_scheduled_sampling(
+                video_latents=video_latents,
+                shifted_features=shifted_features,
+                video_positions=video_positions,
+                video_prompt_embeds=video_prompt_embeds,
+                prompt_attention_mask=prompt_attention_mask,
+                sigmas=sigmas,
+                video_noise=video_noise,
+                tokens_per_frame=tokens_per_frame,
+                num_frames=num_frames,
+                batch_size=batch_size,
+                device=device,
+                dtype=dtype,
+                p_ar=p_ar,
+            )
+
+        # =================================================================
         # DECODER PASS SETUP
         # =================================================================
         # SCD Paper §5.1: "Decoder sees noisy latents at sampled sigma."
@@ -607,6 +696,142 @@ class SCDTrainingStrategy(TrainingStrategy):
         model_inputs._raw_video_latents = batch["latents"]["latents"]  # [B, C, F, H, W]
 
         return model_inputs
+
+    @torch.no_grad()
+    def _apply_scheduled_sampling(
+        self,
+        video_latents: Tensor,
+        shifted_features: Tensor,
+        video_positions: Tensor,
+        video_prompt_embeds: Tensor,
+        prompt_attention_mask: Tensor,
+        sigmas: Tensor,
+        video_noise: Tensor,
+        tokens_per_frame: int,
+        num_frames: int,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        p_ar: float,
+    ) -> Tensor:
+        """Replace GT encoder features with model-predicted features for random frames.
+
+        Simulates autoregressive inference during training: for each frame (except
+        frame 0), flip a coin with probability p_ar. If heads:
+          1. Run a single-step decoder pass on the predecessor frame to get v̂
+          2. Recover x̂₀ = ε - v̂ (flow matching identity)
+          3. Re-encode x̂₀ through the encoder to get "AR-like" features
+          4. Replace the target frame's encoder features with these AR features
+
+        The entire operation runs under @torch.no_grad() — we don't backprop through
+        the AR simulation. The gradient signal comes from the normal decoder pass that
+        follows, which receives AR-contaminated encoder features. This is analogous to
+        how scheduled sampling works in seq2seq: the forward pass uses mixed GT/predicted
+        inputs, but the loss gradient flows through the final prediction only.
+
+        Args:
+            video_latents: Clean patchified latents [B, seq_len, C]
+            shifted_features: GT encoder features (already shifted) [B, seq_len, D]
+            video_positions: Position embeddings [B, 3, seq_len, 2]
+            video_prompt_embeds: Text embeddings
+            prompt_attention_mask: Text attention mask
+            sigmas: Sampled noise levels [B, 1]
+            video_noise: Gaussian noise [B, seq_len, C]
+            tokens_per_frame: Spatial tokens per frame (H * W)
+            num_frames: Number of video frames
+            batch_size: Batch size
+            device: Compute device
+            dtype: Compute dtype
+            p_ar: Current probability of AR replacement
+
+        Returns:
+            Modified shifted_features with some frames' features replaced by AR predictions
+        """
+        tpf = tokens_per_frame
+        result = shifted_features.clone()
+
+        # Determine which frames get AR replacement (skip frame 0 — no predecessor)
+        ar_mask = torch.rand(num_frames - 1) < p_ar
+
+        if not ar_mask.any():
+            return result
+
+        # Build noisy video: x_t = (1 - σ) * x₀ + σ * ε
+        sigmas_expanded = sigmas.view(-1, 1, 1)
+        noisy_video = (1 - sigmas_expanded) * video_latents + sigmas_expanded * video_noise
+
+        # For each selected frame, denoise its predecessor then re-encode
+        for f_idx in range(num_frames - 1):
+            if not ar_mask[f_idx]:
+                continue
+
+            pred_f = f_idx      # Predecessor frame to denoise
+            tgt_f = f_idx + 1   # Target frame that receives AR features
+
+            # Extract predecessor frame's tokens
+            start = pred_f * tpf
+            end = start + tpf
+
+            frame_noisy = noisy_video[:, start:end, :]    # [B, tpf, C]
+            frame_enc = shifted_features[:, start:end, :]  # [B, tpf, D]
+            frame_noise = video_noise[:, start:end, :]     # [B, tpf, C]
+
+            # Build single-frame modality for decoder
+            frame_positions = video_positions[:, :, start:end, :]  # [B, 3, tpf, 2]
+            frame_timesteps = sigmas.squeeze().expand(batch_size, tpf)  # [B, tpf]
+
+            frame_modality = Modality(
+                enabled=True,
+                latent=frame_noisy,
+                timesteps=frame_timesteps,
+                positions=frame_positions,
+                context=video_prompt_embeds,
+                context_mask=prompt_attention_mask,
+            )
+
+            # Single-step decoder to get velocity prediction
+            v_hat, _ = self._scd_model.forward_decoder_per_frame(
+                video=frame_modality,
+                encoder_features=frame_enc,
+                perturbations=None,
+                tokens_per_frame=tpf,
+                num_frames=1,
+            )
+
+            # Recover x̂₀ from velocity: flow matching says v = ε - x₀, so x₀ = ε - v̂
+            x0_hat = frame_noise - v_hat  # [B, tpf, C]
+
+            # Optional noise augmentation — simulates imperfect inference predictions
+            if self.config.ss_noise_augment > 0:
+                aug_noise = torch.randn_like(x0_hat) * self.config.ss_noise_augment
+                x0_hat = x0_hat + aug_noise
+
+            # Re-encode x̂₀ through the encoder (single frame, clean σ=0)
+            enc_timesteps = torch.zeros(batch_size, tpf, device=device, dtype=dtype)
+            enc_modality = Modality(
+                enabled=True,
+                latent=x0_hat,
+                timesteps=enc_timesteps,
+                positions=frame_positions,
+                context=video_prompt_embeds,
+                context_mask=prompt_attention_mask,
+            )
+
+            enc_video_args, _ = self._scd_model.forward_encoder(
+                video=enc_modality,
+                audio=None,
+                perturbations=None,
+                tokens_per_frame=tpf,
+            )
+
+            # Replace the target frame's encoder features with AR-derived features
+            # The shift is already applied — frame tgt_f's features in shifted_features
+            # correspond to frame pred_f's encoder output (which we just re-computed)
+            tgt_start = tgt_f * tpf
+            tgt_end = tgt_start + tpf
+            result[:, tgt_start:tgt_end, :] = enc_video_args.x.detach()
+
+        return result
 
     def compute_loss(
         self,

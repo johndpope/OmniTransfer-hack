@@ -43,6 +43,7 @@ evolution:
   noise_min: 1.0e-4        # Higher floor to prevent signal death
   update_scale: 0.003      # Slightly larger ES steps
   eval_batch_size: 6       # 6 samples per perturbation (lower variance)
+  hyperspherical: true     # Unit-norm perturbation directions (angular-only exploration)
 
 rollout:
   ar_frames: 3             # 3-frame temporal drift (encoder→decoder→next)

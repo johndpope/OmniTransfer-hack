@@ -95,6 +95,7 @@ class EvolutionConfig:
     # Data
     data_root: str = "/media/2TB/omnitransfer/data/ditto_subset"
     conditions_dir: str = "conditions_final"
+    max_samples: int | None = None  # Limit dataset to first N samples (None = use all)
 
     # Hybrid: Backprop warmup before evolution (PixelGen pattern)
     warmup_steps: int = 0  # 0 = skip warmup, >0 = backprop for N steps
@@ -136,6 +137,9 @@ class EvolutionConfig:
     # W&B
     wandb_enabled: bool = True
     wandb_project: str = "scd-evolution"
+
+    # Perturbation mode
+    hyperspherical: bool = False  # Unit-norm perturbation directions (angular-only exploration)
 
     # Misc
     seed: int = 42
@@ -429,6 +433,11 @@ class SCDEvolutionEngine:
                     "condition_path": str(cf),
                 })
 
+        # Optionally limit to first N samples (for overfitting / debugging)
+        if self.config.max_samples is not None and len(self.dataset_samples) > self.config.max_samples:
+            self.dataset_samples = self.dataset_samples[: self.config.max_samples]
+            logger.info(f"Truncated dataset to {self.config.max_samples} sample(s) (overfit mode)")
+
         logger.info(f"Loaded {len(self.dataset_samples)} dataset samples from {data_root}")
 
         if len(self.dataset_samples) == 0:
@@ -461,6 +470,7 @@ class SCDEvolutionEngine:
             device=str(self.device),
             dtype=self.dtype,
             use_gaussian=True,
+            use_hyperspherical=self.config.hyperspherical,
         )
 
         if self.perturbation_handler.num_params == 0:

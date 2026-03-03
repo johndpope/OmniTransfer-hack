@@ -141,6 +141,7 @@ class SelectiveLoRAPerturbation:
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
         use_gaussian: bool = True,
+        use_hyperspherical: bool = False,
         adam_beta1: float = 0.9,
         adam_beta2: float = 0.999,
         adam_eps: float = 1e-8,
@@ -150,6 +151,7 @@ class SelectiveLoRAPerturbation:
         self.device = device
         self.dtype = dtype
         self.use_gaussian = use_gaussian
+        self.use_hyperspherical = use_hyperspherical
 
         # Adam hyperparameters
         self.beta1 = adam_beta1
@@ -202,6 +204,12 @@ class SelectiveLoRAPerturbation:
                 else noise_from_hash(param_seed, idx)
             )
             noise = noise.view(self.original_values[name].shape).to(self.original_values[name].dtype)
+
+            # Hyperspherical: project to unit sphere per-parameter
+            if self.use_hyperspherical:
+                noise_norm = torch.norm(noise)
+                if noise_norm > 1e-8:
+                    noise = noise / noise_norm
 
             if cache_noise:
                 seed_cache[name] = noise  # Unit noise (no scale/direction)
@@ -269,6 +277,11 @@ class SelectiveLoRAPerturbation:
                         else noise_from_hash(param_seed, idx)
                     )
                     noise = noise.view(self.original_values[name].shape).to(self.original_values[name].dtype)
+                    # Must match apply_perturbation normalization
+                    if self.use_hyperspherical:
+                        noise_norm = torch.norm(noise)
+                        if noise_norm > 1e-8:
+                            noise = noise / noise_norm
                 gradient_estimate[name] += diff * noise / (2.0 * noise_scale)
 
         # Clear cache after use

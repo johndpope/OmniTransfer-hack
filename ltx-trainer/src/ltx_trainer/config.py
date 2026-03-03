@@ -129,7 +129,7 @@ class OptimizationConfig(ConfigBaseModel):
         description="Maximum gradient norm for clipping",
     )
 
-    optimizer_type: Literal["adamw", "adamw8bit"] = Field(
+    optimizer_type: Literal["adamw", "adamw8bit", "muon"] = Field(
         default="adamw",
         description="Type of optimizer to use for training",
     )

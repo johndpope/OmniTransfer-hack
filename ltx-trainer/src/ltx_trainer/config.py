@@ -157,6 +157,13 @@ class OptimizationConfig(ConfigBaseModel):
         ge=0.0,
     )
 
+    warmup_steps: int = Field(
+        default=0,
+        description="Number of linear warmup steps before the main scheduler kicks in. "
+        "Useful for stabilizing Muon with token_concat (doubled sequence length).",
+        ge=0,
+    )
+
     enable_gradient_checkpointing: bool = Field(
         default=False,
         description="Enable gradient checkpointing to save memory at the cost of slower training",

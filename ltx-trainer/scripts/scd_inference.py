@@ -458,15 +458,29 @@ def main() -> None:
             args.num_inference_steps = len(DISTILLED_SIGMA_VALUES) - 1  # 8 steps
         print(f"  Distilled mode: {args.num_inference_steps} steps with {'BézierFlow' if args.bezier_schedule else 'predefined'} sigma schedule")
 
-    # ── Handle BézierFlow schedule ──
+    # ── Handle learned sigma schedule (BézierFlow or BSplineFlow) ──
     BEZIER_SIGMA_VALUES = None
     if args.bezier_schedule:
-        from ltx_trainer.bezierflow import BezierScheduler
-        _bezier = BezierScheduler.load(args.bezier_schedule, device="cpu")
-        # Use the user-specified --num-inference-steps (not overridden by distilled)
-        BEZIER_SIGMA_VALUES = _bezier.get_sigma_schedule(args.num_inference_steps).tolist()
-        print(f"  BézierFlow: {args.num_inference_steps} steps, σ={[f'{s:.4f}' for s in BEZIER_SIGMA_VALUES]}")
-        del _bezier
+        sched_path = Path(args.bezier_schedule)
+        json_path = sched_path.with_suffix(".json")
+        sched_type = "bezier"
+        if json_path.exists():
+            import json as _json
+            _cfg = _json.loads(json_path.read_text())
+            sched_type = _cfg.get("type", "bezier")
+
+        if sched_type == "bspline":
+            from ltx_trainer.bsplineflow import BSplineScheduler
+            _sched = BSplineScheduler.load(args.bezier_schedule, device="cpu")
+            label = "BSplineFlow"
+        else:
+            from ltx_trainer.bezierflow import BezierScheduler
+            _sched = BezierScheduler.load(args.bezier_schedule, device="cpu")
+            label = "BézierFlow"
+
+        BEZIER_SIGMA_VALUES = _sched.get_sigma_schedule(args.num_inference_steps).tolist()
+        print(f"  {label}: {args.num_inference_steps} steps, σ={[f'{s:.4f}' for s in BEZIER_SIGMA_VALUES]}")
+        del _sched
 
     # ── Validate dimensions ──
     assert args.height % 32 == 0, f"Height {args.height} must be divisible by 32"

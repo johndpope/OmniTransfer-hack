@@ -22,6 +22,7 @@ from torch.optim.lr_scheduler import (
     LinearLR,
     LRScheduler,
     PolynomialLR,
+    SequentialLR,
     StepLR,
 )
 from torch.utils.data import DataLoader
@@ -1104,21 +1105,26 @@ class LtxvTrainer:
         steps = self._config.optimization.steps
         params = self._config.optimization.scheduler_params or {}
 
+        warmup_steps = self._config.optimization.warmup_steps
+
         if scheduler_type is None:
             return None
+
+        # Subtract warmup from main scheduler duration so total = warmup + main = steps
+        main_steps = max(steps - warmup_steps, 1)
 
         if scheduler_type == "linear":
             scheduler = LinearLR(
                 optimizer,
                 start_factor=params.pop("start_factor", 1.0),
                 end_factor=params.pop("end_factor", 0.1),
-                total_iters=steps,
+                total_iters=main_steps,
                 **params,
             )
         elif scheduler_type == "cosine":
             scheduler = CosineAnnealingLR(
                 optimizer,
-                T_max=steps,
+                T_max=main_steps,
                 eta_min=params.pop("eta_min", 0),
                 **params,
             )
@@ -1148,6 +1154,21 @@ class LtxvTrainer:
             scheduler = None
         else:
             raise ValueError(f"Unknown scheduler type: {scheduler_type}")
+
+        # Wrap with linear warmup if warmup_steps > 0
+        if warmup_steps > 0 and scheduler is not None:
+            warmup_scheduler = LinearLR(
+                optimizer,
+                start_factor=1e-3,  # Start at 0.1% of peak lr
+                end_factor=1.0,
+                total_iters=warmup_steps,
+            )
+            scheduler = SequentialLR(
+                optimizer,
+                schedulers=[warmup_scheduler, scheduler],
+                milestones=[warmup_steps],
+            )
+            logger.info(f"LR warmup: {warmup_steps} steps (linear 0.001× → 1×), then {scheduler_type}")
 
         return scheduler
 

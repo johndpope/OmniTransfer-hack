@@ -105,10 +105,20 @@ def main() -> None:
         help="Single cached embedding .pt file",
     )
 
+    # Scheduler type selection
+    parser.add_argument(
+        "--scheduler-type", default="bezier", choices=["bezier", "bspline"],
+        help="Scheduler parameterization: 'bezier' (global Bernstein basis) or 'bspline' (local B-spline basis)",
+    )
+    parser.add_argument(
+        "--bspline-order", type=int, default=4,
+        help="B-spline order (degree=order-1). Only used when --scheduler-type=bspline. 4=cubic.",
+    )
+
     # Training params
     parser.add_argument("--teacher-steps", type=int, default=30, help="Teacher (high-quality) denoising steps")
     parser.add_argument("--student-steps", type=int, default=4, help="Student (target) denoising steps")
-    parser.add_argument("--n-control-points", type=int, default=32, help="Bézier control points")
+    parser.add_argument("--n-control-points", type=int, default=32, help="Control points / coefficients")
     parser.add_argument("--num-iterations", type=int, default=200, help="Training iterations")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--guidance-scale", type=float, default=4.0, help="CFG scale for teacher and student")
@@ -145,10 +155,12 @@ def main() -> None:
 
     use_cfg = args.guidance_scale > 1.0
 
+    _sched_name = "BézierFlow" if args.scheduler_type == "bezier" else f"BSplineFlow (order={args.bspline_order})"
     print()
     print("=" * 65)
-    print("  BézierFlow Schedule Training")
+    print(f"  {_sched_name} Schedule Training")
     print("=" * 65)
+    print(f"  Scheduler:      {args.scheduler_type}")
     print(f"  Teacher steps:  {args.teacher_steps}")
     print(f"  Student steps:  {args.student_steps}")
     print(f"  Control points: {args.n_control_points}")
@@ -167,7 +179,7 @@ def main() -> None:
             wandb_run = wandb.init(
                 project=args.wandb_project,
                 config=vars(args),
-                name=f"bezier_s{args.student_steps}_cp{args.n_control_points}",
+                name=f"{args.scheduler_type}_s{args.student_steps}_cp{args.n_control_points}",
             )
         except Exception as e:
             print(f"  W&B init failed: {e}, continuing without logging")
@@ -287,11 +299,19 @@ def main() -> None:
     # ══════════════════════════════════════════════════════════════════
     # Step 3: Train BézierFlow schedule
     # ══════════════════════════════════════════════════════════════════
-    print(f"\n[3/3] Training BézierFlow ({args.num_iterations} iterations)...")
+    sched_label = "BézierFlow" if args.scheduler_type == "bezier" else "BSplineFlow"
+    print(f"\n[3/3] Training {sched_label} ({args.num_iterations} iterations)...")
 
-    from ltx_trainer.bezierflow import BezierScheduler
+    if args.scheduler_type == "bezier":
+        from ltx_trainer.bezierflow import BezierScheduler
+        bezier = BezierScheduler(n_control_points=args.n_control_points).to(device)
+    else:
+        from ltx_trainer.bsplineflow import BSplineScheduler
+        bezier = BSplineScheduler(  # variable named 'bezier' for minimal diff
+            n_coefficients=args.n_control_points,
+            order=args.bspline_order,
+        ).to(device)
 
-    bezier = BezierScheduler(n_control_points=args.n_control_points).to(device)
     optimizer = torch.optim.RMSprop(bezier.parameters(), lr=args.lr, momentum=0.9)
 
     # Show initial schedule

@@ -2,6 +2,39 @@
 
 This file provides guidance to AI coding assistants (Claude, Cursor, etc.) when working with code in this repository.
 
+## ⚠️ CRITICAL: Check Image Size Before Reading
+
+> **ALWAYS check file size and dimensions before using the Read tool on images!**
+>
+> Large images (>500KB or >1024px in any dimension) blow out the context window and can
+> cause conversation resets. Debug images from training (e.g., `debug_decoded.png`) are
+> typically 1536×1792 / 3.6MB — far too large to read directly.
+>
+> **Before reading ANY image file:**
+> ```bash
+> # Check file size first
+> ls -la /path/to/image.png | awk '{print $5}'
+>
+> # Check dimensions
+> python3 -c "from PIL import Image; img=Image.open('/path/to/image.png'); print(f'{img.size[0]}x{img.size[1]}')"
+> ```
+>
+> **If the image is >500KB or >1024px, resize before reading:**
+> ```bash
+> python3 -c "
+> from PIL import Image
+> img = Image.open('/path/to/large.png')
+> img.thumbnail((512, 512), Image.LANCZOS)
+> img.save('/tmp/preview.png')
+> "
+> ```
+> Then read `/tmp/preview.png` instead.
+>
+> **Never directly Read tool on:** `debug_decoded.png`, `debug_recon.png`, or any
+> training visualization without checking size first.
+
+---
+
 ## ⚠️ CRITICAL: Always Use Muon Optimizer
 
 > **All training configs MUST use the Muon optimizer — never use AdamW or other optimizers.**

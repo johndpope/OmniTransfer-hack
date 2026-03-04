@@ -273,8 +273,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--lora-path",
-        default="/media/2TB/omnitransfer/output/scd_ditto_subset/checkpoints/lora_weights_step_02000.safetensors",
-        help="SCD LoRA checkpoint",
+        default="/media/2TB/omnitransfer/output/scd_token_concat/checkpoints/lora_weights_step_01000.safetensors",
+        help="SCD LoRA checkpoint (must be trained with matching --decoder-combine mode)",
     )
 
     # Text conditioning (one required)
@@ -310,7 +310,7 @@ def main() -> None:
     # SCD Paper, Section 3.3: Encoder features are combined with decoder input via either
     # additive fusion ("add") or token concatenation ("token_concat"). Additive is simpler
     # and memory-efficient; token_concat preserves more information but doubles sequence length.
-    parser.add_argument("--decoder-combine", default="add", choices=["add", "token_concat"])
+    parser.add_argument("--decoder-combine", default="token_concat", choices=["add", "token_concat"])
     parser.add_argument("--quantization", default="fp8-quanto", choices=["fp8-quanto", "int8-quanto", "none"])
     parser.add_argument("--compile", action="store_true", help="torch.compile decoder for ~1.5-2x speedup (warmup takes ~60s)")
 
@@ -453,15 +453,17 @@ def main() -> None:
             else:
                 print(f"  WARNING: Distilled model not found at {distilled_path}")
                 print(f"  Using dev model with distilled sigma schedule (quality may differ)")
-        args.num_inference_steps = len(DISTILLED_SIGMA_VALUES) - 1  # 8 steps
-        print(f"  Distilled mode: {args.num_inference_steps} steps with predefined sigma schedule")
+        # BézierFlow overrides the distilled step count — user controls steps via CLI
+        if not args.bezier_schedule:
+            args.num_inference_steps = len(DISTILLED_SIGMA_VALUES) - 1  # 8 steps
+        print(f"  Distilled mode: {args.num_inference_steps} steps with {'BézierFlow' if args.bezier_schedule else 'predefined'} sigma schedule")
 
     # ── Handle BézierFlow schedule ──
     BEZIER_SIGMA_VALUES = None
     if args.bezier_schedule:
         from ltx_trainer.bezierflow import BezierScheduler
         _bezier = BezierScheduler.load(args.bezier_schedule, device="cpu")
-        # Infer step count from the --num-inference-steps arg (user sets this)
+        # Use the user-specified --num-inference-steps (not overridden by distilled)
         BEZIER_SIGMA_VALUES = _bezier.get_sigma_schedule(args.num_inference_steps).tolist()
         print(f"  BézierFlow: {args.num_inference_steps} steps, σ={[f'{s:.4f}' for s in BEZIER_SIGMA_VALUES]}")
         del _bezier

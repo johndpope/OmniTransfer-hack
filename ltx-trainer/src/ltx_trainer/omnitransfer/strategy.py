@@ -747,6 +747,72 @@ class OmniTransferConfig(TrainingStrategyConfigBase):
         ge=1,
     )
 
+    # ======================================================================
+    # MotionStream Track Conditioning (arXiv:2511.01266)
+    # ======================================================================
+    enable_track_conditioning: bool = Field(
+        default=False,
+        description="Enable MotionStream-style track conditioning. Encodes 2D point "
+        "tracks as cross-attention tokens for explicit geometric motion control.",
+    )
+    track_num_tokens: int = Field(
+        default=8,
+        description="Number of track query tokens for cross-attention.",
+        ge=1,
+    )
+    track_hidden_dim: int = Field(
+        default=512,
+        description="Internal hidden dimension of track conditioner.",
+    )
+    track_num_layers: int = Field(
+        default=4,
+        description="Number of transformer layers in track conditioner.",
+        ge=1,
+    )
+    track_sincos_dim: int = Field(
+        default=64,
+        description="Sinusoidal embedding dimension per coordinate (total PE dim = sincos_dim * 2).",
+    )
+    track_max_points: int = Field(
+        default=128,
+        description="Maximum number of track points per sample.",
+        ge=1,
+    )
+    track_decoder_loss_weight: float = Field(
+        default=0.05,
+        description="Weight for auxiliary track decoder loss.",
+        ge=0.0,
+    )
+    track_decoder_anneal_steps: int = Field(
+        default=15000,
+        description="Steps over which track decoder loss anneals to zero.",
+        ge=1,
+    )
+    track_consistency_loss_weight: float = Field(
+        default=0.02,
+        description="Weight for track consistency loss on generated latents.",
+        ge=0.0,
+    )
+    track_pseudo_gt_dir: str = Field(
+        default="tracks",
+        description="Directory for pre-computed track .pt files.",
+    )
+    enable_joint_motion_cfg: bool = Field(
+        default=False,
+        description="Enable joint text-motion classifier-free guidance during training. "
+        "Requires randomly dropping text/motion conditions independently.",
+    )
+    motion_cfg_drop_rate: float = Field(
+        default=0.1,
+        description="Probability of dropping motion/track conditions for CFG training.",
+        ge=0.0, le=1.0,
+    )
+    text_cfg_drop_rate: float = Field(
+        default=0.1,
+        description="Probability of dropping text conditions for CFG training.",
+        ge=0.0, le=1.0,
+    )
+
     _task_step_counter: int = 0  # For round-robin sampling
 
     @property
@@ -833,6 +899,10 @@ class OmniTransferModelInputs(ModelInputs):
     # AMB3R 3D reconstruction outputs (arXiv:2511.20343)
     geo_3d_hidden: Tensor | None = None        # [B, K, hidden_dim] from Geometric3DEncoder
     depth_3d_pseudo_gt: dict | None = None     # Pre-computed depth/points/confidence/normals
+
+    # MotionStream track conditioning outputs (arXiv:2511.01266)
+    track_hidden: Tensor | None = None         # [B, K, hidden_dim] from TrackConditioner
+    track_pseudo_gt: dict | None = None        # Pre-computed tracks/visibility
 
 
 class OmniTransferStrategy(TrainingStrategy):
@@ -1046,6 +1116,39 @@ class OmniTransferStrategy(TrainingStrategy):
                 f"Initialized AMB3R Geometric3DEncoder: "
                 f"tokens={config.geometric_3d_num_tokens}, hidden={config.geometric_3d_hidden_dim}, "
                 f"layers={config.geometric_3d_num_layers}, params={param_count:,}{dec_info}"
+            )
+
+        # ======================================================================
+        # MotionStream Track Conditioning (arXiv:2511.01266)
+        # ======================================================================
+        self._track_conditioner = None
+        self._track_decoder = None
+
+        if config.enable_track_conditioning:
+            from ltx_trainer.omnitransfer.track_conditioner import TrackConditioner
+            self._track_conditioner = TrackConditioner(
+                sincos_dim=config.track_sincos_dim,
+                hidden_dim=config.track_hidden_dim,
+                output_dim=3840,
+                num_tokens=config.track_num_tokens,
+                num_layers=config.track_num_layers,
+                max_tracks=config.track_max_points,
+            )
+
+            if config.track_decoder_loss_weight > 0:
+                from ltx_trainer.omnitransfer.track_decoder import TrackDecoder
+                self._track_decoder = TrackDecoder(
+                    hidden_dim=config.track_hidden_dim,
+                    num_tokens=config.track_num_tokens,
+                    max_tracks=config.track_max_points,
+                )
+
+            param_count = sum(p.numel() for p in self._track_conditioner.parameters())
+            dec_info = ", +Decoder" if self._track_decoder else ""
+            logger.info(
+                f"Initialized TrackConditioner: tokens={config.track_num_tokens}, "
+                f"hidden={config.track_hidden_dim}, layers={config.track_num_layers}, "
+                f"params={param_count:,}{dec_info}"
             )
 
         # Log I2V mode if enabled
@@ -1626,6 +1729,10 @@ class OmniTransferStrategy(TrainingStrategy):
         if self.config.enable_depth_3d_loss or self.config.enable_geometric_3d_encoder:
             sources[self.config.depth_3d_pseudo_gt_dir] = "depth_3d"
 
+        # MotionStream track conditioning pseudo-GT
+        if self.config.enable_track_conditioning:
+            sources[self.config.track_pseudo_gt_dir] = "tracks"
+
         return sources
 
     def _apply_augmentations(
@@ -1950,6 +2057,63 @@ class OmniTransferStrategy(TrainingStrategy):
                 )
                 prompt_attention_mask = torch.cat([geo_mask, prompt_attention_mask], dim=1)
 
+        # ======================================================================
+        # MotionStream Track Conditioning Processing (arXiv:2511.01266)
+        # ======================================================================
+        track_hidden = None
+        track_pseudo_gt = None
+
+        # Load track pseudo-GT if available
+        if self._track_conditioner is not None and "tracks" in batch:
+            try:
+                trk = batch["tracks"]
+                track_pseudo_gt = {
+                    k: v.to(device=device, dtype=dtype) if isinstance(v, Tensor) else v
+                    for k, v in trk.items()
+                    if k in ("coords", "visibility", "track_ids")
+                }
+            except Exception as e:
+                logger.debug(f"Failed to load track pseudo-GT: {e}")
+                track_pseudo_gt = None
+
+        # Encode tracks into tokens for cross-attention
+        if self._track_conditioner is not None and track_pseudo_gt is not None:
+            if not hasattr(self, '_track_cond_device_set'):
+                self._track_conditioner.to(device=device, dtype=dtype)
+                self._track_cond_device_set = True
+                if self._track_decoder is not None:
+                    self._track_decoder.to(device=device, dtype=dtype)
+                logger.info(f"TrackConditioner moved to {device}")
+
+            coords = track_pseudo_gt.get("coords")       # [B, F, N, 2]
+            visibility = track_pseudo_gt.get("visibility")  # [B, F, N]
+
+            if coords is not None:
+                # Joint motion CFG: randomly drop track conditions
+                drop_tracks = False
+                if self.config.enable_joint_motion_cfg and self.training:
+                    import random
+                    drop_tracks = random.random() < self.config.motion_cfg_drop_rate
+
+                if not drop_tracks:
+                    track_tokens, track_hidden = self._track_conditioner(coords, visibility)
+                    # track_tokens: [B, K, 3840]
+
+                    if not hasattr(self, '_logged_track_shape'):
+                        logger.info(
+                            f"MotionStream track tokens: {track_tokens.shape} "
+                            f"(prepended to prompt_embeds for cross-attention)"
+                        )
+                        self._logged_track_shape = True
+
+                    # Prepend to prompt_embeds (before motion/geo/text tokens)
+                    prompt_embeds = torch.cat([track_tokens, prompt_embeds], dim=1)
+                    trk_mask = torch.ones(
+                        batch_size, track_tokens.shape[1],
+                        device=device, dtype=prompt_attention_mask.dtype,
+                    )
+                    prompt_attention_mask = torch.cat([trk_mask, prompt_attention_mask], dim=1)
+
         # 3DiMo self-reconstruction mode: target == driving video
         if self.config.motion_self_reconstruction and self._motion_encoder is not None:
             import random as _random
@@ -2194,6 +2358,9 @@ class OmniTransferStrategy(TrainingStrategy):
             # AMB3R 3D reconstruction outputs (NOT detached - decoder loss needs gradients)
             geo_3d_hidden=geo_3d_hidden if geo_3d_hidden is not None else None,
             depth_3d_pseudo_gt=depth_3d_pseudo_gt,
+            # MotionStream track conditioning outputs (NOT detached - decoder loss needs gradients)
+            track_hidden=track_hidden if track_hidden is not None else None,
+            track_pseudo_gt=track_pseudo_gt,
         )
 
     def compute_loss(
@@ -2360,6 +2527,44 @@ class OmniTransferStrategy(TrainingStrategy):
             )
             if geo_3d_dec_loss is not None:
                 loss = loss + geo_3d_dec_loss
+
+        # ======================================================================
+        # MotionStream Track Conditioning Losses (arXiv:2511.01266)
+        # ======================================================================
+        # Track decoder auxiliary loss
+        if (
+            self._track_decoder is not None
+            and inputs.track_hidden is not None
+            and inputs.track_pseudo_gt is not None
+        ):
+            from ltx_trainer.omnitransfer.track_decoder import compute_track_decoder_loss
+            trk_dec_loss = compute_track_decoder_loss(
+                decoder=self._track_decoder,
+                hidden=inputs.track_hidden.to(device=loss.device),
+                gt_tracks=inputs.track_pseudo_gt,
+                step=self._current_step,
+                initial_weight=self.config.track_decoder_loss_weight,
+                anneal_steps=self.config.track_decoder_anneal_steps,
+            )
+            if trk_dec_loss is not None:
+                loss = loss + trk_dec_loss
+
+        # Track consistency loss on generated latents
+        if (
+            self.config.track_consistency_loss_weight > 0
+            and inputs.track_pseudo_gt is not None
+            and compute_perceptual
+        ):
+            from ltx_trainer.omnitransfer.track_losses import compute_track_loss
+            trk_loss = compute_track_loss(
+                target_pred=target_pred,
+                inputs=inputs,
+                step=self._current_step,
+                weight=self.config.track_consistency_loss_weight,
+                anneal_steps=self.config.depth_3d_loss_anneal_steps,  # Reuse anneal schedule
+            )
+            if trk_loss is not None:
+                loss = loss + trk_loss * self.config.perceptual_loss_interval
 
         return loss
 

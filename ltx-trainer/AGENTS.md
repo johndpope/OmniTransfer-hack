@@ -27,6 +27,38 @@ This file provides guidance to AI coding assistants (Claude, Cursor, etc.) when 
 
 ---
 
+## ⚠️ CRITICAL: Always Use token_concat for SCD Decoder Combine
+
+> **All SCD training and inference MUST use `decoder_input_combine: "token_concat"` — never use `"add"` mode.**
+>
+> The SCD paper (Table 3 ablation) shows `token_concat` significantly outperforms `add` and `concat`:
+> - **token_concat**: Prepends encoder features as prefix tokens → decoder self-attention attends
+>   to both encoder context and noisy tokens → rich, learned encoder-decoder interaction
+> - **add**: Raw element-wise addition of encoder features to decoder tokens → NO learned alignment,
+>   encoder features (post-32 transformer blocks) have completely different distribution from
+>   freshly patchified decoder tokens → **produces mush at inference**
+>
+> With `per_frame_decoder: true`, token_concat only doubles per-frame tokens (336→672) which
+> easily fits on 32GB GPU. The old OOM concern was for multi-frame token_concat (1344→2688).
+>
+> **Required config:**
+> ```yaml
+> training_strategy:
+>   name: "scd"
+>   decoder_input_combine: "token_concat"   # Paper's best mode
+>   per_frame_decoder: true                 # Keeps sequence manageable (672 tokens)
+> ```
+>
+> **Inference must match:**
+> ```bash
+> python scripts/scd_inference.py --decoder-combine token_concat ...
+> ```
+>
+> **Do NOT use** `decoder_input_combine: "add"` unless explicitly asked. The `add` mode has
+> no learned alignment layer and produces mushy, washed-out output at inference time.
+
+---
+
 ## Project Overview
 
 **LTX-2 Trainer** is a training toolkit for fine-tuning the Lightricks LTX-2 audio-video generation model. It supports:

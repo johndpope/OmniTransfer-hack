@@ -88,8 +88,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--lora-path",
-        default="/media/2TB/omnitransfer/output/scd_distilled_perframe/checkpoints/lora_weights_step_02000.safetensors",
-        help="SCD LoRA checkpoint",
+        default="/media/2TB/omnitransfer/output/scd_token_concat/checkpoints/lora_weights_step_01000.safetensors",
+        help="SCD LoRA checkpoint (must match --decoder-combine mode)",
     )
 
     # Data source — either a directory of embeddings or a single file
@@ -117,7 +117,7 @@ def main() -> None:
 
     # SCD architecture
     parser.add_argument("--encoder-layers", type=int, default=32)
-    parser.add_argument("--decoder-combine", default="add", choices=["add", "token_concat"])
+    parser.add_argument("--decoder-combine", default="token_concat", choices=["add", "token_concat"])
     parser.add_argument("--quantization", default="int8-quanto", choices=["fp8-quanto", "int8-quanto", "none"])
     parser.add_argument("--height", type=int, default=448)
     parser.add_argument("--width", type=int, default=768)

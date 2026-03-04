@@ -72,6 +72,18 @@ from ltx_trainer.omnitransfer.geometric_3d_decoder import (
     Geometric3DDecoder,
     compute_geo_3d_decoder_loss,
 )
+from ltx_trainer.omnitransfer.track_conditioner import (
+    TrackConditioner,
+    sinusoidal_track_embedding,
+)
+from ltx_trainer.omnitransfer.track_decoder import (
+    TrackDecoder,
+    compute_track_decoder_loss,
+)
+from ltx_trainer.omnitransfer.track_losses import (
+    track_consistency_loss,
+    compute_track_loss,
+)
 
 # Qwen VL integration for TMA (optional, requires transformers>=4.43)
 try:
@@ -136,6 +148,13 @@ __all__ = [
     "Geometric3DEncoder",
     "Geometric3DDecoder",
     "compute_geo_3d_decoder_loss",
+    # MotionStream Track Conditioning (arXiv:2511.01266)
+    "TrackConditioner",
+    "sinusoidal_track_embedding",
+    "TrackDecoder",
+    "compute_track_decoder_loss",
+    "track_consistency_loss",
+    "compute_track_loss",
     # Qwen VL TMA integration (optional)
     "QwenVLConfig",
     "QwenVLFeatureExtractor",

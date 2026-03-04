@@ -73,12 +73,6 @@ class ModelInputs:
     _global_context: Tensor | None = None  # [B, num_global, D] from GlobalContextEmbedder
     _edit_mask: Tensor | None = None       # [B, seq_len] boolean edit mask
 
-    # HRR-specific: cross-caption editing signal for routing divergence loss
-    _edit_prompt_embeds: Tensor | None = None    # [B, T, 3840] HRR-enhanced edit caption
-    _edit_prompt_mask: Tensor | None = None      # [B, T] edit attention mask
-    _hrr_edit_mask: Tensor | None = None         # [B, T_text] routing divergence per token
-    _hrr_input_embeds: Tensor | None = None      # [B, T, 3840] pre-HRR for entropy reg
-
 
 class TrainingStrategy(ABC):
     """Abstract base class for training strategies.

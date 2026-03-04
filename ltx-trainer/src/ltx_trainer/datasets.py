@@ -1,4 +1,3 @@
-import random
 from pathlib import Path
 
 import torch
@@ -202,6 +201,23 @@ class PrecomputedDataset(Dataset):
             expected_path = self._get_expected_file_path(dir_name, data_file, rel_path)
             sample_files[output_key].append(expected_path.relative_to(self.source_paths[dir_name]))
 
+    def rescan(self) -> int:
+        """Re-glob directories for new .pt files added since last scan.
+
+        Returns the number of new samples found. Only call when no DataLoader
+        workers are active (e.g., between epochs after rebuilding the loader).
+        """
+        first_key = next(iter(self.sample_files.keys()))
+        old_count = len(self.sample_files[first_key])
+
+        self.sample_files = self._discover_samples()
+
+        new_count = len(self.sample_files[first_key])
+        delta = new_count - old_count
+        if delta > 0:
+            logger.info(f"Live ingest: discovered {delta} new samples (total: {new_count})")
+        return delta
+
     def _validate_setup(self) -> None:
         """Validate that the dataset setup is correct."""
         if not self.sample_files:
@@ -305,40 +321,3 @@ class PrecomputedDataset(Dataset):
                 data["qwen_features"] = features.view(-1, features.shape[-1])
 
         return data
-
-
-class PairedPrecomputedDataset(PrecomputedDataset):
-    """PrecomputedDataset that also returns a random different sample's text conditions.
-
-    For each __getitem__(idx), returns the normal sample dict plus:
-      - "edit_conditions": text conditions from a random *different* sample
-
-    This enables cross-caption training where the model learns that different
-    prompts should produce different outputs (used by HRR routing divergence).
-    """
-
-    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
-        result = super().__getitem__(index)
-
-        # Pick a random different index for the edit caption
-        n = len(self)
-        edit_idx = index
-        while edit_idx == index:
-            edit_idx = random.randint(0, n - 1)
-
-        # Load only the text conditions from the edit sample
-        cond_key = "conditions"
-        cond_output_key = self.data_sources.get(cond_key, "text_conditions")
-        source_path = self.source_paths[cond_key]
-        file_rel_path = self.sample_files[cond_output_key][edit_idx]
-        file_path = source_path / file_rel_path
-
-        try:
-            edit_cond = torch.load(file_path, map_location="cpu", weights_only=True)
-        except Exception as e:
-            # Fallback: just reuse the same conditions (no cross-caption signal)
-            logger.warning(f"Failed to load edit conditions from {file_path}: {e}")
-            edit_cond = result.get("text_conditions", result.get(cond_output_key, {}))
-
-        result["edit_conditions"] = edit_cond
-        return result

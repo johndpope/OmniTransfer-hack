@@ -25,6 +25,8 @@ class TransformerArgs:
     cross_scale_shift_timestep: torch.Tensor | None
     cross_gate_timestep: torch.Tensor | None
     enabled: bool
+    self_attn_mask: torch.Tensor | None = None  # UNUSED — kept for API compat
+    rcl_split_point: int | None = None  # Split point for RCL decoupled attention
 
 
 class TransformerArgsPreprocessor:
@@ -143,6 +145,8 @@ class TransformerArgsPreprocessor:
             cross_scale_shift_timestep=None,
             cross_gate_timestep=None,
             enabled=modality.enabled,
+            self_attn_mask=modality.self_attn_mask,
+            rcl_split_point=modality.rcl_split_point,
         )
 
 

@@ -22,6 +22,7 @@ from torch.optim.lr_scheduler import (
     LinearLR,
     LRScheduler,
     PolynomialLR,
+    SequentialLR,
     StepLR,
 )
 from torch.utils.data import DataLoader
@@ -181,6 +182,11 @@ class LtxvTrainer:
                 try:
                     batch = next(data_iter)
                 except StopIteration:
+                    # Epoch boundary — check for new samples from live ingest
+                    if self._config.data.live_ingest_enabled:
+                        new_count = self._dataset.rescan()
+                        if new_count > 0:
+                            self._rebuild_dataloader()
                     data_iter = iter(self._dataloader)
                     batch = next(data_iter)
 
@@ -282,14 +288,18 @@ class LtxvTrainer:
 
                     # Log metrics to W&B (only on main process and optimization steps)
                     if IS_MAIN_PROCESS and is_optimization_step:
-                        self._log_metrics(
-                            {
-                                "train/loss": loss.item(),
-                                "train/learning_rate": current_lr,
-                                "train/step_time": step_time,
-                                "train/global_step": self._global_step,
-                            }
-                        )
+                        metrics = {
+                            "train/loss": loss.item(),
+                            "train/learning_rate": current_lr,
+                            "train/step_time": step_time,
+                            "train/global_step": self._global_step,
+                        }
+                        # Log scheduled sampling probability if active
+                        if hasattr(self._training_strategy, "_get_p_ar"):
+                            p_ar = self._training_strategy._get_p_ar()
+                            if p_ar > 0.0 or hasattr(self._training_strategy, "_current_step"):
+                                metrics["train/p_ar"] = p_ar
+                        self._log_metrics(metrics)
 
                         # Save debug image every optimization step (overwrites)
                         if should_save_debug and video_pred is not None and model_inputs is not None:
@@ -448,6 +458,10 @@ class LtxvTrainer:
             conditions["audio_prompt_embeds"] = audio_embeds
             conditions["prompt_attention_mask"] = attention_mask
 
+        # Pass current step to strategy (for scheduled sampling curriculum)
+        if hasattr(self._training_strategy, "set_current_step"):
+            self._training_strategy.set_current_step(self._global_step)
+
         # Use strategy to prepare training inputs (returns ModelInputs with Modality objects)
         model_inputs = self._training_strategy.prepare_training_inputs(batch, self._timestep_sampler)
 
@@ -455,19 +469,34 @@ class LtxvTrainer:
         # For SCD strategy: encoder already ran in prepare_training_inputs;
         # here we only run the decoder with encoder features
         if hasattr(model_inputs, "_scd_model") and model_inputs._scd_model is not None:
-            # Pass EditCtrl control signals if available
-            local_control = getattr(model_inputs, "_local_control", None)
-            global_context = getattr(model_inputs, "_global_context", None)
+            # Per-frame decoder: process each frame independently through the decoder,
+            # matching the autoregressive inference setup (1 frame per forward pass).
+            # This prevents the train/inference attention scope mismatch that causes
+            # grid artifacts when the decoder LoRA is trained on multi-frame input
+            # but used on single-frame input at inference.
+            per_frame = getattr(model_inputs, "_per_frame_decoder", False)
+            if per_frame:
+                video_pred, audio_pred = model_inputs._scd_model.forward_decoder_per_frame(
+                    video=model_inputs.video,
+                    encoder_features=model_inputs._encoder_features,
+                    perturbations=None,
+                    tokens_per_frame=model_inputs._tokens_per_frame,
+                    num_frames=model_inputs._num_frames,
+                )
+            else:
+                # Pass EditCtrl control signals if available
+                local_control = getattr(model_inputs, "_local_control", None)
+                global_context = getattr(model_inputs, "_global_context", None)
 
-            video_pred, audio_pred = model_inputs._scd_model.forward_decoder(
-                video=model_inputs.video,
-                encoder_features=model_inputs._encoder_features,
-                audio=model_inputs.audio,
-                perturbations=None,
-                encoder_audio_args=model_inputs._encoder_audio_args,
-                local_control=local_control,
-                global_context=global_context,
-            )
+                video_pred, audio_pred = model_inputs._scd_model.forward_decoder(
+                    video=model_inputs.video,
+                    encoder_features=model_inputs._encoder_features,
+                    audio=model_inputs.audio,
+                    perturbations=None,
+                    encoder_audio_args=model_inputs._encoder_audio_args,
+                    local_control=local_control,
+                    global_context=global_context,
+                )
         else:
             video_pred, audio_pred = self._transformer(
                 video=model_inputs.video,
@@ -719,22 +748,6 @@ class LtxvTrainer:
             self._local_context_module = None
             self._global_embedder = None
             self._tma = None
-
-        # Instantiate HRR text enhancer if configured
-        self._hrr_enhancer = None
-        if self._config.hrr.enabled and isinstance(self._training_strategy, EditCtrlSCDTrainingStrategy):
-            from ltx_trainer.hrr_text_enhancer import create_hrr_enhancer  # noqa: PLC0415
-            self._hrr_enhancer = create_hrr_enhancer(self._config.hrr, dim=3840)
-            self._hrr_enhancer = self._hrr_enhancer.to(
-                device=hw_devices.transformer, dtype=torch.bfloat16
-            )
-            self._training_strategy.set_hrr_enhancer(self._hrr_enhancer)
-            hrr_params = sum(p.numel() for p in self._hrr_enhancer.parameters())
-            logger.info(
-                f"HRR {self._config.hrr.mode} enhancer: {hrr_params:,} params "
-                f"({hrr_params * 2 / 1e6:.1f} MB bf16), "
-                f"gate_init={self._config.hrr.gate_init_bias}"
-            )
 
         # Freeze all models. We later unfreeze the transformer based on training mode.
         # Note: embedding_connectors are already frozen (they come from the frozen text encoder)
@@ -1000,25 +1013,7 @@ class LtxvTrainer:
                     ]
                 logger.info(f"Using cached final embeddings from: {final_dir}/")
 
-            # Use PairedPrecomputedDataset when HRR cross-caption training is enabled
-            use_paired = (
-                self._config.hrr.enabled
-                and hasattr(self._config.training_strategy, "use_hrr")
-                and self._config.training_strategy.use_hrr
-            )
-            if use_paired:
-                from ltx_trainer.datasets import PairedPrecomputedDataset  # noqa: PLC0415
-                self._dataset = PairedPrecomputedDataset(
-                    self._config.data.preprocessed_data_root, data_sources=data_sources
-                )
-                logger.info(
-                    f"Using PairedPrecomputedDataset with {len(self._dataset):,} samples "
-                    f"(cross-caption HRR training)"
-                )
-            else:
-                self._dataset = PrecomputedDataset(
-                    self._config.data.preprocessed_data_root, data_sources=data_sources
-                )
+            self._dataset = PrecomputedDataset(self._config.data.preprocessed_data_root, data_sources=data_sources)
             logger.debug(f"Loaded dataset with {len(self._dataset):,} samples from sources: {list(data_sources)}")
 
         num_workers = self._config.data.num_dataloader_workers
@@ -1034,6 +1029,26 @@ class LtxvTrainer:
 
         self._dataloader = self._accelerator.prepare(dataloader)
 
+    def _rebuild_dataloader(self) -> None:
+        """Rebuild DataLoader after dataset rescan to pick up new samples.
+
+        persistent_workers=True forks the dataset at DataLoader creation time,
+        so workers hold stale copies. The only way to refresh is to create a
+        brand-new DataLoader from the updated dataset.
+        """
+        num_workers = self._config.data.num_dataloader_workers
+        dataloader = DataLoader(
+            self._dataset,
+            batch_size=self._config.optimization.batch_size,
+            shuffle=True,
+            drop_last=True,
+            num_workers=num_workers,
+            pin_memory=num_workers > 0,
+            persistent_workers=num_workers > 0,
+        )
+        self._dataloader = self._accelerator.prepare(dataloader)
+        logger.info(f"Rebuilt DataLoader with {len(self._dataset)} samples")
+
     def _init_lora_weights(self) -> None:
         """Initialize LoRA weights for the transformer."""
         logger.debug("Initializing LoRA weights...")
@@ -1041,39 +1056,40 @@ class LtxvTrainer:
             if isinstance(module, (BaseTunerLayer, ModulesToSaveWrapper)):
                 module.reset_lora_parameters(adapter_name="default", init_lora_weights=True)
 
-    def _build_param_groups(self, lr: float, wd: float) -> list[dict]:
-        """Build optimizer parameter groups, applying lr_multiplier for HRR."""
-        if self._hrr_enhancer is not None and self._config.hrr.lr_multiplier != 1.0:
-            hrr_param_ids = {id(p) for p in self._hrr_enhancer.parameters()}
-            base_params = [p for p in self._trainable_params if id(p) not in hrr_param_ids]
-            hrr_params = [p for p in self._trainable_params if id(p) in hrr_param_ids]
-
-            groups = [{"params": base_params}]
-            if hrr_params:
-                hrr_lr = lr * self._config.hrr.lr_multiplier
-                groups.append({"params": hrr_params, "lr": hrr_lr})
-                logger.info(f"HRR param group: lr={hrr_lr:.2e} ({self._config.hrr.lr_multiplier}x base)")
-            return groups
-
-        return [{"params": self._trainable_params}]
-
     def _init_optimizer(self) -> None:
         """Initialize the optimizer and learning rate scheduler."""
         opt_cfg = self._config.optimization
 
         lr = opt_cfg.learning_rate
         wd = opt_cfg.weight_decay
-
-        # Build parameter groups (support HRR lr_multiplier)
-        param_groups = self._build_param_groups(lr, wd)
-
         if opt_cfg.optimizer_type == "adamw":
-            optimizer = AdamW(param_groups, lr=lr, weight_decay=wd)
+            optimizer = AdamW(self._trainable_params, lr=lr, weight_decay=wd)
         elif opt_cfg.optimizer_type == "adamw8bit":
             # noinspection PyUnresolvedReferences
             from bitsandbytes.optim import AdamW8bit  # noqa: PLC0415
 
-            optimizer = AdamW8bit(param_groups, lr=lr, weight_decay=wd)
+            optimizer = AdamW8bit(self._trainable_params, lr=lr, weight_decay=wd)
+        elif opt_cfg.optimizer_type == "muon":
+            from torch.optim import Muon  # noqa: PLC0415
+
+            # Muon requires 2D+ params; 1D params (biases, norms) fall back to AdamW.
+            muon_params = [p for p in self._trainable_params if p.ndim >= 2]
+            adamw_params = [p for p in self._trainable_params if p.ndim < 2]
+
+            if adamw_params:
+                logger.info(
+                    f"Muon optimizer: {len(muon_params)} params (2D+) via Muon, "
+                    f"{len(adamw_params)} params (1D) via AdamW fallback"
+                )
+                optimizer = Muon(
+                    [
+                        {"params": muon_params, "lr": lr, "weight_decay": wd},
+                        {"params": adamw_params, "lr": lr * 0.1, "weight_decay": wd, "muon": False},
+                    ],
+                )
+            else:
+                logger.info(f"Muon optimizer: {len(muon_params)} params (all 2D+)")
+                optimizer = Muon(self._trainable_params, lr=lr, weight_decay=wd)
         else:
             raise ValueError(f"Unknown optimizer type: {opt_cfg.optimizer_type}")
 
@@ -1089,21 +1105,26 @@ class LtxvTrainer:
         steps = self._config.optimization.steps
         params = self._config.optimization.scheduler_params or {}
 
+        warmup_steps = self._config.optimization.warmup_steps
+
         if scheduler_type is None:
             return None
+
+        # Subtract warmup from main scheduler duration so total = warmup + main = steps
+        main_steps = max(steps - warmup_steps, 1)
 
         if scheduler_type == "linear":
             scheduler = LinearLR(
                 optimizer,
                 start_factor=params.pop("start_factor", 1.0),
                 end_factor=params.pop("end_factor", 0.1),
-                total_iters=steps,
+                total_iters=main_steps,
                 **params,
             )
         elif scheduler_type == "cosine":
             scheduler = CosineAnnealingLR(
                 optimizer,
-                T_max=steps,
+                T_max=main_steps,
                 eta_min=params.pop("eta_min", 0),
                 **params,
             )
@@ -1133,6 +1154,21 @@ class LtxvTrainer:
             scheduler = None
         else:
             raise ValueError(f"Unknown scheduler type: {scheduler_type}")
+
+        # Wrap with linear warmup if warmup_steps > 0
+        if warmup_steps > 0 and scheduler is not None:
+            warmup_scheduler = LinearLR(
+                optimizer,
+                start_factor=1e-3,  # Start at 0.1% of peak lr
+                end_factor=1.0,
+                total_iters=warmup_steps,
+            )
+            scheduler = SequentialLR(
+                optimizer,
+                schedulers=[warmup_scheduler, scheduler],
+                milestones=[warmup_steps],
+            )
+            logger.info(f"LR warmup: {warmup_steps} steps (linear 0.001× → 1×), then {scheduler_type}")
 
         return scheduler
 

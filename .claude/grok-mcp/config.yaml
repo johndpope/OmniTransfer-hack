@@ -1,0 +1,103 @@
+provider: grok
+model: grok-4-latest
+default_context: general
+auto_detect_patterns:
+  rive_rust:
+  - rive-rs/
+  - rive_rs/
+  - /src/ffi.rs
+  - /src/artboard/
+  - /src/vello/
+  rive_core:
+  - rive/
+  - rive-cpp/
+  - /artboard.cpp
+  - /linear_animation.cpp
+  - /state_machine.cpp
+  github:
+  - .github/
+  - github_client
+  mcp:
+  - mcp/
+  - /mcp_protocol
+  - /server.rs
+  - /main.rs
+system_prompts:
+  flash_mapping: |
+    You are an expert in both Flash/ActionScript and Rive architectures. Key mappings:
+    - MovieClip → Artboard
+    - DisplayObject → Node
+    - Timeline → LinearAnimation
+    - EventDispatcher → StateMachine
+    - Graphics API → Shape/Path/Renderer
+    - Stage → Artboard (root)
+  github: |
+    You are an expert in GitHub APIs and project management. You have deep knowledge of:
+    - GitHub Issues: Creating, updating, searching, and managing issues
+    - Pull Requests: Review processes, merge strategies, and collaboration
+    - GitHub Actions: CI/CD workflows and automation
+    - Repository management: Branches, releases, and settings
+    - GitHub's search syntax and advanced queries
+  general: |
+    You are Grok, an AI assistant specialized in software development and research. Provide detailed, accurate, and helpful responses.
+  mcp: |
+    You are an expert in Model Context Protocol (MCP). MCP enables AI assistants to interact with external tools through standardized interfaces including tool definitions, session management, and transport mechanisms.
+  rive_rust: |
+    You are an expert in rive-rs, the Rust bindings for Rive. Focus on:
+    - FFI bridge: src/ffi.rs using cxx crate
+    - Artboard API: src/artboard/mod.rs
+    - Animation: src/linear_animation.rs, src/state_machine/
+    - Renderer: src/renderer.rs, src/vello/ (GPU rendering)
+    - Scene graph: src/scene.rs
+  rive_core: |
+    You are an expert in Rive C++ runtime. You have deep knowledge of:
+    - Core: src/artboard.cpp, src/animation/*, src/shapes/*, src/renderer.hpp
+    - Artboards: Container for graphics and animations (like Flash MovieClip)
+    - Animations: LinearAnimation, StateMachine (timeline and state-based)
+    - Shapes: Path, Rectangle, Ellipse with GPU-optimized rendering
+    - Constraints: Bones, IK, transform constraints
+contexts:
+  github:
+  - name: GitHub API Basics
+    content: |
+      GitHub API Key Concepts:
+      - Issues: Track bugs, features, and tasks with labels, assignees, and milestones
+      - Pull Requests: Code review and collaboration workflow
+      - Search API: Query issues, PRs, code, commits, and users
+      - Rate Limiting: 5000 requests/hour for authenticated requests
+      - GraphQL vs REST: Both available, REST is simpler for basic operations
+  - name: Issue Management
+    content: |
+      GitHub Issue Best Practices:
+      - Use labels for categorization (bug, enhancement, priority levels)
+      - Link issues with keywords (fixes #123, closes #456)
+      - Reference commits and PRs with #number syntax
+      - Use milestones for release planning
+      - Templates for consistent issue creation
+  rive_runtime:
+  - name: Core Architecture
+    content: |
+      Key Rive Runtime Components:
+      - Artboard: Core container for graphics and animations (src/artboard.cpp)
+      - LinearAnimation: Timeline-based animations (src/animation/linear_animation.cpp)
+      - StateMachine: State-based animation controller (src/animation/state_machine.cpp)
+      - Shapes: Path, Rectangle, Ellipse, etc. (src/shapes/)
+      - Renderer: GPU-optimized rendering pipeline (include/rive/renderer.hpp)
+  rive_core:
+  - name: Rust Bindings Architecture
+    content: |
+      Key Rive-rs Components:
+      - FFI Bridge: C++ bindings using cxx crate (src/ffi.rs)
+      - Artboard: Safe Rust wrapper for artboards (src/artboard/mod.rs)
+      - Animation: Linear and state machine animations (src/linear_animation.rs)
+      - Renderer: Vello GPU renderer integration (src/vello/)
+      - Scene: Scene graph management (src/scene.rs)
+  mcp:
+  - name: MCP Architecture
+    content: |
+      Model Context Protocol (MCP) Components:
+      - Tools: Functions AI can call with defined schemas
+      - Resources: Data sources AI can read
+      - Transport: stdio (local) or SSE (HTTP) communication
+      - Sessions: Stateful conversation management
+      - Error Handling: Structured error responses

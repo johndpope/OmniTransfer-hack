@@ -1,0 +1,126 @@
+# =============================================================================
+# LTX-2 T2I LoRA Training — Isometric Frame Overfit v2 (ALL 158 videos)
+# =============================================================================
+#
+# Improved training based on Grok recommendations:
+# - Cosine LR schedule (5e-4 → 1e-5) instead of constant
+# - Larger effective batch (8 vs 4) for smoother gradients
+# - Uniform timestep sampling for better style coverage across noise levels
+# - Light weight decay (1e-4) to regularize and prevent mode collapse
+# - 10,000 steps (~20 epochs) for deeper style burn-in
+# - Continues from v1 step 5000 checkpoint
+#
+# With ~3,950 samples and 10000 steps (batch_size=1, grad_accum=8):
+#   effective_batch = 8, steps_per_epoch = 3950/8 ≈ 494, epochs ≈ 20
+#
+# Usage:
+#   cd ltx-trainer
+#   python scripts/train.py configs/ltx2_t2i_isometric_overfit.yaml
+#
+# =============================================================================
+
+# Model — continue from T2I v1 checkpoint (step 5000)
+model:
+  model_path: "/media/2TB/ltx-models/ltx2/ltx-2-19b-dev.safetensors"
+  text_encoder_path: "/media/2TB/ltx-models/gemma"
+  training_mode: "lora"
+  load_checkpoint: "/media/2TB/omnitransfer/output/t2i_isometric_overfit_v2/checkpoints/lora_weights_step_02000.safetensors"
+
+# LoRA — must match source checkpoint config
+lora:
+  rank: 64
+  alpha: 64
+  dropout: 0.0
+  target_modules:
+    - "to_k"
+    - "to_q"
+    - "to_v"
+    - "to_out.0"
+
+# Training strategy: text-to-video (works with 1-frame latents = T2I)
+training_strategy:
+  name: "text_to_video"
+  with_audio: false
+  log_reconstructions: true
+  reconstruction_log_interval: 200
+
+# Optimization — improved per Grok recommendations
+optimization:
+  learning_rate: 5.0e-4            # Peak LR, decays via cosine to eta_min
+  steps: 10000                     # ~20 epochs for deep style burn-in
+  batch_size: 1
+  gradient_accumulation_steps: 8   # Effective batch = 8 (smoother gradients)
+  max_grad_norm: 1.0
+  optimizer_type: "adamw"
+  scheduler_type: "cosine"         # Cosine annealing: aggressive early, refined late
+  scheduler_params:
+    eta_min: 1.0e-5                # Minimum LR at end of training
+  weight_decay: 1.0e-4             # Light L2 regularization to prevent mode collapse
+  enable_gradient_checkpointing: true
+
+# Acceleration
+acceleration:
+  mixed_precision_mode: "bf16"
+  quantization: "int8-quanto"      # fp8 Marlin kernel JIT fails with CUDA 13
+  load_text_encoder_in_8bit: true
+
+# Hardware (dual GPU)
+hardware:
+  devices:
+    text_encoder: "cuda:1"
+    vae_encoder: "cuda:1"
+    vae_decoder: "cuda:1"
+    transformer: "cuda:0"          # RTX 5090 (32GB)
+    audio_vae: "cuda:0"
+    vocoder: "cuda:0"
+
+# Data — extracted T2I frames
+data:
+  preprocessed_data_root: "/media/2TB/omnitransfer/data/isometric_t2i_all"
+  num_dataloader_workers: 4        # More workers — small files, fast loading
+  use_cached_final_embeddings: true
+  final_embeddings_dir: "conditions_final"
+
+# Validation — disabled (using cached embeddings, no text encoder loaded)
+validation:
+  prompts: []
+  negative_prompt: "blurry, distorted, low quality"
+  video_dims: [480, 704, 1]        # Single frame = T2I
+  frame_rate: 24.0
+  seed: 42
+  inference_steps: 30
+  interval: null
+  videos_per_prompt: 1
+  guidance_scale: 4.0
+  stg_scale: 1.0
+  stg_blocks: [29]
+  stg_mode: "stg_v"
+  generate_audio: false
+  skip_initial_validation: true
+
+# Checkpoints — save frequently for overfit monitoring
+checkpoints:
+  interval: 500
+  keep_last_n: 10
+
+# Flow Matching — uniform sampling for better style coverage across noise levels
+flow_matching:
+  timestep_sampling_mode: "uniform"
+  timestep_sampling_params: {}
+
+# Hub
+hub:
+  push_to_hub: false
+  hub_model_id: null
+
+# Weights & Biases
+wandb:
+  enabled: true
+  project: "t2i-isometric-overfit"
+  entity: null
+  tags: ["t2i", "isometric", "grok", "overfit", "lora", "v2", "cosine", "uniform"]
+  log_validation_videos: false
+
+# General
+seed: 42
+output_dir: "/media/2TB/omnitransfer/output/t2i_isometric_overfit_v2"

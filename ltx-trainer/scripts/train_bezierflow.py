@@ -121,6 +121,8 @@ def main() -> None:
     parser.add_argument("--n-control-points", type=int, default=32, help="Control points / coefficients")
     parser.add_argument("--num-iterations", type=int, default=200, help="Training iterations")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    parser.add_argument("--optimizer", default="rmsprop", choices=["rmsprop", "muon"],
+                        help="Optimizer: rmsprop (default) or muon (Newton-Schulz, needs higher LR)")
     parser.add_argument("--guidance-scale", type=float, default=4.0, help="CFG scale for teacher and student")
     parser.add_argument("--max-samples", type=int, default=100, help="Max conditioning samples to load")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
@@ -166,6 +168,7 @@ def main() -> None:
     print(f"  Control points: {args.n_control_points}")
     print(f"  Iterations:     {args.num_iterations}")
     print(f"  LR:             {args.lr}")
+    print(f"  Optimizer:      {args.optimizer}")
     print(f"  CFG:            {args.guidance_scale}")
     print(f"  Resolution:     {args.width}x{args.height} (latent {latent_w}x{latent_h})")
     print(f"  Quantization:   {args.quantization}")
@@ -312,7 +315,27 @@ def main() -> None:
             order=args.bspline_order,
         ).to(device)
 
-    optimizer = torch.optim.RMSprop(bezier.parameters(), lr=args.lr, momentum=0.9)
+    if args.optimizer == "muon":
+        from torch.optim import Muon  # PyTorch built-in Muon (no dist required)
+        # Muon NS orthogonalization requires 2D+ params; theta [32] is 1D.
+        # Split: 2D+ params → Muon, 1D → AdamW fallback (matches trainer.py pattern).
+        muon_params = [p for p in bezier.parameters() if p.ndim >= 2]
+        adamw_params = [p for p in bezier.parameters() if p.ndim < 2]
+        if muon_params:
+            optimizer = Muon(
+                [
+                    {"params": muon_params, "lr": args.lr},
+                    {"params": adamw_params, "lr": args.lr * 0.1, "muon": False},
+                ],
+            )
+            print(f"  Optimizer: Muon ({len(muon_params)} 2D+ params, {len(adamw_params)} 1D fallback)")
+        else:
+            # All params are 1D — Muon's NS doesn't apply, use AdamW
+            optimizer = torch.optim.AdamW(bezier.parameters(), lr=args.lr * 0.1)
+            print(f"  Optimizer: AdamW fallback (all {len(adamw_params)} params are 1D, Muon NS needs 2D+)")
+    else:
+        optimizer = torch.optim.RMSprop(bezier.parameters(), lr=args.lr, momentum=0.9)
+        print(f"  Optimizer: RMSprop (lr={args.lr}, momentum=0.9)")
 
     # Show initial schedule
     with torch.no_grad():
@@ -516,8 +539,8 @@ def main() -> None:
                     log_dict[f"sigma_{args.student_steps}step/{i}"] = s
                 for i, s in enumerate(sched_8.tolist()):
                     log_dict[f"sigma_8step/{i}"] = s
-                # Log control points
-                cp = bezier.control_points.detach().cpu().tolist()
+                # Log control points / coefficients (attribute name differs by scheduler type)
+                cp = (bezier.control_points if hasattr(bezier, "control_points") else bezier.coefficients).detach().cpu().tolist()
                 log_dict["control_points/min_gap"] = min(cp[i+1] - cp[i] for i in range(len(cp)-1))
                 log_dict["control_points/max_gap"] = max(cp[i+1] - cp[i] for i in range(len(cp)-1))
                 # Schedule visualization as W&B line plot

@@ -118,7 +118,11 @@ def main() -> None:
     # Training params
     parser.add_argument("--teacher-steps", type=int, default=30, help="Teacher (high-quality) denoising steps")
     parser.add_argument("--student-steps", type=int, default=4, help="Student (target) denoising steps")
-    parser.add_argument("--n-control-points", type=int, default=32, help="Control points / coefficients")
+    parser.add_argument("--n-control-points", type=int, default=64, help="Control points / coefficients")
+    parser.add_argument("--student-steps-secondary", type=int, default=8,
+                        help="Secondary step count for joint distillation (0 to disable)")
+    parser.add_argument("--secondary-weight", type=float, default=0.3,
+                        help="Weight for secondary step loss (primary gets 1-weight)")
     parser.add_argument("--num-iterations", type=int, default=200, help="Training iterations")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--optimizer", default="rmsprop", choices=["rmsprop", "muon"],
@@ -162,10 +166,16 @@ def main() -> None:
     print("=" * 65)
     print(f"  {_sched_name} Schedule Training")
     print("=" * 65)
+    # Compute theta shape for display
+    _n = args.n_control_points
+    _rows = int(_n**0.5)
+    _cols = (_n + _rows - 1) // _rows
     print(f"  Scheduler:      {args.scheduler_type}")
     print(f"  Teacher steps:  {args.teacher_steps}")
-    print(f"  Student steps:  {args.student_steps}")
-    print(f"  Control points: {args.n_control_points}")
+    print(f"  Student steps:  {args.student_steps} (primary)")
+    if args.student_steps_secondary > 0:
+        print(f"  Student steps:  {args.student_steps_secondary} (secondary, weight={args.secondary_weight})")
+    print(f"  Control points: {args.n_control_points} → theta [{_rows}×{_cols}] (Muon-compatible)")
     print(f"  Iterations:     {args.num_iterations}")
     print(f"  LR:             {args.lr}")
     print(f"  Optimizer:      {args.optimizer}")
@@ -492,8 +502,65 @@ def main() -> None:
             dt = student_sigmas[step + 1] - student_sigmas[step]  # carries gradient!
             z_replay = z_replay + cached_velocities[step] * dt.float()
 
-        # Loss: MSE between student and teacher final states
-        loss = torch.nn.functional.mse_loss(z_replay, z_teacher.float())
+        # Primary loss: MSE between student and teacher final states
+        loss_primary = torch.nn.functional.mse_loss(z_replay, z_teacher.float())
+
+        # ── SECONDARY: multi-step distillation (e.g. 8-step) ──
+        if args.student_steps_secondary > 0:
+            student_sigmas_sec = bezier.get_sigma_schedule(args.student_steps_secondary)
+            cached_velocities_sec = []
+
+            with torch.no_grad():
+                z_sec_fwd = patchifier.patchify(z_init.clone())
+                for step in range(args.student_steps_secondary):
+                    sigma_val = student_sigmas_sec[step].detach().item()
+                    sigma_next_val = student_sigmas_sec[step + 1].detach().item()
+
+                    dec_modality = Modality(
+                        enabled=True,
+                        latent=z_sec_fwd,
+                        timesteps=torch.full((1, tokens_per_frame), sigma_val, device=device, dtype=dtype),
+                        positions=positions,
+                        context=prompt_embeds,
+                        context_mask=prompt_mask,
+                    )
+                    velocity, _ = scd_model.forward_decoder(
+                        video=dec_modality, encoder_features=enc_features,
+                        audio=None, perturbations=None,
+                    )
+
+                    if use_cfg:
+                        uncond_mod = Modality(
+                            enabled=True,
+                            latent=z_sec_fwd,
+                            timesteps=torch.full((1, tokens_per_frame), sigma_val, device=device, dtype=dtype),
+                            positions=positions,
+                            context=null_embeds,
+                            context_mask=null_mask,
+                        )
+                        v_uncond, _ = scd_model.forward_decoder(
+                            video=uncond_mod, encoder_features=enc_features_null,
+                            audio=None, perturbations=None,
+                        )
+                        velocity = v_uncond + args.guidance_scale * (velocity - v_uncond)
+
+                    cached_velocities_sec.append(velocity.detach().float().clone())
+                    dt_sec = sigma_next_val - sigma_val
+                    z_sec_fwd = (z_sec_fwd.float() + velocity.float() * dt_sec).to(dtype)
+
+            # Differentiable replay for secondary steps
+            z_replay_sec = patchifier.patchify(z_init.clone()).float()
+            for step in range(args.student_steps_secondary):
+                dt_sec = student_sigmas_sec[step + 1] - student_sigmas_sec[step]
+                z_replay_sec = z_replay_sec + cached_velocities_sec[step] * dt_sec.float()
+            loss_secondary = torch.nn.functional.mse_loss(z_replay_sec, z_teacher.float())
+
+            # Combined loss
+            w = args.secondary_weight
+            loss = (1 - w) * loss_primary + w * loss_secondary
+        else:
+            loss_secondary = None
+            loss = loss_primary
 
         # NaN/Inf detection — abort before corrupting weights
         if torch.isnan(loss) or torch.isinf(loss):
@@ -527,9 +594,12 @@ def main() -> None:
         if wandb_run:
             log_dict = {
                 "loss": loss_val,
+                "loss_primary": loss_primary.item(),
                 "best_loss": best_loss,
                 "grad_norm": grad_norm,
             }
+            if loss_secondary is not None:
+                log_dict["loss_secondary"] = loss_secondary.item()
             # Log full schedule as individual sigma values + table every 10 iters
             if iteration % 10 == 0 or iteration == args.num_iterations - 1:
                 with torch.no_grad():
@@ -561,9 +631,16 @@ def main() -> None:
         if iteration % 20 == 0 or iteration == args.num_iterations - 1:
             with torch.no_grad():
                 sched = bezier.get_sigma_schedule(args.student_steps)
+                sched_sec = bezier.get_sigma_schedule(args.student_steps_secondary) if args.student_steps_secondary > 0 else None
+            loss_str = f"loss={loss_val:.6f}"
+            if loss_secondary is not None:
+                loss_str += f" (L1={loss_primary.item():.4f} L2={loss_secondary.item():.4f})"
+            sched_str = f"σ{args.student_steps}={[f'{s:.3f}' for s in sched.tolist()]}"
+            if sched_sec is not None:
+                sched_str += f" σ{args.student_steps_secondary}={[f'{s:.3f}' for s in sched_sec.tolist()]}"
             tqdm.write(
-                f"  iter {iteration:4d} | loss={loss_val:.6f} | best={best_loss:.6f} | "
-                f"grad={grad_norm:.4f} | σ={[f'{s:.3f}' for s in sched.tolist()]}"
+                f"  iter {iteration:4d} | {loss_str} | best={best_loss:.6f} | "
+                f"grad={grad_norm:.4f} | {sched_str}"
             )
 
     elapsed = time.time() - t_train_start
@@ -580,11 +657,13 @@ def main() -> None:
     with torch.no_grad():
         final_sched = bezier.get_sigma_schedule(args.student_steps)
         final_sched_8 = bezier.get_sigma_schedule(8)
+        final_sched_16 = bezier.get_sigma_schedule(16)
     print(f"\n  Saved to: {output_path}")
     print(f"  Config:   {output_path.with_suffix('.json')}")
     print(f"  Best loss: {best_loss:.6f}")
-    print(f"  {args.student_steps}-step σ: {[f'{s:.4f}' for s in final_sched.tolist()]}")
-    print(f"  8-step σ:  {[f'{s:.4f}' for s in final_sched_8.tolist()]}")
+    print(f"  {args.student_steps}-step σ:  {[f'{s:.4f}' for s in final_sched.tolist()]}")
+    print(f"  8-step σ:   {[f'{s:.4f}' for s in final_sched_8.tolist()]}")
+    print(f"  16-step σ:  {[f'{s:.4f}' for s in final_sched_16.tolist()]}")
 
     # Monotonicity check
     diffs = final_sched[1:] - final_sched[:-1]

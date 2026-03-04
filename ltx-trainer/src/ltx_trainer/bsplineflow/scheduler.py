@@ -43,8 +43,13 @@ class BSplineScheduler(nn.Module):
         super().__init__()
         self.n_coefficients = n_coefficients
         self.order = order  # k (degree = k-1)
-        # Unconstrained parameters — monotonicity enforced by cumulative softmax
-        self.theta = nn.Parameter(torch.zeros(n_coefficients))
+        # Store theta as 2D matrix so Muon's Newton-Schulz can apply.
+        # Reshape to roughly square: find factors closest to sqrt(n).
+        rows = int(n_coefficients**0.5)
+        cols = (n_coefficients + rows - 1) // rows  # ceil division
+        self._theta_rows = rows
+        self._theta_cols = cols
+        self.theta = nn.Parameter(torch.zeros(rows, cols))
 
         # Total coefficients including pinned endpoints
         n_total = n_coefficients + 2  # c_0=0, c_1..c_n, c_{n+1}=1
@@ -75,7 +80,8 @@ class BSplineScheduler(nn.Module):
 
         Returns shape [n_coefficients + 2] with endpoints pinned at 0 and 1.
         """
-        deltas = torch.nn.functional.softplus(self.theta)  # [n], each > 0
+        flat_theta = self.theta.reshape(-1)[:self.n_coefficients]  # trim padding from ceil
+        deltas = torch.nn.functional.softplus(flat_theta)  # [n], each > 0
         raw_cumsum = torch.cumsum(deltas, dim=0)            # monotonically increasing
         total = raw_cumsum[-1]                               # normalization constant
         interior = raw_cumsum / total                        # [n], in (0, 1)
@@ -240,19 +246,28 @@ class BSplineScheduler(nn.Module):
 
     @classmethod
     def load(cls, path: str | Path, device: str = "cpu") -> BSplineScheduler:
-        """Load scheduler from .pt file, reading config from companion .json."""
+        """Load scheduler from .pt file, reading config from companion .json.
+
+        Handles migration from old 1D theta checkpoints to new 2D format.
+        """
         path = Path(path)
         config_path = path.with_suffix(".json")
+        sd = torch.load(path, map_location=device, weights_only=True)
         if config_path.exists():
             config = json.loads(config_path.read_text())
             n_coeff = config["n_coefficients"]
             order = config.get("order", 4)
         else:
-            sd = torch.load(path, map_location=device, weights_only=True)
-            n_coeff = sd["theta"].shape[0]
+            # Infer from state dict (works for both 1D and 2D theta)
+            n_coeff = sd["theta"].numel()
             order = 4
         scheduler = cls(n_coefficients=n_coeff, order=order)
-        scheduler.load_state_dict(
-            torch.load(path, map_location=device, weights_only=True)
-        )
+        # Migrate old 1D checkpoints → new 2D shape
+        if sd["theta"].ndim == 1:
+            rows = scheduler._theta_rows
+            cols = scheduler._theta_cols
+            padded = torch.zeros(rows * cols, device=sd["theta"].device, dtype=sd["theta"].dtype)
+            padded[:sd["theta"].numel()] = sd["theta"]
+            sd["theta"] = padded.reshape(rows, cols)
+        scheduler.load_state_dict(sd)
         return scheduler.to(device)

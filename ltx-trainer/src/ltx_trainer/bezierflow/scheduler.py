@@ -29,8 +29,13 @@ class BezierScheduler(nn.Module):
     def __init__(self, n_control_points: int = 32) -> None:
         super().__init__()
         self.n_control_points = n_control_points
-        # Unconstrained parameters — monotonicity enforced by cumulative softmax
-        self.theta = nn.Parameter(torch.zeros(n_control_points))
+        # Store theta as 2D matrix so Muon's Newton-Schulz can apply.
+        # Reshape to roughly square: find factors closest to sqrt(n).
+        rows = int(n_control_points**0.5)
+        cols = (n_control_points + rows - 1) // rows  # ceil division
+        self._theta_rows = rows
+        self._theta_cols = cols
+        self.theta = nn.Parameter(torch.zeros(rows, cols))
         # Precompute log-binomial coefficients for Bernstein basis (degree n+1)
         degree = n_control_points + 1
         self.register_buffer(
@@ -56,8 +61,10 @@ class BezierScheduler(nn.Module):
 
         Returns shape [n_control_points + 2] with endpoints pinned at 0 and 1.
         """
+        # Flatten 2D theta → 1D, trim padding from ceil division
+        flat_theta = self.theta.reshape(-1)[:self.n_control_points]
         # softmax → probabilities summing to 1, cumsum → sorted values in (0, 1)
-        interior = torch.cumsum(torch.softmax(self.theta, dim=0), dim=0)
+        interior = torch.cumsum(torch.softmax(flat_theta, dim=0), dim=0)
         zeros = torch.zeros(1, device=self.theta.device, dtype=self.theta.dtype)
         ones = torch.ones(1, device=self.theta.device, dtype=self.theta.dtype)
         return torch.cat([zeros, interior, ones])  # [n+2]
@@ -122,18 +129,26 @@ class BezierScheduler(nn.Module):
 
     @classmethod
     def load(cls, path: str | Path, device: str = "cpu") -> BezierScheduler:
-        """Load scheduler from .pt file, reading config from companion .json."""
+        """Load scheduler from .pt file, reading config from companion .json.
+
+        Handles migration from old 1D theta checkpoints to new 2D format.
+        """
         path = Path(path)
         config_path = path.with_suffix(".json")
+        sd = torch.load(path, map_location=device, weights_only=True)
         if config_path.exists():
             config = json.loads(config_path.read_text())
             n_cp = config["n_control_points"]
         else:
-            # Infer from state dict
-            sd = torch.load(path, map_location=device, weights_only=True)
-            n_cp = sd["theta"].shape[0]
+            # Infer from state dict (works for both 1D and 2D theta)
+            n_cp = sd["theta"].numel()
         scheduler = cls(n_control_points=n_cp)
-        scheduler.load_state_dict(
-            torch.load(path, map_location=device, weights_only=True)
-        )
+        # Migrate old 1D checkpoints → new 2D shape
+        if sd["theta"].ndim == 1:
+            rows = scheduler._theta_rows
+            cols = scheduler._theta_cols
+            padded = torch.zeros(rows * cols, device=sd["theta"].device, dtype=sd["theta"].dtype)
+            padded[:sd["theta"].numel()] = sd["theta"]
+            sd["theta"] = padded.reshape(rows, cols)
+        scheduler.load_state_dict(sd)
         return scheduler.to(device)

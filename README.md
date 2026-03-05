@@ -458,6 +458,226 @@ Compression ratios:
 
 ---
 
+## Inference Speedup Stack
+
+This project implements **10 complementary inference acceleration technologies** that stack multiplicatively. The unified inference script (`scripts/scd_inference.py`) supports all of them via CLI flags.
+
+### Technology Overview
+
+| # | Technology | Paper | Type | Speedup | Training Required? |
+|---|-----------|-------|------|---------|-------------------|
+| 1 | [SCD](#1-scd-separable-causal-diffusion) | [arXiv:2602.10095](https://arxiv.org/abs/2602.10095) | Architecture | ~3× | Yes (LoRA) |
+| 2 | [DDiT](#2-ddit-dynamic-diffusion-transformer) | [arXiv:2602.16968](https://arxiv.org/abs/2602.16968) | Token reduction | 1.25-1.48× | Yes (adapter) |
+| 3 | [Spectrum](#3-spectrum-chebyshev-velocity-forecasting) | [arXiv:2603.01623](https://arxiv.org/abs/2603.01623) | Step forecasting | 2.0× | No |
+| 4 | [TeaCache](#4-teacache-temporal-adaptive-cache) | CVPR 2025 | Step caching | 1.5-2× | No |
+| 5 | [BézierFlow](#5-bézierflow-learned-sigma-schedule) | [arXiv:2512.13255](https://arxiv.org/abs/2512.13255) | Learned schedule | 1.5-2× | Yes (~10 min) |
+| 6 | [BSplineFlow](#6-bsplineflow-local-learned-schedule) | — | Learned schedule | 1.5-2× | Yes (~10 min) |
+| 7 | [Distilled Model](#7-distilled-model-8-step) | — | Model distillation | 3.75× | Pre-trained |
+| 8 | [Quantization](#8-quantization) | — | Weight compression | 1.1-1.5× | No |
+| 9 | [Evolution](#9-evolution-gradient-free-lora-tuning) | — | AR quality tuning | Quality improvement | Yes |
+| 10 | [Split-GPU](#10-split-gpu-inference) | — | Hardware parallelism | 1.0-1.48× | No |
+
+### Stacking Compatibility
+
+All technologies are orthogonal **except** TeaCache and Spectrum (mutually exclusive — both skip decoder steps). If both are enabled, Spectrum takes priority.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    SCD (Architecture)                        │
+│  Encoder (32 layers, 1× per frame) → Decoder (16 layers)   │
+│                                                             │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │              Decoder Speedup Stack                   │    │
+│  │                                                     │    │
+│  │  Distilled (8 steps)     ← fewer denoising steps    │    │
+│  │  + BézierFlow/BSpline    ← optimal sigma placement  │    │
+│  │  + Spectrum OR TeaCache  ← skip redundant steps      │    │
+│  │  + DDiT (4× fewer tokens)← spatial token merging     │    │
+│  │  + Quantization (int8)   ← reduced memory bandwidth  │    │
+│  └─────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Benchmarks (RTX 5090, 768×448, 30s video, int8-quanto)
+
+| Configuration | Steps | s/frame | Gen Time | Decoder | Decoder Speedup |
+|---------------|-------|---------|----------|---------|-----------------|
+| SCD baseline | 30 | 3.3 | 11.0 min | 237s | 1.0× |
+| SCD + TeaCache (0.10) | 30 | 1.6 | 6.2 min | 118s | 2.0× |
+| SCD + **Spectrum** | 30 | 1.7 | 5.2 min | 99s | 2.4× |
+| SCD + DDiT 2× (dynamic) | 30 | 1.3 | 2.5 min | 93s | 2.5× |
+| **Distilled** | 8 | 1.0 | 4.7 min | 78s | 3.0× |
+| Distilled + TeaCache | 8 | 0.5 | 2.8 min | 39s | 6.1× |
+| **Spectrum + DDiT** | 30 | 0.9 | 2.4 min | 26s | 9.2× |
+| Distilled + DDiT + TeaCache | 8 | — | ~1.8 min | — | ~13× |
+
+> **Key finding:** Spectrum (4th-order polynomial forecast) outperforms TeaCache (0th-order reuse) at the same skip rate, with 63% forecast rate vs 52% cache hit rate.
+
+### 1. SCD (Separable Causal Diffusion)
+
+Splits the 48-layer DiT into **encoder** (32 layers, causal, KV-cached) + **decoder** (16 layers, denoised per frame). The encoder runs **once per frame** at σ=0 (noise-free), accumulating KV-cache across the temporal sequence. The decoder iterates N denoising steps per frame.
+
+```
+Frame N: encoder(frame N-1, σ=0) → KV-cache → decoder(noisy_N, steps=30) → clean frame N
+```
+
+**Files:** `ltx-core/.../scd_model.py`, `ltx-trainer/scripts/scd_inference.py`
+
+```bash
+python scripts/scd_inference.py \
+    --cached-embedding /path/to/conditions_final/000.pt \
+    --num-seconds 30 --quantization int8-quanto \
+    --decoder-combine token_concat \
+    --output /media/2TB/omnitransfer/inference/scd_30s.mp4
+```
+
+### 2. DDiT (Dynamic Diffusion Transformer)
+
+Merges 2×2 spatial patches → **4× fewer tokens** per decoder step. A lightweight 4.2M-param adapter learns to project between native (336 tokens) and merged (84 tokens) representations. The **dynamic scheduler** analyzes 3rd-order trajectory finite differences to pick the optimal scale per step.
+
+**Files:** `ltx-core/.../ddit.py`, pre-trained adapter at `sparse-causal-diffusion/outputs/ddit_scd_v2/`
+
+```bash
+python scripts/scd_inference.py \
+    --ddit-adapter /path/to/ddit_scd_adapter_final.safetensors \
+    --ddit-scale 2 \
+    # Dynamic scheduling is default; --ddit-fixed-schedule for old head/tail behavior
+```
+
+### 3. Spectrum (Chebyshev Velocity Forecasting)
+
+Fits **Chebyshev T-polynomials** (degree 4) to the denoising velocity trajectory via ridge regression, then **forecasts** velocity at non-critical steps instead of running the decoder. Blends Chebyshev prediction with Newton forward-difference Taylor extrapolation (w=0.5). Adaptive scheduling grows the skip window over time (smooth later steps need fewer evaluations).
+
+**Paper:** [arXiv:2603.01623](https://arxiv.org/abs/2603.01623) (CVPR 2026)
+**Files:** `ltx-trainer/src/ltx_trainer/spectrum/forecaster.py`
+
+```bash
+python scripts/scd_inference.py \
+    --spectrum \
+    --spectrum-degree 4 --spectrum-warmup 5 \
+    --spectrum-window 2.0 --spectrum-flex 0.75 \
+    --spectrum-weight 0.5 --spectrum-lam 0.1
+```
+
+**Scheduling pattern (30 steps):** Steps 0-4 always computed (warmup), then adaptive — computed steps: [0,1,2,3,4,6,8,11,15,20,25], forecasted: 19/30 = **63% forecast rate**.
+
+### 4. TeaCache (Temporal Adaptive Cache)
+
+Tracks relative L1 distance between consecutive denoising states. When accumulated distance < threshold, **reuses the previous velocity** (0th-order). Simpler than Spectrum but lower quality at high skip rates.
+
+```bash
+python scripts/scd_inference.py \
+    --teacache-thresh 0.10
+```
+
+### 5. BézierFlow (Learned Sigma Schedule)
+
+Learns an **optimal sigma schedule** via monotonic Bézier curve with 32 control points (cumulative softmax). Trains in ~10 minutes by distilling the 30-step teacher trajectory into 4 or 8 optimal steps. The learned schedule front-loads structure steps and spaces detail steps optimally.
+
+**Paper:** [arXiv:2512.13255](https://arxiv.org/abs/2512.13255) (ICLR 2026)
+**Files:** `ltx-trainer/src/ltx_trainer/bezierflow/scheduler.py`, `scripts/train_bezierflow.py`
+
+```bash
+# Train (one-time, ~10 min)
+python scripts/train_bezierflow.py --output /path/to/schedule.pt
+
+# Inference with learned schedule
+python scripts/scd_inference.py \
+    --bezier-schedule /path/to/schedule.pt \
+    --num-inference-steps 8
+```
+
+### 6. BSplineFlow (Local Learned Schedule)
+
+Variant of BézierFlow using **cubic B-spline** basis (local support) instead of global Bernstein basis. Each control point affects only its 4 neighboring knot spans, enabling **independent tuning** of early-step (structure) vs late-step (detail) phases. Same 32-parameter footprint.
+
+**Files:** `ltx-trainer/src/ltx_trainer/bsplineflow/scheduler.py`
+
+### 7. Distilled Model (8-Step)
+
+Pre-distilled checkpoint (`ltx-2-19b-distilled.safetensors`) with a fixed **non-uniform 8-step sigma schedule**:
+
+```
+σ = [1.0, 0.994, 0.988, 0.981, 0.975, 0.909, 0.725, 0.422, 0.0]
+```
+
+First 4 steps: tiny deltas (structure). Last 4 steps: large jumps (refinement). Matches 30-step teacher quality at 3.75× speed.
+
+```bash
+python scripts/scd_inference.py --distilled --num-inference-steps 8
+```
+
+### 8. Quantization
+
+Runtime weight quantization via `optimum-quanto`. Reduces VRAM and (in memory-bound regimes) speeds up inference.
+
+| Format | VRAM Saved | Best For |
+|--------|-----------|----------|
+| `int8-quanto` | ~50% | General use (most stable) |
+| `fp8-quanto` | ~40% | Maximum throughput (JIT warmup ~20 min) |
+
+```bash
+python scripts/scd_inference.py --quantization int8-quanto
+```
+
+### 9. Evolution (Gradient-Free LoRA Tuning)
+
+Evolutionary strategy (ES) optimization of the decoder LoRA weights for improved **autoregressive quality**. Uses antithetic perturbation pairs (+ε, -ε) with multi-metric fitness (flow matching MSE, latent reconstruction, temporal coherence, LPIPS, SSIM). Not a direct speedup, but enables fewer-step inference (4-8 steps) with acceptable quality.
+
+**Files:** `ltx-trainer/src/ltx_trainer/evolution/`, `scripts/evolve_scd.py`
+
+```bash
+python scripts/evolve_scd.py \
+    --lora-path /path/to/scd_lora.safetensors \
+    --dataset /path/to/data --distilled --guidance-scale 4.0
+```
+
+### 10. Split-GPU Inference
+
+Distributes encoder → GPU 0, decoder → GPU 1. Forces bf16 (no quantization). Makes the decoder **compute-bound** instead of memory-bound, which is where DDiT's 4× token reduction has real impact (1.48× vs 1.25× speedup).
+
+```bash
+python scripts/scd_inference.py --split-gpus  # encoder→cuda:0, decoder→cuda:1
+```
+
+> **Note:** Only beneficial with symmetric GPUs (e.g., 2× RTX 5090). Asymmetric setups (RTX 5090 + PRO 4000) are slower in absolute terms despite higher DDiT multipliers.
+
+### Quick Reference: CLI Flags
+
+```bash
+python scripts/scd_inference.py \
+    # Required
+    --cached-embedding /path/to/conditions_final/000.pt \
+    --output /path/to/output.mp4 \
+    \
+    # SCD config
+    --encoder-layers 32 \
+    --decoder-combine token_concat \
+    \
+    # Model selection
+    --distilled \                          # 8-step distilled model
+    --num-inference-steps 8 \              # Steps (30 default, 8 distilled)
+    --bezier-schedule /path/to/sched.pt \  # Learned sigma schedule
+    \
+    # Step skipping (pick ONE)
+    --spectrum \                           # Chebyshev forecasting (recommended)
+    --teacache-thresh 0.10 \               # OR TeaCache L1 threshold
+    \
+    # Token reduction
+    --ddit-adapter /path/to/adapter.safetensors \
+    --ddit-scale 2 \
+    \
+    # Hardware
+    --quantization int8-quanto \           # Weight quantization
+    --split-gpus \                         # Dual-GPU mode (bf16 only)
+    \
+    # Output
+    --num-seconds 30 \
+    --height 448 --width 768
+```
+
+---
+
 ## Troubleshooting
 
 ### OOM during training
@@ -485,9 +705,17 @@ Never load text encoder and VAE simultaneously on 32GB GPUs. Use the staged pipe
 
 ## References
 
-- [OmniTransfer Paper](https://arxiv.org/abs/2601.14250) - arXiv:2601.14250v1
+**Training:**
+- [OmniTransfer](https://arxiv.org/abs/2601.14250) - arXiv:2601.14250v1 — Unified spatio-temporal video transfer
 - [LTX-2 Model](https://huggingface.co/Lightricks/LTX-Video-2B) - HuggingFace
 - [Movie Weaver](https://arxiv.org/abs/2501.xxxxx) - CVPR 2025 (multi-concept)
+
+**Inference Speedup:**
+- [SCD](https://arxiv.org/abs/2602.10095) - arXiv:2602.10095 — Separable Causal Diffusion
+- [DDiT](https://arxiv.org/abs/2602.16968) - arXiv:2602.16968 — Dynamic Diffusion Transformer
+- [Spectrum](https://arxiv.org/abs/2603.01623) - arXiv:2603.01623 (CVPR 2026) — Chebyshev velocity forecasting
+- [BézierFlow](https://arxiv.org/abs/2512.13255) - arXiv:2512.13255 (ICLR 2026) — Learned sigma schedules
+- [TeaCache](https://arxiv.org/abs/2411.xxxxx) - CVPR 2025 — Temporal adaptive caching
 
 ---
 

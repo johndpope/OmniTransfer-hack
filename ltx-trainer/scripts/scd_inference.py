@@ -419,6 +419,25 @@ def main() -> None:
              "0.15 (aggressive, ~65%% hits). Default: None (disabled).",
     )
 
+    # Spectrum — adaptive spectral velocity forecasting (CVPR 2026, arXiv:2603.01623)
+    # Fits Chebyshev polynomials to the denoising trajectory and forecasts velocity
+    # at non-critical steps. 4th-order polynomial forecast vs TeaCache's 0th-order
+    # (stale reuse). Achieves 4.67x on Wan2.1-14B in the paper.
+    # Mutually exclusive with TeaCache (both skip decoder steps).
+    parser.add_argument(
+        "--spectrum",
+        action="store_true",
+        help="Enable Spectrum velocity forecasting (replaces TeaCache). "
+             "Uses Chebyshev polynomial fitting + Taylor blend to predict decoder "
+             "velocity at non-critical steps. Training-free, ~2-3x decoder speedup.",
+    )
+    parser.add_argument("--spectrum-degree", type=int, default=4, help="Chebyshev polynomial degree M (M+1 basis functions)")
+    parser.add_argument("--spectrum-warmup", type=int, default=5, help="Warmup steps (always computed, builds trajectory history)")
+    parser.add_argument("--spectrum-window", type=float, default=2.0, help="Initial skip window size N")
+    parser.add_argument("--spectrum-flex", type=float, default=0.75, help="Window growth rate alpha (curr_ws += alpha after each compute)")
+    parser.add_argument("--spectrum-weight", type=float, default=0.5, help="Chebyshev/Taylor blend weight (0=Taylor, 0.5=paper default, 1=Chebyshev)")
+    parser.add_argument("--spectrum-lam", type=float, default=0.1, help="Ridge regression regularization lambda")
+
     # Dual-GPU split mode
     # SCD Paper, Section 4.2: The encoder and decoder have asymmetric compute profiles.
     # The encoder processes one clean frame per step (lightweight with KV-cache), while
@@ -436,6 +455,11 @@ def main() -> None:
     parser.add_argument("--output", type=str, required=True, help="Output video path (.mp4)")
 
     args = parser.parse_args()
+
+    # Spectrum and TeaCache are mutually exclusive (both skip decoder steps)
+    if args.spectrum and args.teacache_thresh is not None:
+        print("  WARNING: --spectrum and --teacache-thresh are both set. Using Spectrum (preferred).")
+        args.teacache_thresh = None
 
     if args.split_gpus:
         if args.quantization != "none":
@@ -557,8 +581,12 @@ def main() -> None:
         print(f"  DDiT:        disabled (use --ddit-adapter to enable)")
     if args.teacache_thresh is not None:
         print(f"  TeaCache:    enabled (threshold={args.teacache_thresh})")
+    elif args.spectrum:
+        print(f"  Spectrum:    enabled (degree={args.spectrum_degree}, warmup={args.spectrum_warmup}, "
+              f"window={args.spectrum_window}, flex={args.spectrum_flex}, "
+              f"w={args.spectrum_weight}, λ={args.spectrum_lam})")
     else:
-        print(f"  TeaCache:    disabled (use --teacache-thresh to enable)")
+        print(f"  Caching:     disabled (use --spectrum or --teacache-thresh)")
     print(f"  Output:      {args.output}")
     print("=" * 65)
 
@@ -1193,12 +1221,29 @@ def main() -> None:
             coefficients=[0.0, 1.0],  # Identity polynomial: rescaled = raw_distance
         )
 
+    # ── Spectrum initialization ──
+    spectrum: SpectrumState | None = None  # type: ignore[assignment]
+    if args.spectrum:
+        from ltx_trainer.spectrum import SpectrumState
+
+        spectrum = SpectrumState(
+            warmup_steps=args.spectrum_warmup,
+            window_size=args.spectrum_window,
+            flex_window=args.spectrum_flex,
+            num_steps=args.num_inference_steps,
+            degree=args.spectrum_degree,
+            regularization=args.spectrum_lam,
+            blend_weight=args.spectrum_weight,
+        )
+
     gen_start = time.time()
     enc_time_total = 0.0
     dec_time_total = 0.0
     ddit_steps_used = 0  # Accumulates across all frames
     teacache_total_hits = 0
     teacache_total_misses = 0
+    spectrum_total_hits = 0
+    spectrum_total_misses = 0
 
     for chunk_idx in tqdm(range(num_chunks), desc="Chunks", unit="chunk"):
         # SCD Paper, Section 4.2: Chunk overlap for temporal continuity.
@@ -1349,9 +1394,11 @@ def main() -> None:
                 if ddit_wrapper is not None and not args.ddit_fixed_schedule:
                     ddit_wrapper.scheduler.reset()
 
-                # Reset TeaCache for this frame's denoising
+                # Reset TeaCache / Spectrum for this frame's denoising
                 if tea_cache is not None:
                     tea_cache.reset()
+                if spectrum is not None:
+                    spectrum.reset()
 
                 # ── Denoising loop: Euler ODE solver from sigma_max to sigma_min ──
                 _debug_first_frame = (f_idx == 0 and chunk_idx == 0)
@@ -1366,11 +1413,38 @@ def main() -> None:
                     noisy_patch = patchifier.patchify(x_t)
                     dec_seq = noisy_patch.shape[1]
 
+                    # ── Spectrum: adaptive polynomial velocity forecasting ──
+                    # Spectrum (CVPR 2026, arXiv:2603.01623) uses Chebyshev polynomial
+                    # fitting blended with Newton forward-difference Taylor extrapolation
+                    # to forecast decoder velocity at non-critical denoising steps.
+                    # On forecast: skip ALL decoder blocks + CFG, use predicted velocity.
+                    if spectrum is not None:
+                        # Always record DDiT trajectory, even on forecast
+                        if ddit_wrapper is not None and not args.ddit_fixed_schedule:
+                            ddit_wrapper.scheduler.record(noisy_patch)
+
+                        if not spectrum.should_compute(step):
+                            # Forecast hit — predict velocity via polynomial blend
+                            velocity = spectrum.forecast(step)
+                            dt = sigma_next - sigma
+                            if _debug_first_frame and step in (0, 1, 5, 14, 28, 29):
+                                print(f"    [DEBUG step {step:2d}] sigma={sigma.item():.4f}→{sigma_next.item():.4f} "
+                                      f"[SPECTRUM] forecasted velocity")
+                            noisy_patch = (noisy_patch.float() + velocity.float() * dt.float()).to(dtype)
+                            x_t = patchifier.unpatchify(
+                                noisy_patch,
+                                output_shape=VideoLatentShape(
+                                    frames=1, height=latent_h, width=latent_w,
+                                    batch=1, channels=latent_channels,
+                                ),
+                            )
+                            continue  # Skip to next denoising step
+
                     # ── TeaCache: check if this decoder step can be skipped ──
                     # TeaCache (CVPR 2025) caches decoder velocity and reuses it when
                     # consecutive denoising steps produce similar outputs (mid-schedule).
                     # On cache hit: skip ALL decoder blocks + CFG, use cached velocity.
-                    if tea_cache is not None:
+                    elif tea_cache is not None:
                         # Always record DDiT trajectory, even on cache hits
                         if ddit_wrapper is not None and not args.ddit_fixed_schedule:
                             ddit_wrapper.scheduler.record(noisy_patch)
@@ -1535,8 +1609,10 @@ def main() -> None:
                                 )
                                 velocity = velocity_uncond + args.guidance_scale * (velocity - velocity_uncond)
 
-                    # ── Update TeaCache with freshly computed velocity ──
-                    if tea_cache is not None:
+                    # ── Update caching state with freshly computed velocity ──
+                    if spectrum is not None:
+                        spectrum.record(step, velocity)
+                    elif tea_cache is not None:
                         tea_cache.cached_velocity = velocity.detach().clone()
 
                     # ── Euler ODE Step ──
@@ -1608,7 +1684,15 @@ def main() -> None:
         rate = elapsed / frames_done if frames_done > 0 else 0
         remaining = (actual_latent - frames_done) * rate
         _tc_info = ""
-        if tea_cache is not None:
+        if spectrum is not None:
+            spectrum_total_hits += spectrum.hits
+            spectrum_total_misses += spectrum.misses
+            _chunk_total = spectrum.hits + spectrum.misses
+            _chunk_pct = spectrum.hits / _chunk_total * 100 if _chunk_total > 0 else 0
+            _tc_info = f" | Spectrum: {spectrum.hits}/{_chunk_total} forecasted ({_chunk_pct:.0f}%)"
+            spectrum.hits = 0
+            spectrum.misses = 0
+        elif tea_cache is not None:
             teacache_total_hits += tea_cache.hits
             teacache_total_misses += tea_cache.misses
             _chunk_total = tea_cache.hits + tea_cache.misses
@@ -1651,7 +1735,19 @@ def main() -> None:
             pct = ddit_steps_used / total_steps_all * 100 if total_steps_all > 0 else 0
             print(f"  DDiT: DYNAMIC scheduler — merged {ddit_steps_used}/{total_steps_all} total steps "
                   f"({pct:.0f}%)")
-    if tea_cache is not None:
+    if spectrum is not None:
+        total_steps_all = args.num_inference_steps * actual_latent
+        sp_total = spectrum_total_hits + spectrum_total_misses
+        sp_pct = spectrum_total_hits / sp_total * 100 if sp_total > 0 else 0
+        skipped_calls = spectrum_total_hits
+        calls_per_step = 2 if use_cfg else 1
+        saved_decoder_calls = skipped_calls * calls_per_step
+        total_decoder_calls = total_steps_all * calls_per_step
+        computed_steps = sp_total - spectrum_total_hits
+        print(f"  Spectrum: {spectrum_total_hits}/{sp_total} steps forecasted ({sp_pct:.0f}% forecast rate) | "
+              f"{computed_steps} computed, {spectrum_total_hits} forecasted")
+        print(f"  Spectrum: {saved_decoder_calls}/{total_decoder_calls} decoder calls saved")
+    elif tea_cache is not None:
         total_steps_all = args.num_inference_steps * actual_latent
         tc_total = teacache_total_hits + teacache_total_misses
         tc_pct = teacache_total_hits / tc_total * 100 if tc_total > 0 else 0

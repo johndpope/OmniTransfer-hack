@@ -47,12 +47,12 @@ class TextToVideoConfig(TrainingStrategyConfigBase):
 
     log_reconstructions: bool = Field(
         default=False,
-        description="Whether to log reconstruction visualizations to W&B",
+        description="Log target/predict/source reconstruction images to W&B",
     )
 
     reconstruction_log_interval: int = Field(
-        default=200,
-        description="Steps between reconstruction visualization logging",
+        default=50,
+        description="Log reconstruction images every N training steps",
     )
 
 
@@ -104,12 +104,10 @@ class TextToVideoStrategy(TrainingStrategy):
         latents = batch["latents"]
         video_latents = latents["latents"]
 
-        # Use actual latent tensor shape for dimensions — metadata num_frames may
-        # contain raw video frame count instead of latent frame count.
-        # video_latents shape: [B, C, F_lat, H_lat, W_lat]
-        num_frames = video_latents.shape[2]
-        height = video_latents.shape[3]
-        width = video_latents.shape[4]
+        # Get video dimensions (assume same for all batch elements)
+        num_frames = latents["num_frames"][0].item()
+        height = latents["height"][0].item()
+        width = latents["width"][0].item()
 
         # Patchify latents: [B, C, F, H, W] -> [B, seq_len, C]
         video_latents = self._video_patchifier.patchify(video_latents)
@@ -175,6 +173,7 @@ class TextToVideoStrategy(TrainingStrategy):
         # Create video Modality
         video_modality = Modality(
             enabled=True,
+            sigma=sigmas,
             latent=noisy_video,
             timesteps=video_timesteps,
             positions=video_positions,
@@ -201,21 +200,22 @@ class TextToVideoStrategy(TrainingStrategy):
                 dtype=dtype,
             )
 
-        model_inputs = ModelInputs(
+        inputs = ModelInputs(
             video=video_modality,
             audio=audio_modality,
             video_targets=video_targets,
             audio_targets=audio_targets,
             video_loss_mask=video_loss_mask,
             audio_loss_mask=audio_loss_mask,
-            shared_noise=video_noise,
-            shared_sigmas=sigmas,
         )
 
-        # Store raw latents for reconstruction visualization (pre-patchified [B, C, F, H, W])
-        model_inputs._raw_video_latents = batch["latents"]["latents"]
+        # Store raw latents + noise for reconstruction logging
+        inputs._raw_video_latents = batch["latents"]["latents"]  # [B, C, F, H, W]
+        inputs._noisy_video = noisy_video  # [B, seq_len, C] patchified
+        inputs._video_noise = video_noise
+        inputs._video_sigmas = sigmas
 
-        return model_inputs
+        return inputs
 
     def _prepare_audio_inputs(
         self,
@@ -273,6 +273,7 @@ class TextToVideoStrategy(TrainingStrategy):
         audio_modality = Modality(
             enabled=True,
             latent=noisy_audio,
+            sigma=sigmas,
             timesteps=audio_timesteps,
             positions=audio_positions,
             context=audio_prompt_embeds,
@@ -315,122 +316,91 @@ class TextToVideoStrategy(TrainingStrategy):
         vae_decoder: torch.nn.Module | None = None,
         prefix: str = "train",
     ) -> dict[str, Any]:
-        """Log reconstruction visualizations to W&B.
+        """Log target/predict/source reconstruction images to W&B.
 
-        Recovers the predicted clean latent from the velocity prediction using
-        flow matching: x_0_hat = noise - v_hat, then VAE-decodes both ground
-        truth and prediction for side-by-side comparison.
-
-        Args:
-            video_pred: Model velocity prediction [B, seq_len, C]
-            inputs: ModelInputs with raw latents and noise
-            step: Current training step
-            vae_decoder: VAE decoder for pixel-space visualization
-            prefix: W&B metric prefix
-
-        Returns:
-            Dictionary of logged W&B metrics
+        Decodes one sample from the batch through the VAE and logs a triplet:
+        source (noisy input) | predict (denoised) | target (ground truth).
         """
         try:
             import wandb
         except ImportError:
             return {}
-
         if wandb.run is None or not self.config.log_reconstructions:
             return {}
 
         raw_latents = getattr(inputs, "_raw_video_latents", None)
-        if raw_latents is None:
-            logger.warning("No raw latents stored for reconstruction")
+        if raw_latents is None or vae_decoder is None:
             return {}
 
+        import random as _random
+
         b, c, f, h, w = raw_latents.shape
-        noise = inputs.shared_noise  # [B, seq_len, C] (patchified)
 
-        # Flow matching recovery: v = noise - clean → clean_hat = noise - v_hat
-        pred_clean = noise - video_pred  # [B, seq_len, C]
+        # Reconstruct clean prediction from velocity: pred_clean = noisy - sigma * velocity
+        # In flow matching: noisy = (1-σ)x₀ + σε, target = ε - x₀, pred ≈ target
+        # So x₀_hat = noisy - σ * pred = (1-σ)x₀ + σε - σ(ε - x₀) = x₀
+        noisy_video = getattr(inputs, "_noisy_video", None)
+        sigmas = getattr(inputs, "_video_sigmas", None)
+        if noisy_video is None or sigmas is None:
+            return {}
 
-        # Unpatchify: [B, seq_len, C] → [B, C, F, H, W]
-        pred_clean_spatial = pred_clean.reshape(b, f, h, w, c).permute(0, 4, 1, 2, 3)
-        gt_latents = raw_latents
+        sigmas_expanded = sigmas.view(-1, 1, 1)
+        pred_clean = noisy_video - sigmas_expanded * video_pred  # [B, seq_len, C]
 
-        # VAE-decode to pixel space if decoder available
-        if vae_decoder is not None:
-            try:
-                decoder_device = next(vae_decoder.parameters()).device
-                decoder_dtype = next(vae_decoder.parameters()).dtype
+        # Unpatchify to [B, C, F, H, W]
+        from ltx_core.types import VideoLatentShape  # noqa: PLC0415
+        output_shape = VideoLatentShape(batch=b, channels=c, frames=f, height=h, width=w)
+        pred_spatial = self._video_patchifier.unpatchify(pred_clean, output_shape)
+        noisy_spatial = self._video_patchifier.unpatchify(noisy_video, output_shape)
 
+        sample_idx = _random.randint(0, b - 1) if b > 1 else 0
+
+        log_dict: dict[str, Any] = {}
+        try:
+            decoder_device = next(vae_decoder.parameters()).device
+            decoder_dtype = next(vae_decoder.parameters()).dtype
+
+            # Decode one at a time, moving results to CPU immediately to save VRAM
+            def _decode_one(latent: Tensor) -> Tensor:
                 with torch.inference_mode():
-                    gt_decoded = vae_decoder(
-                        gt_latents[:1].to(device=decoder_device, dtype=decoder_dtype)
-                    )
-                    pred_decoded = vae_decoder(
-                        pred_clean_spatial[:1].to(device=decoder_device, dtype=decoder_dtype)
-                    )
+                    decoded = vae_decoder(latent.to(device=decoder_device, dtype=decoder_dtype))
+                result = decoded.float().clamp(-1, 1) * 0.5 + 0.5
+                return result[0].cpu()  # [3, T, H, W]
 
-                gt_decoded = gt_decoded.float().clamp(-1, 1) * 0.5 + 0.5
-                pred_decoded = pred_decoded.float().clamp(-1, 1) * 0.5 + 0.5
+            # Free training activations before VAE decode
+            torch.cuda.empty_cache()
 
-                # For T2I (1 frame), use frame 0; for T2V use middle frame
-                mid_f = gt_decoded.shape[2] // 2
-                gt_frame = gt_decoded[0, :, mid_f].cpu()
-                pred_frame = pred_decoded[0, :, mid_f].cpu()
+            gt_frames = _decode_one(raw_latents[sample_idx:sample_idx + 1])
+            torch.cuda.empty_cache()
+            pred_frames = _decode_one(pred_spatial[sample_idx:sample_idx + 1])
+            torch.cuda.empty_cache()
+            noisy_frames = _decode_one(noisy_spatial[sample_idx:sample_idx + 1])
+            torch.cuda.empty_cache()
 
-                import torchvision.utils as vutils
+            # Mid-frame triplet image: source | predict | target
+            mid_f = gt_frames.shape[1] // 2
+            import torchvision.utils as vutils
 
-                grid = vutils.make_grid([gt_frame, pred_frame], nrow=2, padding=4)
-
-                log_dict = {
-                    f"{prefix}/reconstruction": wandb.Image(
-                        grid.permute(1, 2, 0).numpy(),
-                        caption=f"Step {step} | Left: Ground Truth | Right: Prediction",
-                    ),
-                }
-
-                # Log first and last frames for multi-frame data
-                if gt_decoded.shape[2] > 1:
-                    gt_first = gt_decoded[0, :, 0].cpu()
-                    pred_first = pred_decoded[0, :, 0].cpu()
-                    gt_last = gt_decoded[0, :, -1].cpu()
-                    pred_last = pred_decoded[0, :, -1].cpu()
-
-                    grid_first = vutils.make_grid([gt_first, pred_first], nrow=2, padding=4)
-                    grid_last = vutils.make_grid([gt_last, pred_last], nrow=2, padding=4)
-
-                    log_dict[f"{prefix}/reconstruction_first"] = wandb.Image(
-                        grid_first.permute(1, 2, 0).numpy(),
-                        caption=f"Step {step} | First frame | GT vs Pred",
-                    )
-                    log_dict[f"{prefix}/reconstruction_last"] = wandb.Image(
-                        grid_last.permute(1, 2, 0).numpy(),
-                        caption=f"Step {step} | Last frame | GT vs Pred",
-                    )
-
-                # Return log_dict — caller (trainer) handles wandb.log with proper step
-                logger.debug(f"Logged T2V reconstruction images at step {step}")
-                return log_dict
-
-            except Exception as e:
-                logger.warning(f"Failed to decode reconstruction: {e}")
-
-        # Fallback: latent-space pseudo-RGB visualization
-        mid_f = f // 2
-        gt_vis = raw_latents[0, :3, mid_f].cpu().float()
-        pred_vis = pred_clean_spatial[0, :3, mid_f].cpu().float()
-
-        def normalize(x: Tensor) -> Tensor:
-            x = x - x.min()
-            return x / (x.max() + 1e-8)
-
-        import torchvision.utils as vutils
-
-        grid = vutils.make_grid([normalize(gt_vis), normalize(pred_vis)], nrow=2, padding=4)
-
-        log_dict = {
-            f"{prefix}/reconstruction_latent": wandb.Image(
+            grid = vutils.make_grid(
+                [noisy_frames[:, mid_f], pred_frames[:, mid_f], gt_frames[:, mid_f]],
+                nrow=3, padding=4, normalize=False,
+            )
+            log_dict[f"{prefix}/reconstruction"] = wandb.Image(
                 grid.permute(1, 2, 0).numpy(),
-                caption=f"Step {step} | Latent pseudo-RGB | GT vs Pred",
-            ),
-        }
-        # Return log_dict — caller (trainer) handles wandb.log with proper step
+                caption=f"Step {step} | Source (noisy) | Predict | Target (GT)",
+            )
+
+            # Also log as video if multi-frame
+            if gt_frames.shape[1] > 1:
+                side_by_side = torch.cat([noisy_frames, pred_frames, gt_frames], dim=-1)
+                video_np = (side_by_side.permute(1, 0, 2, 3) * 255).clamp(0, 255).to(torch.uint8).numpy()
+                log_dict[f"{prefix}/reconstruction_video"] = wandb.Video(
+                    video_np, fps=8,
+                    caption=f"Step {step} | Source | Predict | Target",
+                )
+
+            logger.debug(f"Logged reconstruction triplet at step {step}")
+        except Exception as e:
+            logger.warning(f"Failed to decode reconstructions: {e}")
+
         return log_dict

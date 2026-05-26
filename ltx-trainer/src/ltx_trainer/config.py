@@ -8,7 +8,26 @@ from ltx_trainer.training_strategies.base_strategy import TrainingStrategyConfig
 from ltx_trainer.training_strategies.text_to_video import TextToVideoConfig
 from ltx_trainer.training_strategies.video_to_video import VideoToVideoConfig
 from ltx_trainer.training_strategies.scd_strategy import SCDTrainingConfig
-from ltx_trainer.training_strategies.editctrl_scd_strategy import EditCtrlSCDConfig
+from ltx_trainer.training_strategies.vfm_scd_strategy import VFMSCDTrainingConfig
+from ltx_trainer.training_strategies.vfm_scd_distill_strategy import VFMSCDDistillConfig
+from ltx_trainer.training_strategies.vfm_strategy import VFMTrainingConfig
+from ltx_trainer.training_strategies.vfm_strategy_v1b import VFMv1bTrainingConfig
+from ltx_trainer.training_strategies.vfm_strategy_v1c import VFMv1cTrainingConfig
+from ltx_trainer.training_strategies.isogen_strategy import IsoGenTrainingConfig
+from ltx_trainer.training_strategies.vfm_distill_strategy import VFMDistillConfig
+from ltx_trainer.training_strategies.vfm_strategy_v1d import VFMv1dTrainingConfig
+from ltx_trainer.training_strategies.vfm_strategy_v1e import VFMv1eTrainingConfig
+from ltx_trainer.training_strategies.vfm_strategy_v1f import VFMv1fTrainingConfig
+# from ltx_trainer.training_strategies.vfm_strategy_v1_1f import VFMv11fTrainingConfig
+from ltx_trainer.training_strategies.vfm_strategy_v1_2f import VFMv12fTrainingConfig
+from ltx_trainer.training_strategies.vfm_strategy_v1g import VFMv1gTrainingConfig
+from ltx_trainer.training_strategies.vfm_strategy_v1h import VFMv1hTrainingConfig
+from ltx_trainer.training_strategies.vfm_strategy_v1i_patchflow import VFMv1iPatchFlowConfig
+from ltx_trainer.training_strategies.vfm_strategy_v2a import VFMv2aTrainingConfig
+from ltx_trainer.training_strategies.vfm_strategy_v2b import VFMv2bTrainingConfig
+from ltx_trainer.training_strategies.vfm_strategy_v3a import DMDVFMv3aTrainingConfig
+from ltx_trainer.training_strategies.vfm_strategy_v3b import SelfEVFMv3bTrainingConfig
+from ltx_trainer.training_strategies.vfm_v4a_standalone import VFMv4aConfig
 from ltx_trainer.omnitransfer.strategy import OmniTransferConfig
 
 
@@ -29,15 +48,35 @@ class ModelConfig(ConfigBaseModel):
         description="Path to text encoder (required for LTX-2/Gemma models, optional for LTXV/T5 models)",
     )
 
-    training_mode: Literal["lora", "full"] = Field(
+    training_mode: Literal["lora", "full", "frozen"] = Field(
         default="lora",
-        description="Training mode - either LoRA fine-tuning or full model fine-tuning",
+        description="Training mode - 'lora' for LoRA fine-tuning, 'full' for full model fine-tuning, "
+        "'frozen' to freeze the transformer entirely (only train strategy params like VFM adapter)",
     )
 
     load_checkpoint: str | Path | None = Field(
         default=None,
         description="Path to a checkpoint file or directory to load from. "
         "If a directory is provided, the latest checkpoint will be used.",
+    )
+
+    load_noise_adapter: str | Path | None = Field(
+        default=None,
+        description="Path to a noise adapter checkpoint (.safetensors) to resume VFM training.",
+    )
+
+    self_attn_type: Literal["standard", "clifford_rolling", "clifford_video"] = Field(
+        default="standard",
+        description="Self-attention type for transformer blocks. "
+        "'clifford_rolling' for 1D sparse geometric attention, "
+        "'clifford_video' for video-aware 3D rolling with temporal/spatial shifts.",
+    )
+
+    clifford_kwargs: dict | None = Field(
+        default=None,
+        description="Parameters for Clifford attention variants: "
+        "num_seq_shifts, num_channel_shifts, max_seq_len (rolling), "
+        "num_spatial_shifts, num_temporal_shifts, spherical_norm, num_frames (video).",
     )
 
     @field_validator("model_path")
@@ -95,7 +134,25 @@ TrainingStrategyConfig = Annotated[
     Annotated[TextToVideoConfig, Tag("text_to_video")]
     | Annotated[VideoToVideoConfig, Tag("video_to_video")]
     | Annotated[SCDTrainingConfig, Tag("scd")]
-    | Annotated[EditCtrlSCDConfig, Tag("editctrl_scd")]
+    | Annotated[VFMSCDDistillConfig, Tag("vfm_scd_distill")]
+    | Annotated[VFMSCDTrainingConfig, Tag("vfm_scd")]
+    | Annotated[VFMTrainingConfig, Tag("vfm")]
+    | Annotated[VFMv1bTrainingConfig, Tag("vfm_v1b")]
+    | Annotated[VFMv4aConfig, Tag("vfm_v4a")]
+    | Annotated[SelfEVFMv3bTrainingConfig, Tag("vfm_v3b")]
+    | Annotated[DMDVFMv3aTrainingConfig, Tag("vfm_v3a")]
+    | Annotated[VFMv2bTrainingConfig, Tag("vfm_v2b")]
+    | Annotated[VFMv2aTrainingConfig, Tag("vfm_v2a")]
+    | Annotated[VFMv1iPatchFlowConfig, Tag("vfm_v1i_patchflow")]
+    | Annotated[VFMv1hTrainingConfig, Tag("vfm_v1h")]
+    | Annotated[VFMv1gTrainingConfig, Tag("vfm_v1g")]
+    | Annotated[VFMv1fTrainingConfig, Tag("vfm_v1f")]
+    | Annotated[VFMv12fTrainingConfig, Tag("vfm_v1_2f")]
+    | Annotated[VFMv1eTrainingConfig, Tag("vfm_v1e")]
+    | Annotated[VFMv1dTrainingConfig, Tag("vfm_v1d")]
+    | Annotated[VFMv1cTrainingConfig, Tag("vfm_v1c")]
+    | Annotated[VFMDistillConfig, Tag("vfm_distill")]
+    | Annotated[IsoGenTrainingConfig, Tag("isogen")]
     | Annotated[OmniTransferConfig, Tag("omnitransfer")],
     Discriminator(_get_strategy_discriminator),
 ]
@@ -106,7 +163,14 @@ class OptimizationConfig(ConfigBaseModel):
 
     learning_rate: float = Field(
         default=5e-4,
-        description="Learning rate for optimization",
+        description="Learning rate for optimization (DiT/LoRA params)",
+    )
+
+    adapter_learning_rate: float | None = Field(
+        default=None,
+        description="Separate learning rate for VFM noise adapter. "
+        "If None, uses the main learning_rate. Higher LR (e.g. 1e-3) helps "
+        "the adapter escape collapse basins faster than the DiT LoRA.",
     )
 
     steps: int = Field(
@@ -167,6 +231,13 @@ class OptimizationConfig(ConfigBaseModel):
     enable_gradient_checkpointing: bool = Field(
         default=False,
         description="Enable gradient checkpointing to save memory at the cost of slower training",
+    )
+
+    score_mix_lr_multiplier: float = Field(
+        default=1.0,
+        description="LR multiplier for Clifford score_mix parameters. "
+        "Higher values (e.g., 3.0) help geometric mixing adapt faster.",
+        ge=1.0,
     )
 
 

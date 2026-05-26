@@ -1,0 +1,50 @@
+acceleration:
+  load_text_encoder_in_8bit: false
+  mixed_precision_mode: bf16
+  quantization: int8-quanto
+data:
+  final_embeddings_dir: conditions
+  num_dataloader_workers: 0
+  preprocessed_data_root: /home/johndpope/Documents/GitHub/OmniTransfer-hack/facebook_reels/mashup_training
+  use_cached_final_embeddings: true
+lora:
+  alpha: 32
+  rank: 32
+model:
+  model_path: /media/2TB/ltx-models/ltx2.3/ltx-2.3-22b-distilled.safetensors
+  training_mode: lora
+optimization:
+  batch_size: 1
+  enable_gradient_checkpointing: true
+  gradient_accumulation_steps: 1
+  learning_rate: 5.0e-05
+  optimizer_type: adamw
+  scheduler_type: cosine
+  steps: 5000
+training_strategy:
+  concept_embedding_dim: 128
+  concept_embedding_task_specific: true
+  enable_concept_embeddings: true
+  enable_rcl: true
+  enable_tma: false
+  enable_tpb: true
+  i2v_mode: false
+  log_reconstructions: true
+  log_video_comparisons: true
+  name: omnitransfer
+  num_frames_to_visualize: 1
+  perceptual_loss_interval: 5
+  reconstruction_log_interval: 100
+  reference_latents_dir: reference_latents
+  style_loss_weight: 0.1
+  task_type: style_transfer
+  training_stage: 1
+  use_decoded_pixels_for_style: true
+  use_vgg_style_features: true
+  video_log_interval: 500
+validation:
+  interval: null
+wandb:
+  enabled: true
+  log_validation_videos: false
+  project: omnitransfer-mashup-style

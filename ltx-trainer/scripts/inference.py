@@ -136,14 +136,14 @@ def main() -> None:  # noqa: PLR0912, PLR0915
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="/media/2TB/ltx-models/ltx2/ltx-2-19b-dev.safetensors",
+        required=True,
         help="Path to model checkpoint (.safetensors)",
     )
     parser.add_argument(
         "--text-encoder-path",
         type=str,
-        default="/media/2TB/ltx-models/gemma",
-        help="Path to Gemma text encoder directory (not needed with --cached-embedding)",
+        required=True,
+        help="Path to Gemma text encoder directory",
     )
 
     # LoRA arguments
@@ -158,8 +158,8 @@ def main() -> None:  # noqa: PLR0912, PLR0915
     parser.add_argument(
         "--prompt",
         type=str,
-        default="",
-        help="Text prompt for generation (not needed with --cached-embedding)",
+        required=True,
+        help="Text prompt for generation",
     )
     parser.add_argument(
         "--negative-prompt",
@@ -270,23 +270,6 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         help="Output audio path (.wav, optional - if not provided, audio will be embedded in video)",
     )
 
-    # Cached embedding (bypass text encoder)
-    parser.add_argument(
-        "--cached-embedding",
-        type=str,
-        default=None,
-        help="Path to precomputed text embedding .pt file (skips loading Gemma text encoder)",
-    )
-
-    # Quantization
-    parser.add_argument(
-        "--quantization",
-        type=str,
-        default="none",
-        choices=["none", "int8-quanto", "fp8-quanto"],
-        help="Quantize transformer to reduce VRAM (required for 32GB GPUs)",
-    )
-
     # Device arguments
     parser.add_argument(
         "--device",
@@ -294,6 +277,14 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         default="cuda",
         help="Device to run on (cuda/cpu)",
     )
+
+    # Clifford attention arguments
+    parser.add_argument("--self-attn-type", default="standard",
+                        choices=["standard", "clifford_video"],
+                        help="Self-attention type (use clifford_video for Clifford LoRA checkpoints)")
+    parser.add_argument("--num-spatial-shifts", type=int, default=12)
+    parser.add_argument("--num-temporal-shifts", type=int, default=4)
+    parser.add_argument("--num-channel-shifts", type=int, default=4)
 
     args = parser.parse_args()
 
@@ -303,26 +294,10 @@ def main() -> None:  # noqa: PLR0912, PLR0915
 
     # Validate arguments
     generate_audio = not args.skip_audio
-    use_cached = args.cached_embedding is not None
 
     print("=" * 80)
     print("LTX Video/Audio Generation")
     print("=" * 80)
-
-    # Load cached embeddings if provided (bypasses text encoder entirely)
-    cached_embeddings = None
-    if use_cached:
-        from ltx_trainer.validation_sampler import CachedPromptEmbeddings
-
-        print(f"Loading cached embedding from {args.cached_embedding}...")
-        emb = torch.load(args.cached_embedding, map_location="cpu", weights_only=True)
-        video_embeds = emb["video_prompt_embeds"].unsqueeze(0).to(torch.bfloat16)
-        audio_embeds = emb.get("audio_prompt_embeds", torch.zeros_like(emb["video_prompt_embeds"])).unsqueeze(0).to(torch.bfloat16)
-        cached_embeddings = CachedPromptEmbeddings(
-            video_context_positive=video_embeds,
-            audio_context_positive=audio_embeds,
-        )
-        print(f"  Shape: {video_embeds.shape}")
 
     # Determine if we need VAE encoder (for image or video conditioning)
     need_vae_encoder = args.condition_image is not None or args.reference_video is not None
@@ -335,20 +310,35 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         with_video_vae_decoder=True,
         with_audio_vae_decoder=generate_audio,
         with_vocoder=generate_audio,
-        with_text_encoder=not use_cached,
-        text_encoder_path=args.text_encoder_path if not use_cached else None,
+        with_text_encoder=True,
+        text_encoder_path=args.text_encoder_path,
     )
 
-    # Quantize transformer if requested (must be done before .to(device) in sampler)
+    # Apply Clifford attention swap if requested
     transformer = components.transformer
-    if args.quantization != "none":
-        from ltx_trainer.quantization import quantize_model
-
-        print(f"Quantizing transformer ({args.quantization})...")
-        transformer = quantize_model(transformer, args.quantization, device=args.device)
-        # Move to device after quantization (sampler's .to() will be a no-op)
-        transformer = transformer.to(args.device)
-        print(f"  GPU memory: {torch.cuda.memory_allocated(0) / 1e9:.1f} GB")
+    if getattr(args, "self_attn_type", "standard") != "standard":
+        from ltx_core.model.transformer.clifford_attention import CliffordVideoAttention
+        from ltx_core.model.transformer.attention import Attention
+        swapped = 0
+        for block in transformer.transformer_blocks:
+            old = block.attn1
+            if isinstance(old, Attention):
+                new_attn = CliffordVideoAttention(
+                    query_dim=old.to_q.in_features, heads=old.heads, dim_head=old.dim_head,
+                    norm_eps=1e-6, rope_type=old.rope_type, attention_function=old.attention_function,
+                    apply_gated_attention=old.to_gate_logits is not None,
+                    num_spatial_shifts=getattr(args, "num_spatial_shifts", 12),
+                    num_temporal_shifts=getattr(args, "num_temporal_shifts", 4),
+                    num_channel_shifts=getattr(args, "num_channel_shifts", 4),
+                )
+                new_attn.to_q = old.to_q; new_attn.to_k = old.to_k
+                new_attn.to_v = old.to_v; new_attn.to_out = old.to_out
+                new_attn.q_norm = old.q_norm; new_attn.k_norm = old.k_norm
+                if old.to_gate_logits is not None:
+                    new_attn.to_gate_logits = old.to_gate_logits
+                block.attn1 = new_attn
+                swapped += 1
+        print(f"Swapped {swapped} self-attention blocks to {args.self_attn_type}")
 
     # Apply LoRA weights if provided
     if args.lora_path is not None:
@@ -427,17 +417,21 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         stg_scale=args.stg_scale,
         stg_blocks=args.stg_blocks,
         stg_mode=args.stg_mode,
-        cached_embeddings=cached_embeddings,
     )
 
     # Generate with progress bar
     with StandaloneSamplingProgress(num_steps=args.num_inference_steps) as progress:
         # Create sampler with progress context
+        # Load embeddings processor for text-to-embedding conversion
+        from ltx_trainer.model_loader import load_embeddings_processor
+        embeddings_processor = load_embeddings_processor(args.checkpoint, device="cpu")
+
         sampler = ValidationSampler(
             transformer=transformer,
             vae_decoder=components.video_vae_decoder,
             vae_encoder=components.video_vae_encoder,
             text_encoder=components.text_encoder,
+            embeddings_processor=embeddings_processor,
             audio_decoder=components.audio_vae_decoder if generate_audio else None,
             vocoder=components.vocoder if generate_audio else None,
             sampling_context=progress,
@@ -454,25 +448,16 @@ def main() -> None:  # noqa: PLR0912, PLR0915
     # Get audio sample rate from vocoder if audio was generated
     audio_sample_rate = None
     if audio is not None and components.vocoder is not None:
-        audio_sample_rate = components.vocoder.output_sample_rate
+        audio_sample_rate = components.vocoder.output_sampling_rate
 
-    # Save as image if single frame + image extension, otherwise video
-    if args.num_frames == 1 and output_path.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp"):
-        from torchvision.utils import save_image
-
-        # video is [C, F, H, W] in [0, 1] — extract first frame as [C, H, W]
-        frame = video[:, 0, :, :] if video.dim() == 4 else video
-        save_image(frame, output_path)
-        print(f"✓ Image saved to {args.output}")
-    else:
-        save_video(
-            video_tensor=video,
-            output_path=output_path,
-            fps=args.frame_rate,
-            audio=audio,
-            audio_sample_rate=audio_sample_rate,
-        )
-        print(f"✓ Video saved to {args.output}")
+    save_video(
+        video_tensor=video,
+        output_path=output_path,
+        fps=args.frame_rate,
+        audio=audio,
+        audio_sample_rate=audio_sample_rate,
+    )
+    print(f"✓ Video saved to {args.output}")
 
     # Save separate audio file if requested
     if audio is not None and args.audio_output is not None:

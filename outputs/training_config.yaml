@@ -1,0 +1,207 @@
+acceleration:
+  load_text_encoder_in_8bit: false
+  mixed_precision_mode: bf16
+  quantization: int8-quanto
+checkpoints:
+  interval: null
+  keep_last_n: 1
+  precision: bfloat16
+data:
+  final_embeddings_dir: conditions
+  live_ingest_enabled: false
+  num_dataloader_workers: 0
+  preprocessed_data_root: /home/johndpope/Documents/GitHub/OmniTransfer-hack/facebook_reels/mashup_training
+  use_cached_final_embeddings: true
+flow_matching:
+  timestep_sampling_mode: shifted_logit_normal
+  timestep_sampling_params: {}
+hardware:
+  devices:
+    audio_vae: cuda:0
+    text_encoder: cuda:0
+    transformer: cuda:0
+    vae_decoder: cuda:0
+    vae_encoder: cuda:0
+    vocoder: cuda:0
+hub:
+  hub_model_id: null
+  push_to_hub: false
+lora:
+  alpha: 32
+  dropout: 0.0
+  rank: 32
+  target_modules:
+  - to_k
+  - to_q
+  - to_v
+  - to_out.0
+model:
+  clifford_kwargs: null
+  load_checkpoint: null
+  load_noise_adapter: null
+  model_path: /media/2TB/ltx-models/ltx2.3/ltx-2.3-22b-distilled.safetensors
+  self_attn_type: standard
+  text_encoder_path: null
+  training_mode: lora
+optimization:
+  adapter_learning_rate: null
+  batch_size: 1
+  enable_gradient_checkpointing: true
+  gradient_accumulation_steps: 1
+  learning_rate: 5.0e-05
+  max_grad_norm: 1.0
+  optimizer_type: adamw
+  scheduler_params: {}
+  scheduler_type: cosine
+  score_mix_lr_multiplier: 1.0
+  steps: 5000
+  warmup_steps: 0
+  weight_decay: 0.0
+output_dir: outputs
+seed: 42
+training_strategy:
+  augmentation:
+    enabled: false
+    horizontal_flip_p: 0.5
+    noise_injection_p: 0.2
+    noise_injection_scale: 0.02
+    temporal_jitter_max_frames: 1
+    temporal_jitter_p: 0.3
+  clip_model_name: ViT-SO400M-14-SigLIP-384
+  clip_pretrained: webli
+  concept_embedding_dim: 128
+  concept_embedding_init_scale: 0.02
+  concept_embedding_num_concepts: 4
+  concept_embedding_task_specific: true
+  depth_3d_loss_anneal_steps: 15000
+  depth_3d_loss_weight: 0.05
+  depth_3d_pseudo_gt_dir: depth_3d
+  edge_3d_loss_weight: 0.02
+  enable_concept_embeddings: true
+  enable_depth_3d_loss: false
+  enable_geometric_3d_encoder: false
+  enable_geometric_supervision: false
+  enable_joint_motion_cfg: false
+  enable_motion_encoder: false
+  enable_rcl: true
+  enable_tma: false
+  enable_tpb: true
+  enable_track_conditioning: false
+  first_frame_conditioning_p: 0.1
+  first_frame_latents_dir: first_frame_latents
+  geometric_3d_decoder_anneal_steps: 15000
+  geometric_3d_decoder_loss_weight: 0.05
+  geometric_3d_feature_dim: 7
+  geometric_3d_hidden_dim: 512
+  geometric_3d_num_layers: 4
+  geometric_3d_num_tokens: 8
+  geometric_loss_anneal_steps: 12000
+  geometric_loss_initial_weight: 0.1
+  geometric_pseudo_gt_dir: skeleton
+  i2v_mode: false
+  identity_loss_model: arcface
+  identity_loss_weight: 0.0
+  local_reconstruction_dir: null
+  log_reconstructions: true
+  log_video_comparisons: true
+  lpips_weight: 0.0
+  max_samples_per_log: 4
+  metaquery_freeze: true
+  metaquery_load_in_8bit: true
+  metaquery_model: llava-hf/llava-onevision-qwen2-7b-ov-hf
+  min_snr_gamma: 5.0
+  motion_augmentation:
+    channel_jitter_scale: 0.05
+    enabled: true
+    spatial_crop_ratio_max: 1.0
+    spatial_crop_ratio_min: 0.7
+    temporal_subsample_ratio: 0.8
+  motion_cfg_drop_rate: 0.1
+  motion_cross_view: false
+  motion_cross_view_ratio: 0.5
+  motion_encoder_dual_scale: false
+  motion_encoder_hand_tokens: 3
+  motion_encoder_hidden_dim: 512
+  motion_encoder_num_layers: 4
+  motion_encoder_num_tokens: 5
+  motion_self_reconstruction: false
+  motion_training_phase: 1
+  multi_task_mode: false
+  name: omnitransfer
+  normal_3d_loss_weight: 0.03
+  num_frames_to_visualize: 1
+  perceptual_loss_interval: 5
+  rcl_ref_timestep: 0.0
+  reconstruction_log_interval: 100
+  ref_preservation_loss_weight: 0.0
+  reference_latents_dir: reference_latents
+  save_reconstructions_locally: false
+  self_reconstruction_mode: false
+  style_loss_weight: 0.1
+  target_loss_weight: 1.0
+  task_sampling: uniform
+  task_type: style_transfer
+  task_types:
+  - identity_preservation
+  task_weights: {}
+  text_cfg_drop_rate: 0.1
+  tma_connector_layers: 3
+  tma_features_dir: qwen_vl_features
+  tma_mllm_hidden_dim: 3584
+  tma_num_queries: 8
+  tpb_max_pos:
+  - 20
+  - 2048
+  - 2048
+  tpb_theta: 10000.0
+  track_consistency_loss_weight: 0.02
+  track_decoder_anneal_steps: 15000
+  track_decoder_loss_weight: 0.05
+  track_hidden_dim: 512
+  track_max_points: 128
+  track_num_layers: 4
+  track_num_tokens: 8
+  track_pseudo_gt_dir: tracks
+  track_sincos_dim: 64
+  training_stage: 1
+  use_cached_tma_features: false
+  use_clip_identity: false
+  use_confidence_weighted_mse: false
+  use_decoded_pixels_for_lpips: true
+  use_decoded_pixels_for_style: true
+  use_metaquery_mllm: false
+  use_vgg_style_features: true
+  vgg_style_layers:
+  - relu1_2
+  - relu2_2
+  - relu3_3
+  - relu4_3
+  video_log_interval: 500
+validation:
+  frame_rate: 25.0
+  generate_audio: true
+  guidance_scale: 4.0
+  images: null
+  include_reference_in_output: false
+  inference_steps: 50
+  interval: null
+  negative_prompt: worst quality, inconsistent motion, blurry, jittery, distorted
+  prompts: []
+  reference_videos: null
+  seed: 42
+  skip_initial_validation: false
+  stg_blocks:
+  - 29
+  stg_mode: stg_av
+  stg_scale: 1.0
+  video_dims: !!python/tuple
+  - 960
+  - 544
+  - 97
+  videos_per_prompt: 1
+wandb:
+  enabled: true
+  entity: null
+  log_validation_videos: false
+  project: omnitransfer-mashup-style
+  tags: []

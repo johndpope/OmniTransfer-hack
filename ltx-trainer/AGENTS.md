@@ -773,3 +773,13 @@ This helps diagnose:
 - Style extraction quality
 - Identity/content preservation
 - Artifacts or mode collapse
+
+## ⚠️ CRITICAL: NEVER USE LTX 2.0 19B MODEL
+
+> **NEVER use `ltx-2-19b-dev.safetensors`. Always use LTX 2.3 (`ltx-2.3-22b-distilled.safetensors`).**
+>
+> The 19b model is deprecated. All training must use LTX 2.3 at:
+> `/media/2TB/ltx-models/ltx2.3/ltx-2.3-22b-distilled.safetensors`
+>
+> The ltx-core and ltx-trainer packages in this repo have been swapped with
+> the castlehill versions which support LTX 2.3 natively.

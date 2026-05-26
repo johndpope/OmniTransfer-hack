@@ -29,14 +29,15 @@ from torch.utils.data import DataLoader
 from torchvision.transforms import functional as F  # noqa: N812
 from torchvision.utils import save_image
 
+from ltx_core.text_encoders.gemma import convert_to_additive_mask
 from ltx_trainer import logger
 from ltx_trainer.config import LtxTrainerConfig
 from ltx_trainer.config_display import print_config
 from ltx_trainer.datasets import PrecomputedDataset
 from ltx_trainer.gpu_utils import free_gpu_memory, free_gpu_memory_context, get_gpu_memory_gb
 from ltx_trainer.hf_hub_utils import push_to_hub
+from ltx_trainer.model_loader import load_embeddings_processor, load_text_encoder
 from ltx_trainer.model_loader import load_model as load_ltx_model
-from ltx_trainer.model_loader import load_text_encoder
 from ltx_trainer.progress import TrainingProgress
 from ltx_trainer.quantization import quantize_model
 from ltx_trainer.timestep_samplers import SAMPLERS
@@ -85,9 +86,11 @@ class LtxvTrainer:
 
         # Check if using cached final embeddings (skip loading text encoder entirely)
         self._use_cached_final_embeddings = self._config.data.use_cached_final_embeddings
+        # Track whether we need a connector pass on cached embeddings (determined after model load)
+        self._needs_connector_for_cached = False
         if self._use_cached_final_embeddings:
             logger.info("🚀 Using cached final embeddings - skipping text encoder load (~28GB VRAM saved)")
-            self._text_encoder = None
+            self._embeddings_processor = None
             self._cached_validation_embeddings = None
             # Warn if validation is configured - it won't work without text encoder
             if self._config.validation.prompts and self._config.validation.interval:
@@ -101,8 +104,7 @@ class LtxvTrainer:
 
         self._load_models()
 
-        # [GROK RECOMMENDED] Pass VAE decoder to OmniTransfer strategy for pixel-space losses
-        # LPIPS and style loss work much better on decoded RGB pixels than raw latents
+        # Pass VAE decoder to strategy for pixel-space losses (if strategy supports it)
         if hasattr(self._training_strategy, "set_vae_decoder"):
             self._training_strategy.set_vae_decoder(self._vae_decoder)
             logger.info("Passed VAE decoder to training strategy for pixel-space loss computation")
@@ -111,6 +113,16 @@ class LtxvTrainer:
         self._collect_trainable_params()
         self._load_checkpoint()
         self._prepare_models_for_training()
+
+        # Pass transformer to strategy for multi-pass forward (ILR in v1.2f)
+        # Done after setup_accelerator + prepare so the model is on GPU and tracked
+        if hasattr(self._training_strategy, "set_transformer"):
+            self._training_strategy.set_transformer(
+                self._transformer,
+                grad_accumulation_steps=self._config.optimization.gradient_accumulation_steps,
+            )
+            logger.info("Passed transformer to training strategy for multi-pass forward")
+
         self._dataset = None
         self._global_step = -1
         self._checkpoint_paths = []
@@ -191,6 +203,27 @@ class LtxvTrainer:
                     batch = next(data_iter)
 
                 step_start_time = time.time()
+
+                # Anti-collapse: freeze/unfreeze DiT LoRA at configured step boundary
+                freeze_dit_steps = getattr(
+                    getattr(self._training_strategy, "config", None),
+                    "freeze_dit_steps", 0,
+                )
+                if freeze_dit_steps > 0 and self._global_step == 0:
+                    # Freeze DiT LoRA at start
+                    for name, p in self._transformer.named_parameters():
+                        if p.requires_grad and "noise_adapter" not in name.lower():
+                            p.requires_grad = False
+                            p._was_frozen_for_adapter = True
+                    logger.info(f"Froze DiT LoRA for first {freeze_dit_steps} steps (adapter-only training)")
+                elif freeze_dit_steps > 0 and self._global_step == freeze_dit_steps:
+                    # Unfreeze
+                    for p in self._transformer.parameters():
+                        if hasattr(p, "_was_frozen_for_adapter"):
+                            p.requires_grad = True
+                            del p._was_frozen_for_adapter
+                    logger.info(f"Unfroze DiT LoRA at step {freeze_dit_steps}")
+
                 with self._accelerator.accumulate(self._transformer):
                     is_optimization_step = (step + 1) % cfg.optimization.gradient_accumulation_steps == 0
                     if is_optimization_step:
@@ -218,7 +251,14 @@ class LtxvTrainer:
                         loss = self._training_step(batch)
                         video_pred, model_inputs = None, None
 
-                    self._accelerator.backward(loss)
+                    # In frozen mode, skip backward if loss has no grad_fn
+                    # (happens on random-path steps where no adapter was used)
+                    if loss.requires_grad:
+                        self._accelerator.backward(loss)
+                    elif self._config.model.training_mode == "frozen":
+                        logger.debug("Frozen mode: skipping backward (random path, no grad)")
+                    else:
+                        self._accelerator.backward(loss)
 
                     if self._accelerator.sync_gradients and cfg.optimization.max_grad_norm > 0:
                         # Cast any FP8 gradients to bf16 before clipping — PyTorch's
@@ -277,6 +317,8 @@ class LtxvTrainer:
 
                     # Update progress and log metrics
                     current_lr = self._optimizer.param_groups[0]["lr"]
+                    if len(self._optimizer.param_groups) > 1:
+                        adapter_lr = self._optimizer.param_groups[1]["lr"]
                     step_time = (time.time() - step_start_time) * cfg.optimization.gradient_accumulation_steps
 
                     progress.update_training(
@@ -291,6 +333,7 @@ class LtxvTrainer:
                         metrics = {
                             "train/loss": loss.item(),
                             "train/learning_rate": current_lr,
+                        **({"train/adapter_lr": adapter_lr} if len(self._optimizer.param_groups) > 1 else {}),
                             "train/step_time": step_time,
                             "train/global_step": self._global_step,
                         }
@@ -299,6 +342,11 @@ class LtxvTrainer:
                             p_ar = self._training_strategy._get_p_ar()
                             if p_ar > 0.0 or hasattr(self._training_strategy, "_current_step"):
                                 metrics["train/p_ar"] = p_ar
+                        # Log VFM-specific metrics if available
+                        if hasattr(self._training_strategy, "_last_vfm_metrics"):
+                            vfm_metrics = getattr(self._training_strategy, "_last_vfm_metrics", None)
+                            if vfm_metrics:
+                                metrics.update(vfm_metrics)
                         self._log_metrics(metrics)
 
                         # Save debug image every optimization step (overwrites)
@@ -444,16 +492,36 @@ class LtxvTrainer:
         conditions = batch["conditions"]
 
         if self._use_cached_final_embeddings:
-            # Use pre-computed final embeddings directly (no connector call needed)
-            # Format from conditions_final/*.pt: video_prompt_embeds, audio_prompt_embeds, prompt_attention_mask
-            # These are already in final form [seq_len, 4096]
-            pass  # conditions already has video_prompt_embeds, audio_prompt_embeds, prompt_attention_mask
+            if self._needs_connector_for_cached and self._caption_projection_shim is not None:
+                # LTX-2.3: cached embeddings are 3840-dim from LTX-2 feature extractor.
+                # Apply caption_projection shim to transform to 4096 for the 2.3 transformer.
+                with torch.no_grad():
+                    video_features = conditions["video_prompt_embeds"]
+                    batch_size = video_features.shape[0] if video_features.dim() == 3 else 1
+                    conditions["video_prompt_embeds"] = self._caption_projection_shim(video_features).view(
+                        batch_size, -1, 4096
+                    )
+                    if "audio_prompt_embeds" in conditions and conditions["audio_prompt_embeds"] is not None:
+                        audio_features = conditions["audio_prompt_embeds"]
+                        conditions["audio_prompt_embeds"] = self._caption_projection_shim(audio_features).view(
+                            batch_size, -1, 4096
+                        )
         else:
-            # Apply embedding connectors to transform raw pre-computed text embeddings
-            # Format from conditions/*.pt: prompt_embeds [1024, 3840], prompt_attention_mask [1024]
-            video_embeds, audio_embeds, attention_mask = self._text_encoder._run_connectors(
-                conditions["prompt_embeds"], conditions["prompt_attention_mask"]
+            if "video_prompt_embeds" in conditions:
+                # New format: separate video/audio features from precompute()
+                video_features = conditions["video_prompt_embeds"]
+                audio_features = conditions.get("audio_prompt_embeds")
+            else:
+                # Legacy format: single prompt_embeds tensor — duplicate for both modalities
+                video_features = conditions["prompt_embeds"]
+                audio_features = conditions["prompt_embeds"]
+
+            mask = conditions["prompt_attention_mask"]
+            additive_mask = convert_to_additive_mask(mask, video_features.dtype)
+            video_embeds, audio_embeds, attention_mask = self._embeddings_processor.create_embeddings(
+                video_features, audio_features, additive_mask
             )
+
             conditions["video_prompt_embeds"] = video_embeds
             conditions["audio_prompt_embeds"] = audio_embeds
             conditions["prompt_attention_mask"] = attention_mask
@@ -507,31 +575,38 @@ class LtxvTrainer:
         # Use strategy to compute loss
         loss = self._training_strategy.compute_loss(video_pred, audio_pred, model_inputs)
 
+
         if return_for_logging:
             return loss, video_pred, model_inputs
         return loss
 
     @free_gpu_memory_context(after=True)
     def _load_text_encoder_and_cache_embeddings(self) -> list[CachedPromptEmbeddings] | None:
-        """Load text encoder, computes and returns validation embeddings."""
+        """Load text encoder + embeddings processor, compute and cache validation embeddings."""
 
         # This method:
-        #   1. Loads the text encoder on GPU
-        #   2. If validation prompts are configured, computes and caches their embeddings
-        #   3. Unloads the heavy Gemma model while keeping the lightweight embedding connectors
-        #   The text encoder is kept (as self._text_encoder) but with model/tokenizer/feature_extractor
-        #   set to None. Only the embedding connectors remain for use during training.
+        #   1. Loads the pure Gemma text encoder on GPU
+        #   2. Loads the embeddings processor (feature extractor + connectors)
+        #   3. If validation prompts are configured, computes and caches their embeddings
+        #   4. Unloads the Gemma model entirely, keeps the embeddings processor for training
 
         # Load text encoder on configured device (supports multi-GPU)
         text_encoder_device = self._config.hardware.devices.text_encoder
         logger.debug(f"Loading text encoder on {text_encoder_device}...")
 
-        self._text_encoder = load_text_encoder(
-            checkpoint_path=self._config.model.model_path,
+        text_encoder = load_text_encoder(
             gemma_model_path=self._config.model.text_encoder_path,
             device=text_encoder_device,
             dtype=torch.bfloat16,
             load_in_8bit=self._config.acceleration.load_text_encoder_in_8bit,
+        )
+
+        # Load embeddings processor (feature extractor + connectors)
+        logger.debug("Loading embeddings processor...")
+        self._embeddings_processor = load_embeddings_processor(
+            checkpoint_path=self._config.model.model_path,
+            device="cuda",
+            dtype=torch.bfloat16,
         )
 
         # Cache validation embeddings if prompts are configured
@@ -541,25 +616,102 @@ class LtxvTrainer:
             cached_embeddings = []
             with torch.inference_mode():
                 for prompt in self._config.validation.prompts:
-                    v_ctx_pos, a_ctx_pos, _ = self._text_encoder(prompt)
-                    v_ctx_neg, a_ctx_neg, _ = self._text_encoder(self._config.validation.negative_prompt)
+                    pos_hs, pos_mask = text_encoder.encode(prompt)
+                    pos_out = self._embeddings_processor.process_hidden_states(pos_hs, pos_mask)
+
+                    neg_hs, neg_mask = text_encoder.encode(self._config.validation.negative_prompt)
+                    neg_out = self._embeddings_processor.process_hidden_states(neg_hs, neg_mask)
 
                     cached_embeddings.append(
                         CachedPromptEmbeddings(
-                            video_context_positive=v_ctx_pos.cpu(),
-                            audio_context_positive=a_ctx_pos.cpu(),
-                            video_context_negative=v_ctx_neg.cpu() if v_ctx_neg is not None else None,
-                            audio_context_negative=a_ctx_neg.cpu() if a_ctx_neg is not None else None,
+                            video_context_positive=pos_out.video_encoding.cpu(),
+                            audio_context_positive=pos_out.audio_encoding.cpu(),
+                            video_context_negative=neg_out.video_encoding.cpu(),
+                            audio_context_negative=(
+                                neg_out.audio_encoding.cpu() if neg_out.audio_encoding is not None else None
+                            ),
                         )
                     )
 
-        # Unload heavy components to free VRAM, keeping only the embedding connectors
-        self._text_encoder.model = None
-        self._text_encoder.tokenizer = None
-        self._text_encoder.feature_extractor_linear = None
+        # Unload Gemma model and feature extractor, keep only connectors for training
+        del text_encoder
+        self._embeddings_processor.feature_extractor = None
 
         logger.debug("Validation prompt embeddings cached. Gemma model unloaded")
         return cached_embeddings
+
+    def _swap_attention_modules(self, model: "LTXModel") -> None:
+        """Swap standard attention with Clifford attention in transformer blocks.
+
+        Copies shared weights (Q/K/V projections, norms, gating, output) from the
+        original Attention modules into new CliffordRollingAttention or
+        CliffordVideoAttention modules. Only new parameters (score_mix) are
+        randomly initialized.
+        """
+        from ltx_core.model.transformer.clifford_attention import (  # noqa: PLC0415
+            CliffordRollingAttention,
+            CliffordVideoAttention,
+        )
+        from ltx_core.model.transformer.attention import Attention  # noqa: PLC0415
+
+        attn_type = self._config.model.self_attn_type
+        ck = self._config.model.clifford_kwargs or {}
+        swapped = 0
+
+        for block in model.transformer_blocks:
+            old_attn = block.attn1
+            if not isinstance(old_attn, Attention):
+                continue
+
+            if attn_type == "clifford_video":
+                new_attn = CliffordVideoAttention(
+                    query_dim=old_attn.to_q.in_features,
+                    heads=old_attn.heads,
+                    dim_head=old_attn.dim_head,
+                    norm_eps=1e-6,
+                    rope_type=old_attn.rope_type,
+                    attention_function=old_attn.attention_function,
+                    apply_gated_attention=old_attn.to_gate_logits is not None,
+                    num_spatial_shifts=ck.get("num_spatial_shifts", 12),
+                    num_temporal_shifts=ck.get("num_temporal_shifts", 4),
+                    num_channel_shifts=ck.get("num_channel_shifts", 4),
+                    max_spatial_len=ck.get("max_spatial_len", 2048),
+                    spherical_norm=ck.get("spherical_norm", False),
+                    num_frames=ck.get("num_frames", 1),
+                )
+            elif attn_type == "clifford_rolling":
+                new_attn = CliffordRollingAttention(
+                    query_dim=old_attn.to_q.in_features,
+                    heads=old_attn.heads,
+                    dim_head=old_attn.dim_head,
+                    norm_eps=1e-6,
+                    rope_type=old_attn.rope_type,
+                    attention_function=old_attn.attention_function,
+                    apply_gated_attention=old_attn.to_gate_logits is not None,
+                    num_seq_shifts=ck.get("num_seq_shifts", 16),
+                    num_channel_shifts=ck.get("num_channel_shifts", 4),
+                    max_seq_len=ck.get("max_seq_len", 2048),
+                )
+            else:
+                continue
+
+            # Copy shared weights
+            new_attn.to_q = old_attn.to_q
+            new_attn.to_k = old_attn.to_k
+            new_attn.to_v = old_attn.to_v
+            new_attn.to_out = old_attn.to_out
+            new_attn.q_norm = old_attn.q_norm
+            new_attn.k_norm = old_attn.k_norm
+            if old_attn.to_gate_logits is not None:
+                new_attn.to_gate_logits = old_attn.to_gate_logits
+
+            block.attn1 = new_attn
+            swapped += 1
+
+        logger.info(
+            f"Swapped {swapped} self-attention blocks to {attn_type} "
+            f"(kwargs: {ck})"
+        )
 
     def _load_models(self) -> None:
         """Load the LTX-2 model components."""
@@ -594,6 +746,10 @@ class LtxvTrainer:
             with_text_encoder=False,  # Text encoder handled separately
         )
 
+        # Apply Clifford attention swap if configured
+        if self._config.model.self_attn_type != "standard":
+            self._swap_attention_modules(components.transformer)
+
         # Extract components and move to configured devices (supports multi-GPU)
         # Note: hw_devices was already set above for transformer loading
         self._transformer = components.transformer
@@ -615,7 +771,7 @@ class LtxvTrainer:
         if self._vocoder is not None:
             self._vocoder = self._vocoder.to(device=hw_devices.vocoder)
 
-        # Note: self._text_encoder was set in _load_text_encoder_and_cache_embeddings
+        # Note: self._embeddings_processor was set in _load_text_encoder_and_cache_embeddings
         # Note: transformer device is handled by Accelerate, but we track the target device
         self._transformer_device = hw_devices.transformer
 
@@ -626,7 +782,7 @@ class LtxvTrainer:
         # Determine initial dtype based on training mode.
         # Note: For FSDP + LoRA, we'll cast to FP32 later in _prepare_models_for_training()
         # after the accelerator is set up, and we can detect FSDP.
-        transformer_dtype = torch.bfloat16 if self._config.model.training_mode == "lora" else torch.float32
+        transformer_dtype = torch.bfloat16 if self._config.model.training_mode in ("lora", "frozen") else torch.float32
 
         self._transformer = self._transformer.to(dtype=transformer_dtype)
 
@@ -653,9 +809,65 @@ class LtxvTrainer:
             logger.info(f"Moving {model_size} transformer to {hw_devices.transformer}...")
             self._transformer = self._transformer.to(hw_devices.transformer)
 
-        # Wrap transformer with SCD model if using SCD strategy (includes EditCtrl+SCD)
+        # LTX-2.3: no caption_projection in transformer, but cached embeddings may be 3840-dim
+        # from LTX-2's feature extractor. Load the caption_projection from the LTX-2 checkpoint
+        # to transform 3840→4096 before feeding to the 2.3 transformer.
+        # If embeddings are already 4096-dim (precomputed with LTX-2.3), skip the shim.
+        self._caption_projection_shim = None
+        self._needs_connector_for_cached = False
+        if self._use_cached_final_embeddings and not (
+            hasattr(self._transformer, 'caption_projection') and self._transformer.caption_projection is not None
+        ):
+            # Check actual embedding dimension from the first file
+            emb_dir = Path(self._config.data.preprocessed_data_root) / self._config.data.final_embeddings_dir
+            _skip_shim = False
+            try:
+                _first_file = sorted(emb_dir.glob("*.pt"))[0]
+                _sample = torch.load(_first_file, map_location="cpu", weights_only=False)
+                _emb_dim = _sample.get("video_prompt_embeds", _sample.get("prompt_embeds")).shape[-1]
+                if _emb_dim == 4096:
+                    logger.info(f"Embeddings already 4096-dim ({_first_file.name}), skipping caption_projection shim")
+                    _skip_shim = True
+                else:
+                    logger.info(f"Embeddings are {_emb_dim}-dim, will apply caption_projection shim (3840→4096)")
+            except Exception as e:
+                logger.warning(f"Could not check embedding dim: {e}, will apply shim")
+
+            if not _skip_shim:
+                logger.info("LTX-2.3 detected: cached embeddings are 3840-dim, loading caption_projection shim")
+                # Load caption_projection from LTX-2 checkpoint (lightweight, only a few MB)
+                from safetensors import safe_open  # noqa: PLC0415
+                from ltx_core.model.transformer.text_projection import PixArtAlphaTextProjection  # noqa: PLC0415
+                caption_proj = PixArtAlphaTextProjection(in_features=3840, hidden_size=4096)
+                # Try loading from LTX-2 checkpoint first, fall back to current model
+                ltx2_path = "/media/2TB/ltx-models/ltx2/ltx-2-19b-distilled.safetensors"
+                import os
+                if os.path.exists(ltx2_path):
+                    source_path = ltx2_path
+                else:
+                    source_path = str(self._config.model.model_path)
+                with safe_open(source_path, framework="pt") as f:
+                    prefix = "model.diffusion_model.caption_projection."
+                    for key in f.keys():
+                        if key.startswith(prefix):
+                            param_name = key[len(prefix):]
+                            param = f.get_tensor(key)
+                            parts = param_name.split(".")
+                            obj = caption_proj
+                            for part in parts[:-1]:
+                                obj = getattr(obj, part)
+                            setattr(obj, parts[-1], torch.nn.Parameter(param))
+                self._caption_projection_shim = caption_proj.to(hw_devices.transformer).eval()
+                for p in self._caption_projection_shim.parameters():
+                    p.requires_grad = False
+                self._needs_connector_for_cached = True
+                logger.info("Caption projection shim loaded (3840→4096)")
+
+        # Wrap transformer with SCD model if using SCD or VFM-SCD strategy
         from ltx_trainer.training_strategies.scd_strategy import SCDTrainingStrategy  # noqa: PLC0415
-        if isinstance(self._training_strategy, SCDTrainingStrategy):
+        from ltx_trainer.training_strategies.vfm_scd_strategy import VFMSCDTrainingStrategy  # noqa: PLC0415
+        from ltx_trainer.training_strategies.vfm_scd_distill_strategy import VFMSCDDistillStrategy  # noqa: PLC0415
+        if isinstance(self._training_strategy, (SCDTrainingStrategy, VFMSCDTrainingStrategy, VFMSCDDistillStrategy)):
             from ltx_core.model.transformer.scd_model import LTXSCDModel  # noqa: PLC0415
             scd_config = self._training_strategy.config
             # Pass EditCtrl local control injection config if available
@@ -675,79 +887,69 @@ class LtxvTrainer:
                 f"combine={scd_config.decoder_input_combine}"
             )
 
-        # Instantiate EditCtrl modules if using EditCtrl+SCD strategy
-        from ltx_trainer.training_strategies.editctrl_scd_strategy import EditCtrlSCDTrainingStrategy  # noqa: PLC0415
-        if isinstance(self._training_strategy, EditCtrlSCDTrainingStrategy):
-            from ltx_core.model.transformer.editctrl_modules import (  # noqa: PLC0415
-                GlobalContextEmbedder,
-                LocalContextModule,
-            )
-            editctrl_config = self._training_strategy.config
+        # VFM: Create noise adapter and attach to strategy
+        self._noise_adapter = None
+        from ltx_trainer.training_strategies.vfm_strategy import VFMTrainingStrategy  # noqa: PLC0415
+        from ltx_trainer.training_strategies.vfm_strategy_v1b import VFMv1bTrainingStrategy  # noqa: PLC0415
+        from ltx_trainer.training_strategies.vfm_v4a_standalone import VFMv4aStrategy  # noqa: PLC0415
+        if isinstance(self._training_strategy, (VFMSCDTrainingStrategy, VFMSCDDistillStrategy, VFMTrainingStrategy, VFMv1bTrainingStrategy, VFMv4aStrategy)):
+            # Set text embed dim (needed before adapter creation for all VFM families)
+            if hasattr(self._training_strategy, "set_text_embed_dim"):
+                if hasattr(self._transformer, 'caption_projection') and self._transformer.caption_projection is not None:
+                    text_embed_dim = self._transformer.caption_projection.linear_1.in_features
+                else:
+                    text_embed_dim = self._transformer.inner_dim
+                self._training_strategy.set_text_embed_dim(text_embed_dim)
 
-            # Instantiate LocalContextModule on training device
-            # context_dim = text embedding dim (3840 for Gemma), NOT inner_dim (4096),
-            # because LocalContextModule receives raw prompt_embeds before caption_projection
-            text_embed_dim = self._transformer.base_model.caption_projection.linear_1.in_features  # 3840
-            lcm_inner_dim = editctrl_config.local_inner_dim or self._transformer.inner_dim
-            # output_dim must match transformer inner_dim for residual addition in decoder
-            lcm_output_dim = self._transformer.inner_dim if lcm_inner_dim != self._transformer.inner_dim else None
-            # Auto-compute heads from inner_dim if not specified
-            lcm_heads = editctrl_config.local_heads or max(1, lcm_inner_dim // editctrl_config.local_dim_head)
-            lcm_dim_head = editctrl_config.local_dim_head
-            mask_channel = getattr(editctrl_config, 'mask_channel_concat', False)
-            self._local_context_module = LocalContextModule(
-                latent_dim=128,  # LTX-2 patchified latent dim
-                inner_dim=lcm_inner_dim,
-                context_dim=text_embed_dim,
-                num_blocks=editctrl_config.local_num_blocks,
-                heads=lcm_heads,
-                dim_head=lcm_dim_head,
-                output_dim=lcm_output_dim,
-                timestep_dim=self._transformer.inner_dim,  # 4096 — LCM projects internally
-                mask_channel_concat=mask_channel,
-            ).to(device=hw_devices.transformer, dtype=torch.bfloat16)
-            if getattr(editctrl_config, 'gradient_checkpointing_local', False):
-                self._local_context_module._gradient_checkpointing = True
-            self._training_strategy.set_local_context_module(self._local_context_module)
-            lcm_params = sum(p.numel() for p in self._local_context_module.parameters())
-            logger.info(f"EditCtrl LocalContextModule: {lcm_params:,} params ({lcm_params * 2 / 1e9:.2f} GB bf16)")
+            adapter_kwargs = self._training_strategy.get_noise_adapter_params()
 
-            # Instantiate GlobalContextEmbedder for phase 2
-            if editctrl_config.editctrl_phase >= 2:
-                self._global_embedder = GlobalContextEmbedder(
-                    latent_dim=128,
-                    inner_dim=self._transformer.inner_dim,
-                    num_tokens=editctrl_config.global_context_num_tokens,
-                ).to(device=hw_devices.transformer, dtype=torch.bfloat16)
-                self._training_strategy.set_global_embedder(self._global_embedder)
-                ge_params = sum(p.numel() for p in self._global_embedder.parameters())
-                logger.info(f"EditCtrl GlobalContextEmbedder: {ge_params:,} params")
+            # Use appropriate factory: v1b (transformer) vs mlp
+            if isinstance(self._training_strategy, (VFMv1bTrainingStrategy, VFMv4aStrategy)):
+                from ltx_core.model.transformer.noise_adapter_v1b import create_noise_adapter_v1b  # noqa: PLC0415
+                self._noise_adapter = create_noise_adapter_v1b(**adapter_kwargs)
             else:
-                self._global_embedder = None
+                from ltx_core.model.transformer.noise_adapter import create_noise_adapter  # noqa: PLC0415
+                self._noise_adapter = create_noise_adapter(**adapter_kwargs)
 
-            # Instantiate TMA module if enabled
-            if getattr(editctrl_config, "use_tma", False):
-                from ltx_trainer.omnitransfer.components import TaskAdaptiveMultimodalAlignment  # noqa: PLC0415
-                self._tma = TaskAdaptiveMultimodalAlignment(
-                    mllm_hidden_dim=editctrl_config.tma_mllm_hidden_dim,
-                    output_dim=editctrl_config.tma_output_dim,
-                    num_connector_layers=editctrl_config.tma_connector_layers,
-                    num_queries_per_task=editctrl_config.tma_num_queries,
-                ).to(device=hw_devices.transformer, dtype=torch.bfloat16)
-                self._training_strategy.set_tma(self._tma)
-                tma_params = sum(p.numel() for p in self._tma.parameters())
-                logger.info(
-                    f"EditCtrl TMA: {tma_params:,} params ({tma_params * 2 / 1e6:.1f} MB bf16), "
-                    f"mllm_dim={editctrl_config.tma_mllm_hidden_dim}, "
-                    f"output_dim={editctrl_config.tma_output_dim}, "
-                    f"queries={editctrl_config.tma_num_queries}"
+            # Move adapter to transformer's target device
+            # Note: transformer may still be on CPU at this point (single-GPU mode),
+            # but will be moved by accelerator.prepare(). Use configured device instead.
+            adapter_device = hw_devices.transformer
+            self._noise_adapter = self._noise_adapter.to(adapter_device)
+            self._training_strategy.set_noise_adapter(self._noise_adapter)
+
+            # Vanilla VFM / v1b: store transformer ref for EMA + flow map freezing
+            if isinstance(self._training_strategy, (VFMTrainingStrategy, VFMv1bTrainingStrategy)):
+                self._training_strategy.set_transformer_ref(self._transformer)
+
+            # DMD-VFM v3a: create discriminator and pass to strategy
+            self._fake_score_net = None  # reused field name for discriminator
+            from ltx_trainer.training_strategies.vfm_strategy_v3a import DMDVFMv3aTrainingStrategy  # noqa: PLC0415
+            if isinstance(self._training_strategy, DMDVFMv3aTrainingStrategy):
+                from ltx_core.model.transformer.latent_discriminator import LatentDiscriminator  # noqa: PLC0415
+                disc_params = self._training_strategy.get_discriminator_params()
+                self._fake_score_net = LatentDiscriminator(**disc_params)
+                self._fake_score_net = self._fake_score_net.to(device=adapter_device, dtype=torch.bfloat16)
+                self._training_strategy.set_fake_score_network(self._fake_score_net)
+                self._training_strategy.set_transformer(
+                    self._transformer,
+                    grad_accumulation_steps=self._config.optimization.gradient_accumulation_steps,
                 )
-            else:
-                self._tma = None
-        else:
-            self._local_context_module = None
-            self._global_embedder = None
-            self._tma = None
+                disc_n = sum(p.numel() for p in self._fake_score_net.parameters())
+                logger.info(f"DMD-VFM v3a: LatentDiscriminator created ({disc_n:,} params)")
+
+            adapter_params = sum(p.numel() for p in self._noise_adapter.parameters())
+            logger.info(
+                f"VFM noise adapter: "
+                f"{adapter_params:,} params, "
+                f"hidden_dim={adapter_kwargs.get('hidden_dim', '?')}, "
+                f"layers={adapter_kwargs.get('num_layers', '?')}"
+            )
+
+        # Placeholder for optional modules (EditCtrl, TMA — not included in CastleHill)
+        self._local_context_module = None
+        self._global_embedder = None
+        self._tma = None
 
         # Freeze all models. We later unfreeze the transformer based on training mode.
         # Note: embedding_connectors are already frozen (they come from the frozen text encoder)
@@ -763,15 +965,24 @@ class LtxvTrainer:
     def _collect_trainable_params(self) -> None:
         """Collect trainable parameters based on training mode and stage.
 
-        For OmniTransfer 3-stage training (Section 5.1):
-        - Stage 1: Train DiT (LoRA) + TPB + ConceptEmbedding
-        - Stage 2: Freeze DiT, train TMA connector only
+        For multi-stage training:
+        - Stage 1: Train DiT (LoRA) + strategy components
+        - Stage 2: Freeze DiT, train connector only
         - Stage 3: Joint fine-tuning of all components
         """
-        # Check if this is OmniTransfer with stage-based training
-        training_stage = self._get_omnitransfer_training_stage()
+        # Check if strategy uses stage-based training
+        training_stage = self._get_training_stage()
 
-        if self._config.model.training_mode == "lora":
+        if self._config.model.training_mode == "frozen":
+            # Frozen mode: still apply LoRA wrapper (needed for quanto compatibility),
+            # but freeze ALL transformer params including LoRA. Only qφ (adapter + sigma head) trains.
+            if self._config.lora is not None:
+                self._setup_lora()
+            self._transformer.requires_grad_(False)
+            frozen_count = sum(p.numel() for p in self._transformer.parameters())
+            logger.info(f"Frozen mode: transformer fully frozen ({frozen_count:,} params), only training qφ")
+
+        elif self._config.model.training_mode == "lora":
             # For LoRA training, first set up LoRA layers
             self._setup_lora()
 
@@ -781,12 +992,6 @@ class LtxvTrainer:
                 for param in self._transformer.parameters():
                     param.requires_grad = False
 
-            # EditCtrl: Freeze base SCD LoRA (only train LocalContextModule + TMA)
-            editctrl_freeze = getattr(self._config.training_strategy, 'freeze_base_lora', False)
-            if editctrl_freeze:
-                logger.info("EditCtrl: Freezing base SCD LoRA parameters (training EditCtrl modules only)")
-                for param in self._transformer.parameters():
-                    param.requires_grad = False
 
         elif self._config.model.training_mode == "full":
             # For full training, unfreeze all transformer parameters
@@ -811,11 +1016,19 @@ class LtxvTrainer:
                 f"({sum(p.numel() for p in strategy_params):,} total)"
             )
 
+        # VFM: Add noise adapter parameters to trainable params
+        if self._noise_adapter is not None:
+            adapter_params = list(self._noise_adapter.parameters())
+            self._trainable_params.extend(adapter_params)
+            logger.info(
+                f"Added VFM noise adapter: {sum(p.numel() for p in adapter_params):,} params"
+            )
+
         total_params = sum(p.numel() for p in self._trainable_params)
         logger.info(f"Total trainable params: {total_params:,} (stage {training_stage or 'N/A'})")
 
-    def _get_omnitransfer_training_stage(self) -> int | None:
-        """Get the OmniTransfer training stage from config, if applicable."""
+    def _get_training_stage(self) -> int | None:
+        """Get the training stage from strategy config, if applicable."""
         strategy_config = self._config.training_strategy
         if hasattr(strategy_config, "training_stage"):
             return strategy_config.training_stage
@@ -824,8 +1037,7 @@ class LtxvTrainer:
     def _get_strategy_trainable_params(self) -> list:
         """Get trainable parameters from the training strategy.
 
-        This allows strategies like OmniTransfer to add their own trainable
-        parameters (TPB, ConceptEmbedding, TMA) to the optimizer.
+        This allows strategies to add their own trainable parameters to the optimizer.
         """
         if hasattr(self._training_strategy, "get_trainable_parameters"):
             return self._training_strategy.get_trainable_parameters()
@@ -852,20 +1064,42 @@ class LtxvTrainer:
 
     def _load_checkpoint(self) -> None:
         """Load checkpoint if specified in config."""
-        if not self._config.model.load_checkpoint:
-            return
+        if self._config.model.load_checkpoint:
+            checkpoint_path = self._find_checkpoint(self._config.model.load_checkpoint)
+            if not checkpoint_path:
+                logger.warning(f"⚠️ Could not find checkpoint at {self._config.model.load_checkpoint}")
+            else:
+                logger.info(f"📥 Loading checkpoint from {checkpoint_path}")
+                if self._config.model.training_mode == "full":
+                    self._load_full_checkpoint(checkpoint_path)
+                elif self._config.model.training_mode == "lora":
+                    self._load_lora_checkpoint(checkpoint_path)
+                else:
+                    logger.info("Frozen mode: skipping transformer checkpoint (only adapter/strategy params are trained)")
 
-        checkpoint_path = self._find_checkpoint(self._config.model.load_checkpoint)
-        if not checkpoint_path:
-            logger.warning(f"⚠️ Could not find checkpoint at {self._config.model.load_checkpoint}")
-            return
+        # Load noise adapter checkpoint (VFM strategies)
+        if self._config.model.load_noise_adapter and self._noise_adapter is not None:
+            adapter_path = Path(self._config.model.load_noise_adapter)
+            if adapter_path.exists():
+                adapter_sd = load_file(str(adapter_path))
+                self._noise_adapter.load_state_dict(adapter_sd)
+                logger.info(f"📥 Loaded noise adapter from {adapter_path.name}")
 
-        logger.info(f"📥 Loading checkpoint from {checkpoint_path}")
+                # Auto-load SigmaHead if saved alongside noise adapter
+                sigma_head_path = adapter_path.parent / adapter_path.name.replace("noise_adapter_", "sigma_head_")
+                if sigma_head_path.exists() and hasattr(self._training_strategy, "_sigma_head") and self._training_strategy._sigma_head is not None:
+                    sigma_sd = load_file(str(sigma_head_path))
+                    self._training_strategy._sigma_head.load_state_dict(sigma_sd)
+                    logger.info(f"📥 Loaded SigmaHead from {sigma_head_path.name}")
 
-        if self._config.model.training_mode == "full":
-            self._load_full_checkpoint(checkpoint_path)
-        else:  # LoRA mode
-            self._load_lora_checkpoint(checkpoint_path)
+                # Auto-load FakeScoreNet/Discriminator if saved alongside
+                fake_score_path = adapter_path.parent / adapter_path.name.replace("noise_adapter_", "fake_score_")
+                if fake_score_path.exists() and self._fake_score_net is not None:
+                    score_sd = load_file(str(fake_score_path))
+                    self._fake_score_net.load_state_dict(score_sd)
+                    logger.info(f"📥 Loaded FakeScoreNet/Discriminator from {fake_score_path.name}")
+            else:
+                logger.warning(f"⚠️ Noise adapter not found: {adapter_path}")
 
     def _load_full_checkpoint(self, checkpoint_path: Path) -> None:
         """Load full model checkpoint."""
@@ -896,9 +1130,11 @@ class LtxvTrainer:
         if strategy_dict and hasattr(self._training_strategy, "load_strategy_state_dict"):
             loaded, skipped = self._training_strategy.load_strategy_state_dict(strategy_dict)
             if loaded:
-                logger.info(f"✅ Loaded {len(loaded)} strategy params from checkpoint")
+                n_loaded = loaded if isinstance(loaded, int) else len(loaded)
+                logger.info(f"✅ Loaded {n_loaded} strategy params from checkpoint")
             if skipped:
-                logger.warning(f"⚠️ Skipped {len(skipped)} strategy params (modules not initialised)")
+                n_skipped = skipped if isinstance(skipped, int) else len(skipped)
+                logger.warning(f"⚠️ Skipped {n_skipped} strategy params (modules not initialised)")
 
     def _prepare_models_for_training(self) -> None:
         """Prepare models for training with Accelerate."""
@@ -941,16 +1177,9 @@ class LtxvTrainer:
 
             # Move text encoder connectors to transformer device for training
             # (they need to be on the same device as the transformer for the forward pass)
-            if hasattr(self, '_text_encoder') and self._text_encoder is not None:
-                if hasattr(self._text_encoder, "embeddings_connector"):
-                    self._text_encoder.embeddings_connector = self._text_encoder.embeddings_connector.to(
-                        hw_devices.transformer
-                    )
-                if hasattr(self._text_encoder, "audio_embeddings_connector"):
-                    self._text_encoder.audio_embeddings_connector = self._text_encoder.audio_embeddings_connector.to(
-                        hw_devices.transformer
-                    )
-                logger.debug(f"Text encoder connectors moved to {hw_devices.transformer}")
+            if hasattr(self, '_embeddings_processor') and self._embeddings_processor is not None:
+                self._embeddings_processor = self._embeddings_processor.to(hw_devices.transformer)
+                logger.debug(f"Embeddings processor moved to {hw_devices.transformer}")
 
         # Embedding connectors are already on GPU from _load_text_encoder_and_cache_embeddings
 
@@ -1062,8 +1291,66 @@ class LtxvTrainer:
 
         lr = opt_cfg.learning_rate
         wd = opt_cfg.weight_decay
+        adapter_lr = opt_cfg.adapter_learning_rate
+
+        # Split param groups if adapter has separate LR
+        if adapter_lr is not None and self._noise_adapter is not None:
+            adapter_param_ids = {id(p) for p in self._noise_adapter.parameters()}
+            # Also include sigma_head if present
+            if hasattr(self._training_strategy, "_sigma_head") and self._training_strategy._sigma_head is not None:
+                adapter_param_ids.update(id(p) for p in self._training_strategy._sigma_head.parameters())
+
+            dit_params = [p for p in self._trainable_params if id(p) not in adapter_param_ids]
+            adp_params = [p for p in self._trainable_params if id(p) in adapter_param_ids]
+
+            param_groups = [
+                {"params": dit_params, "lr": lr, "weight_decay": wd},
+                {"params": adp_params, "lr": adapter_lr, "weight_decay": wd},
+            ]
+            logger.info(
+                f"Separate LRs: DiT/LoRA ({len(dit_params)} params) @ {lr}, "
+                f"Adapter+SigmaHead ({len(adp_params)} params) @ {adapter_lr}"
+            )
+        else:
+            param_groups = self._trainable_params
+
+        # Apply score_mix LR multiplier for Clifford attention params
+        if opt_cfg.score_mix_lr_multiplier > 1.0:
+            score_mix_ids = set()
+            for name, param in self._transformer.named_parameters():
+                if "score_mix" in name and param.requires_grad:
+                    score_mix_ids.add(id(param))
+
+            if score_mix_ids:
+                if isinstance(param_groups, list) and isinstance(param_groups[0], dict):
+                    # Already using param groups — split score_mix from the first group
+                    new_groups = []
+                    for group in param_groups:
+                        regular = [p for p in group["params"] if id(p) not in score_mix_ids]
+                        sm_params = [p for p in group["params"] if id(p) in score_mix_ids]
+                        if regular:
+                            new_groups.append({**group, "params": regular})
+                        if sm_params:
+                            new_groups.append({
+                                **group, "params": sm_params,
+                                "lr": group.get("lr", lr) * opt_cfg.score_mix_lr_multiplier,
+                            })
+                    param_groups = new_groups
+                else:
+                    # Simple list of params — split into two groups
+                    regular = [p for p in param_groups if id(p) not in score_mix_ids]
+                    sm_params = [p for p in param_groups if id(p) in score_mix_ids]
+                    param_groups = [
+                        {"params": regular, "lr": lr, "weight_decay": wd},
+                        {"params": sm_params, "lr": lr * opt_cfg.score_mix_lr_multiplier, "weight_decay": wd},
+                    ]
+                logger.info(
+                    f"score_mix LR: {lr * opt_cfg.score_mix_lr_multiplier:.2e} "
+                    f"({opt_cfg.score_mix_lr_multiplier}x, {len(score_mix_ids)} params)"
+                )
+
         if opt_cfg.optimizer_type == "adamw":
-            optimizer = AdamW(self._trainable_params, lr=lr, weight_decay=wd)
+            optimizer = AdamW(param_groups, lr=lr, weight_decay=wd)
         elif opt_cfg.optimizer_type == "adamw8bit":
             # noinspection PyUnresolvedReferences
             from bitsandbytes.optim import AdamW8bit  # noqa: PLC0415
@@ -1098,6 +1385,18 @@ class LtxvTrainer:
 
         # noinspection PyTypeChecker
         self._optimizer, self._lr_scheduler = self._accelerator.prepare(optimizer, lr_scheduler)
+
+        # DMD-VFM v3a: create discriminator optimizer
+        if getattr(self, "_fake_score_net", None) is not None:
+            from ltx_trainer.training_strategies.vfm_strategy_v3a import DMDVFMv3aTrainingStrategy  # noqa: PLC0415
+            if isinstance(self._training_strategy, DMDVFMv3aTrainingStrategy):
+                disc_lr = self._training_strategy.config.disc_lr
+                disc_optimizer = AdamW(
+                    self._fake_score_net.parameters(), lr=disc_lr,
+                    betas=(0.0, 0.999), weight_decay=0.01,  # beta1=0 per FlashMotion
+                )
+                self._training_strategy.set_fake_score_optimizer(disc_optimizer)
+                logger.info(f"DMD-VFM v3a: Discriminator optimizer created (lr={disc_lr}, beta1=0)")
 
     def _create_scheduler(self, optimizer: torch.optim.Optimizer) -> LRScheduler | None:
         """Create learning rate scheduler based on config."""
@@ -1319,7 +1618,7 @@ class LtxvTrainer:
                         output_path=output_path,
                         fps=self._config.validation.frame_rate,
                         audio=audio,
-                        audio_sample_rate=self._vocoder.output_sample_rate if audio is not None else None,
+                        audio_sample_rate=self._vocoder.output_sampling_rate if audio is not None else None,
                     )
                 video_paths.append(output_path)
 
@@ -1348,10 +1647,61 @@ class LtxvTrainer:
     def _save_checkpoint(self) -> Path | None:
         """Save the model weights."""
         is_lora = self._config.model.training_mode == "lora"
+        is_frozen = self._config.model.training_mode == "frozen"
         is_fsdp = self._accelerator.distributed_type == DistributedType.FSDP
 
         # Prepare paths
         save_dir = Path(self._config.output_dir) / "checkpoints"
+
+        # Determine save precision
+        save_dtype = torch.bfloat16 if self._config.checkpoints.precision == "bfloat16" else torch.float32
+
+        # Frozen mode: only save adapter + strategy params, no transformer weights
+        if is_frozen:
+            self._accelerator.wait_for_everyone()
+            if not IS_MAIN_PROCESS:
+                return None
+
+            save_dir.mkdir(exist_ok=True, parents=True)
+            saved_weights_path = save_dir / f"strategy_step_{self._global_step:05d}.safetensors"
+
+            # Save noise adapter
+            if self._noise_adapter is not None:
+                adapter_path = save_dir / f"noise_adapter_step_{self._global_step:05d}.safetensors"
+                adapter_sd = {k: v.to(save_dtype) for k, v in self._noise_adapter.state_dict().items()}
+                save_file(adapter_sd, adapter_path)
+                logger.info(f"💾 Noise adapter for step {self._global_step} saved in {adapter_path.relative_to(self._config.output_dir)}")
+
+            # Save SigmaHead
+            if hasattr(self._training_strategy, "_sigma_head") and self._training_strategy._sigma_head is not None:
+                sigma_path = save_dir / f"sigma_head_step_{self._global_step:05d}.safetensors"
+                sigma_sd = {k: v.to(save_dtype) for k, v in self._training_strategy._sigma_head.state_dict().items()}
+                save_file(sigma_sd, sigma_path)
+                logger.info(f"💾 SigmaHead for step {self._global_step} saved in {sigma_path.relative_to(self._config.output_dir)}")
+
+            # Save FakeScoreNetwork (DMD-VFM v3a)
+            if getattr(self, "_fake_score_net", None) is not None:
+                score_path = save_dir / f"fake_score_step_{self._global_step:05d}.safetensors"
+                score_sd = {k: v.to(save_dtype) for k, v in self._fake_score_net.state_dict().items()}
+                save_file(score_sd, score_path)
+                logger.info(f"💾 FakeScoreNet for step {self._global_step} saved in {score_path.relative_to(self._config.output_dir)}")
+
+            # Save strategy params
+            strategy_sd = {}
+            if hasattr(self._training_strategy, "get_strategy_state_dict"):
+                strategy_sd = self._training_strategy.get_strategy_state_dict() or {}
+            if strategy_sd:
+                save_file(
+                    {k: v.to(save_dtype) if isinstance(v, Tensor) else v for k, v in strategy_sd.items()},
+                    saved_weights_path,
+                )
+                logger.debug(f"Included {len(strategy_sd)} strategy params in checkpoint")
+
+            logger.info(f"💾 Frozen-mode checkpoint for step {self._global_step} saved")
+            self._checkpoint_paths.append(saved_weights_path)
+            self._cleanup_checkpoints()
+            return saved_weights_path
+
         prefix = "lora" if is_lora else "model"
         filename = f"{prefix}_weights_step_{self._global_step:05d}.safetensors"
         saved_weights_path = save_dir / filename
@@ -1364,9 +1714,6 @@ class LtxvTrainer:
             return None
 
         save_dir.mkdir(exist_ok=True, parents=True)
-
-        # Determine save precision
-        save_dtype = torch.bfloat16 if self._config.checkpoints.precision == "bfloat16" else torch.float32
 
         # For LoRA: extract only adapter weights; for full: use as-is
         if is_lora:
@@ -1392,6 +1739,20 @@ class LtxvTrainer:
 
             # Save to disk
             save_file(state_dict, saved_weights_path)
+
+            # Save noise adapter separately if present (VFM strategy)
+            if self._noise_adapter is not None:
+                adapter_path = save_dir / f"noise_adapter_step_{self._global_step:05d}.safetensors"
+                adapter_sd = {k: v.to(save_dtype) for k, v in self._noise_adapter.state_dict().items()}
+                save_file(adapter_sd, adapter_path)
+                logger.info(f"💾 Noise adapter for step {self._global_step} saved in {adapter_path.relative_to(self._config.output_dir)}")
+
+            # Save SigmaHead separately if present (VFM v1d+ per-token sigma)
+            if hasattr(self._training_strategy, "_sigma_head") and self._training_strategy._sigma_head is not None:
+                sigma_path = save_dir / f"sigma_head_step_{self._global_step:05d}.safetensors"
+                sigma_sd = {k: v.to(save_dtype) for k, v in self._training_strategy._sigma_head.state_dict().items()}
+                save_file(sigma_sd, sigma_path)
+                logger.info(f"💾 SigmaHead for step {self._global_step} saved in {sigma_path.relative_to(self._config.output_dir)}")
         else:
             # Cast to configured precision
             full_state_dict = {k: v.to(save_dtype) if isinstance(v, Tensor) else v for k, v in full_state_dict.items()}
@@ -1479,9 +1840,13 @@ class LtxvTrainer:
         try:
             from torchvision.utils import save_image
 
-            raw_latents = model_inputs._raw_video_latents  # [B, C, F, H, W]
-            noise = model_inputs.shared_noise  # [B, seq_len, C] (patchified)
-            sigmas = model_inputs.shared_sigmas
+            raw_latents = getattr(model_inputs, "_raw_video_latents", None)
+            if raw_latents is None:
+                return
+            noise = getattr(model_inputs, "shared_noise", None)
+            sigmas = getattr(model_inputs, "shared_sigmas", None)
+            if noise is None or sigmas is None:
+                return
 
             b, c, f, h, w = raw_latents.shape
 
@@ -1633,15 +1998,14 @@ class LtxvTrainer:
         Saves to outputs/debug_decoded.png
         """
         try:
-            from ltx_trainer.omnitransfer.strategy import OmniTransferModelInputs
-
             # Check for SCD strategy debug image
             raw_video_latents = getattr(model_inputs, "_raw_video_latents", None)
             if raw_video_latents is not None:
                 self._save_scd_debug_image(video_pred, model_inputs, step)
                 return
 
-            if not isinstance(model_inputs, OmniTransferModelInputs):
+            # Check for strategy-specific model inputs with raw latents
+            if not hasattr(model_inputs, "ref_latent_raw"):
                 return
 
             # Get raw latents

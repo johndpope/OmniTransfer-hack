@@ -61,6 +61,17 @@ Core Principles
 •NEVER use the default 448×768 landscape when the training data is portrait — it produces aspect-ratio-distorted, low-quality results.
 •Check source latent shape to determine orientation: latent `[C, F, H, W]` where `H > W` = portrait.
 
+9. Training Monitoring & NaN Prevention
+•When launching training, ALWAYS inspect the first 5-10 steps via W&B or log before walking away.
+•Check for NaN loss or exploding gradients (loss > 1e6 or sudden jumps >100x). If NaN appears, kill the run immediately.
+•Common NaN fixes (try in order):
+  1. Reduce learning_rate (e.g., 1e-4 → 3e-5)
+  2. Enable/check max_grad_norm (default 1.0)
+  3. Disable bf16 mixed precision (set mixed_precision_mode: "no")
+  4. Ensure `enable_gradient_checkpointing: true` is set
+  5. Check data for NaN/inf values in latents or conditions
+•After any fix, resume from last good checkpoint (not scratch) to save time.
+
 
 
 # AGENTS.md
@@ -191,6 +202,16 @@ This file provides guidance to AI coding assistants (Claude, Cursor, etc.) when 
 
 ---
 
+## ⚠️ CRITICAL: NEVER USE LTX 2.0 19B
+
+> **NEVER use `ltx-2-19b-dev.safetensors`. Always use LTX 2.3 (`ltx-2.3-22b-distilled.safetensors`).**
+>
+> The 19b model is deprecated. All training must use LTX 2.3 at
+> `/media/2TB/ltx-models/ltx2.3/ltx-2.3-22b-distilled.safetensors`.
+>
+> If a config references `ltx2/ltx-2-19b-dev.safetensors`, change it immediately.
+> The ltx-core and ltx-trainer packages now exclusively target LTX 2.3.
+
 ## ⚠️ CRITICAL: Model Quantization for Training
 
 > **Pre-quantized FP8 checkpoints (`ltx-2-19b-dev-fp8.safetensors`) DO NOT work for LoRA training!**
@@ -199,24 +220,21 @@ This file provides guidance to AI coding assistants (Claude, Cursor, etc.) when 
 > `NotImplementedError: "ufunc_add_CUDA" not implemented for 'Float8_e4m3fn'`.
 > The FP8 file is only useful for **inference** (no gradients needed).
 >
-> **For training, use the bf16 model + quanto runtime quantization:**
+> **For training, use the bf16 LTX 2.3 model + quanto runtime quantization:**
 >
 > | Model File | Size | Use For |
 > |-----------|------|---------|
-> | `ltx-2-19b-dev.safetensors` | 43 GB | **Training** — bf16 weights, quantized at runtime by quanto |
+> | ~~`ltx-2-19b-dev.safetensors`~~ | 43 GB | **DO NOT USE** — deprecated |
+> | **`ltx-2.3-22b-distilled.safetensors`** | **43 GB** | **Training** — bf16 weights, quantized at runtime by quanto |
 > | `ltx-2-19b-dev-fp8.safetensors` | 26 GB | **Inference ONLY** — no autograd support |
-> | `ltx-2-19b-dev-fp4.safetensors` | 20 GB | **DO NOT USE** — no LoRA fusion kernel in ltx-core |
 >
 > **Config for training:**
 > ```yaml
 > model:
->   model_path: "/media/2TB/ltx-models/ltx2/ltx-2-19b-dev.safetensors"
+>   model_path: "/media/2TB/ltx-models/ltx2.3/ltx-2.3-22b-distilled.safetensors"
 > acceleration:
->   quantization: "fp8-quanto"  # Runtime quantization (~20 min first time)
+>   quantization: "int8-quanto"  # Runtime quantization
 > ```
->
-> **Note:** quanto quantization takes ~20 minutes on first load. A future improvement would
-> be to cache the quantized state dict so subsequent loads are instant.
 
 ---
 

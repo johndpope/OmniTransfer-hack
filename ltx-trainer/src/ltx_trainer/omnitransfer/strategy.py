@@ -2181,54 +2181,32 @@ class OmniTransferStrategy(TrainingStrategy):
         # =====================================================================
         # Dynamic Identity Anchoring via Concept Embeddings (Movie Weaver CVPR 2025)
         # =====================================================================
-        # Add the SAME concept embedding to ALL tokens from the reference video.
-        # This creates explicit "identity grouping" - the model knows that all
-        # these tokens represent the same identity/concept, enabling better
-        # cross-temporal and multi-angle identity distillation.
-        #
-        # Key insight from Movie Weaver: "We apply the same concept embedding to
-        # the entire set of vision tokens from one image" (98.2% vs 90.5% accuracy)
-        # =====================================================================
         if self._concept_embedding is not None:
-            # Move ConceptEmbedding to device (once)
             if not hasattr(self, '_concept_emb_device_set'):
                 self._concept_embedding.to(device=device, dtype=dtype)
                 self._concept_emb_device_set = True
                 logger.info(f"ConceptEmbedding moved to {device}")
 
-            # current_task is already an OmniTransferTask enum from sample_task()
             task_enum = current_task
-            # Apply same embedding to ALL reference tokens
             ref_latents_patched = self._concept_embedding(
-                ref_latents_patched,
-                concept_index=0,  # Slot 0 for single-reference training
-                task=task_enum,
+                ref_latents_patched, concept_index=0, task=task_enum,
             )
-            # Log once per task type
             if not hasattr(self, '_logged_concept_emb') or current_task not in self._logged_concept_emb:
                 if not hasattr(self, '_logged_concept_emb'):
                     self._logged_concept_emb = set()
-                logger.info(
-                    f"Applied concept embedding for identity anchoring: "
-                    f"task={current_task}, ref_tokens={ref_latents_patched.shape[1]}"
-                )
+                logger.info(f"Applied concept embedding for identity anchoring: task={current_task}, ref_tokens={ref_latents_patched.shape[1]}")
                 self._logged_concept_emb.add(current_task)
 
         ref_seq_len = ref_latents_patched.shape[1]
         tgt_seq_len = tgt_latents_patched.shape[1]
 
         # Create per-token timesteps
-        # Reference: all zeros (t=0, noise-free)
-        # Target: sampled sigma (except conditioning tokens)
         ref_timesteps = torch.full(
             (batch_size, ref_seq_len),
             self.config.rcl_ref_timestep,
             device=device, dtype=dtype
         )
 
-        # Create target conditioning mask (first frame if applicable)
-        # For T2V tasks (ID, Style), no first-frame conditioning - prompt drives generation
-        # For I2V tasks (Motion, Camera, Effect), use first-frame conditioning
         effective_ff_prob = self.config.first_frame_conditioning_p if task_uses_i2v else 0.0
         target_conditioning_mask = self._create_first_frame_conditioning_mask(
             batch_size=batch_size,
@@ -2305,6 +2283,7 @@ class OmniTransferStrategy(TrainingStrategy):
         video_modality = Modality(
             enabled=True,
             latent=combined_latents,
+            sigma=sigmas.view(-1),
             timesteps=combined_timesteps,
             positions=combined_positions,
             context=prompt_embeds,

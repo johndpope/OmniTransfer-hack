@@ -5,21 +5,12 @@ import torch
 
 @dataclass(frozen=True)
 class Modality:
-    """
-    Input data for a single modality (video or audio) in the transformer.
-    Bundles the latent tokens, timestep embeddings, positional information,
-    and text conditioning context for processing by the diffusion transformer.
-    """
-
-    latent: (
-        torch.Tensor
-    )  # Shape: (B, T, D) where B is the batch size, T is the number of tokens, and D is input dimension
-    timesteps: torch.Tensor  # Shape: (B, T) where T is the number of timesteps
-    positions: (
-        torch.Tensor
-    )  # Shape: (B, 3, T) for video, where 3 is the number of dimensions and T is the number of tokens
+    latent: torch.Tensor
+    sigma: torch.Tensor
+    timesteps: torch.Tensor
+    positions: torch.Tensor
     context: torch.Tensor
     enabled: bool = True
     context_mask: torch.Tensor | None = None
-    self_attn_mask: torch.Tensor | None = None  # UNUSED — kept for API compat, see rcl_split_point
-    rcl_split_point: int | None = None  # Split point for RCL: ref tokens [0:split), target tokens [split:]
+    attention_mask: torch.Tensor | None = None
+    rcl_split_point: int | None = None

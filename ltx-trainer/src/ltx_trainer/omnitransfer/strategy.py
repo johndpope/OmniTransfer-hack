@@ -998,7 +998,10 @@ class OmniTransferStrategy(TrainingStrategy):
 
             self._tma = TaskAdaptiveMultimodalAlignment(
                 mllm_hidden_dim=config.tma_mllm_hidden_dim,
-                output_dim=3840,  # Match Gemma dimension - model does final projection
+                # Must match the (already-projected) prompt-embed dim we prepend to.
+                # LTX-2.3 video_prompt_embeds are 4096-dim (the old 3840 was LTX-2.0/
+                # Gemma and mismatched -> cat() failed).
+                output_dim=4096,
                 num_connector_layers=config.tma_connector_layers,
                 num_queries_per_task=config.tma_num_queries,
                 dropout=0.1,

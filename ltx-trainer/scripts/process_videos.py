@@ -20,7 +20,10 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import torch
-import torchaudio
+try:
+    import torchaudio  # only needed for --with-audio
+except ModuleNotFoundError:
+    torchaudio = None
 import typer
 from pillow_heif import register_heif_opener
 from rich.console import Console

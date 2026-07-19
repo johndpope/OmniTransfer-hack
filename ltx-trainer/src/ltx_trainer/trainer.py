@@ -260,6 +260,7 @@ class LtxvTrainer:
                     else:
                         self._accelerator.backward(loss)
 
+                    grads_finite = True
                     if self._accelerator.sync_gradients and cfg.optimization.max_grad_norm > 0:
                         # Cast any FP8 gradients to bf16 before clipping — PyTorch's
                         # foreach_norm doesn't support FP8 dtypes (pre-quantized models)
@@ -269,12 +270,23 @@ class LtxvTrainer:
                             ):
                                 p.grad = p.grad.to(torch.bfloat16)
 
-                        self._accelerator.clip_grad_norm_(
+                        total_norm = self._accelerator.clip_grad_norm_(
                             self._trainable_params,
                             cfg.optimization.max_grad_norm,
                         )
+                        # Non-finite-gradient guard: a single NaN/Inf step otherwise
+                        # cascades through the whole (video) branch and corrupts every
+                        # checkpoint. Skip the update instead of propagating NaN.
+                        if total_norm is not None:
+                            grads_finite = bool(torch.isfinite(total_norm).item())
+                        if not grads_finite:
+                            logger.warning(
+                                f"Non-finite grad norm ({total_norm}) at step "
+                                f"{self._global_step}; skipping optimizer step."
+                            )
 
-                    self._optimizer.step()
+                    if grads_finite:
+                        self._optimizer.step()
                     self._optimizer.zero_grad()
 
                     if self._lr_scheduler is not None:
@@ -1359,14 +1371,15 @@ class LtxvTrainer:
         elif opt_cfg.optimizer_type == "muon":
             from torch.optim import Muon  # noqa: PLC0415
 
-            # Muon requires 2D+ params; 1D params (biases, norms) fall back to AdamW.
-            muon_params = [p for p in self._trainable_params if p.ndim >= 2]
-            adamw_params = [p for p in self._trainable_params if p.ndim < 2]
+            # torch.optim.Muon supports EXACTLY 2D params; 1D (biases, norms) and
+            # 3D+ (e.g. ConceptEmbedding [tasks, concepts, dim]) fall back to AdamW.
+            muon_params = [p for p in self._trainable_params if p.ndim == 2]
+            adamw_params = [p for p in self._trainable_params if p.ndim != 2]
 
             if adamw_params:
                 logger.info(
-                    f"Muon optimizer: {len(muon_params)} params (2D+) via Muon, "
-                    f"{len(adamw_params)} params (1D) via AdamW fallback"
+                    f"Muon optimizer: {len(muon_params)} params (2D) via Muon, "
+                    f"{len(adamw_params)} params (non-2D) via AdamW fallback"
                 )
                 optimizer = Muon(
                     [

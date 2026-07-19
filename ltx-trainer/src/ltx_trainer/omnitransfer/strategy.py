@@ -1411,29 +1411,27 @@ class OmniTransferStrategy(TrainingStrategy):
     def _create_rcl_attention_mask(
         ref_seq_len: int, tgt_seq_len: int, device: torch.device
     ) -> Tensor:
-        """Create RCL attention mask (Section 4.3).
+        """Create the RCL self-attention keep-mask (Section 4.3).
 
-        Reference tokens only self-attend (cannot see noisy target).
-        Target tokens attend to themselves AND reference (clean, t=0).
+        Reference tokens only self-attend (cannot see the noisy target); target
+        tokens attend to themselves AND the reference (clean, t=0).
 
         Quote: "The reference branch... remains noise-free throughout the diffusion
         process... Attention masking prevents reference from attending to noisy target."
 
-        Returns: [total_seq_len, total_seq_len] float additive mask (0=attend, -inf=block)
+        Returned as a [0, 1] keep-mask of shape (1, T, T) — 1 = attend, 0 = block —
+        which is the format TransformerArgsPreprocessor._prepare_self_attention_mask
+        expects (it converts it to an additive log-space bias and hands it to the
+        block's video self-attention as ``self_attention_mask``).
+
+        Note: no row is fully masked (every ref row keeps the ``ref_seq_len`` ref
+        columns), so softmax cannot produce NaNs from an all-masked row.
         """
         total = ref_seq_len + tgt_seq_len
-        # Start with boolean: True = attend
-        mask = torch.zeros(total, total, dtype=torch.bool, device=device)
-
-        # Reference self-attention: ref rows attend to ref columns only
-        mask[:ref_seq_len, :ref_seq_len] = True
-
-        # Target attends to everything (itself + reference)
-        mask[ref_seq_len:, :] = True
-
-        # Convert to additive float mask for F.scaled_dot_product_attention
-        float_mask = torch.where(mask, 0.0, float("-inf"))
-        return float_mask
+        keep = torch.zeros(1, total, total, dtype=torch.float32, device=device)
+        keep[:, :ref_seq_len, :ref_seq_len] = 1.0  # ref rows -> ref cols only
+        keep[:, ref_seq_len:, :] = 1.0  # target rows -> everything (target + ref)
+        return keep
 
     def _decode_latents_to_pixels(
         self,
@@ -2264,18 +2262,27 @@ class OmniTransferStrategy(TrainingStrategy):
         # Concatenate positions
         combined_positions = torch.cat([biased_ref_positions, tgt_positions], dim=2)
 
-        # RCL split-attention (Section 4.3)
-        # Instead of a dense mask (OOM on 32GB), we pass the split point so the
-        # transformer block splits self-attention into two efficient calls:
-        #   (1) ref self-attention: ref tokens attend only to ref (flash attn, no mask)
-        #   (2) target full attention: target tokens attend to ref+self (flash attn, no mask)
+        # Reference-decoupled Causal Learning (Section 4.3).
+        # The reference branch is held noise-free at t=0 (via combined_timesteps above)
+        # and must be DECOUPLED from the noisy target: reference tokens may attend only
+        # to the reference, while target tokens attend to target+reference. We express
+        # this as a self-attention keep-mask on Modality.attention_mask, which ltx-core
+        # converts to the block's self_attention_mask.
+        #
+        # NOTE: `rcl_split_point` alone does NOT implement RCL — nothing in ltx-core
+        # consumes it, so before this the model ran full bidirectional attention and
+        # the reference "decoupling" was inactive. The mask is what actually enforces it.
         rcl_split = None
+        rcl_attention_mask = None
         if self.config.enable_rcl:
             rcl_split = ref_seq_len
+            rcl_attention_mask = self._create_rcl_attention_mask(
+                ref_seq_len, tgt_seq_len, combined_latents.device
+            )
             if not hasattr(self, "_logged_rcl_split"):
                 logger.info(
-                    f"RCL split-attention: ref={ref_seq_len} | tgt={tgt_seq_len} "
-                    f"(total={ref_seq_len + tgt_seq_len} tokens)"
+                    f"RCL decoupled attention (masked): ref={ref_seq_len} | "
+                    f"tgt={tgt_seq_len} (total={ref_seq_len + tgt_seq_len} tokens)"
                 )
                 self._logged_rcl_split = True
 
@@ -2288,6 +2295,7 @@ class OmniTransferStrategy(TrainingStrategy):
             positions=combined_positions,
             context=prompt_embeds,
             context_mask=prompt_attention_mask,
+            attention_mask=rcl_attention_mask,
             rcl_split_point=rcl_split,
         )
 

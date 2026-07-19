@@ -1,0 +1,73 @@
+model:
+  model_path: /media/2TB/ltx-models/ltx2.3/ltx-2.3-22b-distilled.safetensors
+  training_mode: lora
+  load_checkpoint: /media/2TB/ltx-models/LTX-2.3-22b-IC-LoRA-Ingredients/ltx-2.3-22b-ic-lora-ingredients-0.9.safetensors
+lora:
+  rank: 128
+  alpha: 128
+  target_modules:
+  - attn1.to_q
+  - attn1.to_k
+  - attn1.to_v
+  - attn1.to_out.0
+  - attn2.to_q
+  - attn2.to_k
+  - attn2.to_v
+  - attn2.to_out.0
+  - ff.net.0.proj
+  - ff.net.2
+training_strategy:
+  name: omnitransfer
+  task_type: identity_preservation
+  training_stage: 2
+  enable_tpb: false
+  enable_rcl: false
+  enable_tma: true
+  use_cached_tma_features: true
+  tma_features_dir: qwen_vl_features
+  tma_mllm_hidden_dim: 3584
+  enable_concept_embeddings: false
+  concept_embedding_dim: 128
+  concept_embedding_task_specific: true
+  i2v_mode: false
+  reference_latents_dir: reference_latents
+  style_loss_weight: 0.0
+  use_decoded_pixels_for_style: false
+  use_vgg_style_features: false
+  perceptual_loss_interval: 5
+  log_reconstructions: true
+  reconstruction_log_interval: 200
+  num_frames_to_visualize: 4
+  log_video_comparisons: true
+  video_log_interval: 250
+data:
+  preprocessed_data_root: /media/2TB/omnitransfer/data/mashup_v2
+  final_embeddings_dir: conditions
+  use_cached_final_embeddings: true
+  num_dataloader_workers: 0
+optimization:
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  learning_rate: 3.0e-05
+  warmup_steps: 100
+  optimizer_type: adamw
+  scheduler_type: cosine
+  scheduler_params:
+    eta_min: 0.0001
+  weight_decay: 0.01
+  steps: 1500
+  enable_gradient_checkpointing: true
+acceleration:
+  mixed_precision_mode: bf16
+  quantization: int8-quanto
+  load_text_encoder_in_8bit: false
+output_dir: /media/2TB/omnitransfer/output/mashup_v2_mq_ingredients
+checkpoints:
+  interval: 250
+  keep_last_n: 4
+validation:
+  interval: null
+wandb:
+  enabled: true
+  project: omnitransfer-mq-ingredients
+  log_validation_videos: false

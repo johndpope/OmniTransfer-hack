@@ -95,8 +95,8 @@ def main():
     for idx, caption in tqdm(prompts.items(), desc="Computing embeddings"):
         out_path = cond_dir / f"{idx}.pt"
 
-        # TEMP: Use standard naming with zero-padding for trainer compatibility
-        out_path_zp = cond_dir / f"{int(idx):03d}.pt"
+        # Use standard naming with zero-padding for trainer compatibility
+        out_path_zp = cond_dir / f"{int(idx):06d}.pt"
 
         if out_path_zp.exists():
             skipped += 1

@@ -96,15 +96,26 @@ def main() -> None:
         print(f"[dummy] done: {len(list(out_dir.glob('*.pt')))} files")
         return
 
-    # Real extraction — reuse the repo's Qwen-VL wrapper.
-    from ltx_trainer.omnitransfer.qwen_vl_integration import (
-        QwenVLConfig,
-        QwenVLFeatureExtractor,
-    )
+    # Real extraction — reuse the repo's Qwen-VL wrapper. Load the module directly
+    # by file path to avoid ltx_trainer.omnitransfer.__init__ (which imports strategy
+    # and hits a known circular import); qwen_vl_integration itself only imports
+    # stdlib/torch/transformers at module level.
+    import importlib.util
+
+    qvi_path = Path(__file__).resolve().parent.parent / "src/ltx_trainer/omnitransfer/qwen_vl_integration.py"
+    spec = importlib.util.spec_from_file_location("qwen_vl_integration", qvi_path)
+    qvi = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(qvi)
+    QwenVLConfig = qvi.QwenVLConfig
+    QwenVLFeatureExtractor = qvi.QwenVLFeatureExtractor
 
     device = torch.device(args.device)
     extractor = QwenVLFeatureExtractor(
-        QwenVLConfig(model_path=args.model_path, device=args.device)
+        QwenVLConfig(
+            model_path=args.model_path,
+            device=args.device,
+            use_flash_attention=False,  # not installed; fall back to SDPA
+        )
     ).to(device).eval()
     hidden_dim = extractor.hidden_dim
     print(f"Loaded {args.model_path} (hidden_dim={hidden_dim}); extracting {len(pairs)} samples")

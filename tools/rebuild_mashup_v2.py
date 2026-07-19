@@ -137,37 +137,57 @@ def prepare(scenes_dir: Path, output_dir: Path, min_frames: int) -> None:
         for s in scenes:
             w.writerow([f"clips/{s['name']}.mp4", "scene"])  # relative to scenes.csv dir
 
-    # 3. Cross-pair scenes WITHIN each reel (ref != tgt).
-    by_reel: dict[str, list[dict]] = {}
-    for s in scenes:
-        by_reel.setdefault(s["reel_id"], []).append(s)
+    # 3. GENDER-MATCHED pairing: reference and target must be the same gender
+    #    (lady->lady, man->man). Pairing arbitrary scenes produced nonsense pairs
+    #    (e.g. a woman reference with a two-men target), where the model just
+    #    reconstructs the target and ignores the reference. Uses scene_gender.json
+    #    (tools/classify_scene_gender.py). Each target gets up to K same-gender
+    #    references, preferring a DIFFERENT reel so the reference is a genuine
+    #    transfer source rather than the same clip/scene.
+    import random as _random
+    from collections import Counter as _Counter
+    _random.seed(0)
 
+    gender_file = output_dir / "scene_gender.json"
+    gender: dict[str, str] = json.load(open(gender_file)) if gender_file.exists() else {}
+    if not gender:
+        print("WARN: no scene_gender.json — run tools/classify_scene_gender.py first; "
+              "falling back to ungendered pairing is NOT done.")
+
+    by_gender: dict[str, list[dict]] = {}
+    for s in scenes:
+        g = gender.get(s["name"], "none")
+        if g in ("man", "woman"):
+            by_gender.setdefault(g, []).append(s)
+
+    K_REFS = 4  # same-gender references per target
     pairs: list[dict] = []
     idx = 0
-    for reel_id, reel_scenes in by_reel.items():
-        if len(reel_scenes) < 2:
+    for tgt in scenes:
+        g = gender.get(tgt["name"], "none")
+        if g not in ("man", "woman"):
             continue
-        movie = REEL_MOVIE_MAP.get(reel_id, "a movie mashup")
-        for ref in reel_scenes:
-            for tgt in reel_scenes:
-                if ref["scene"] == tgt["scene"]:
-                    continue
-                pairs.append({
-                    "idx": idx,
-                    "id": idx,
-                    "file_name": f"{idx:06d}.pt",             # target latent
-                    "reference_file_name": f"{idx:06d}.pt",   # reference latent (diff content)
-                    "reel_id": reel_id,
-                    "movie": movie,
-                    "ref_scene": ref["scene"],
-                    "tgt_scene": tgt["scene"],
-                    "ref_name": ref["name"],
-                    "tgt_name": tgt["name"],
-                    "text": neutral_prompt(movie),
-                    "task_type": "style_transfer",
-                })
-                idx += 1
-    print(f"Built {len(pairs)} cross-pairs from {len(by_reel)} reels")
+        candidates = [r for r in by_gender[g] if r["name"] != tgt["name"]]
+        diff_reel = [r for r in candidates if r["reel_id"] != tgt["reel_id"]]
+        pool = diff_reel if len(diff_reel) >= K_REFS else candidates
+        for ref in _random.sample(pool, min(K_REFS, len(pool))):
+            movie = REEL_MOVIE_MAP.get(tgt["reel_id"], "a movie mashup")
+            pairs.append({
+                "idx": idx, "id": idx,
+                "file_name": f"{idx:06d}.pt",             # target latent
+                "reference_file_name": f"{idx:06d}.pt",   # reference latent (diff content)
+                "reel_id": tgt["reel_id"],
+                "movie": movie,
+                "gender": g,
+                "ref_scene": ref["scene"], "tgt_scene": tgt["scene"],
+                "ref_name": ref["name"], "tgt_name": tgt["name"],
+                "ref_reel": ref["reel_id"],
+                "text": neutral_prompt(movie),
+                "task_type": "style_transfer",
+            })
+            idx += 1
+    print(f"Built {len(pairs)} gender-matched pairs "
+          f"({dict(_Counter(p['gender'] for p in pairs))})")
 
     with open(output_dir / "metadata_v2.json", "w") as f:
         json.dump({"pairs": pairs}, f, indent=2)

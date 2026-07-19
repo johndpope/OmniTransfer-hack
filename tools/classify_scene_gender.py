@@ -15,9 +15,13 @@ import torch
 from PIL import Image
 from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
-Q = ("Look at the main person in this image. Answer with exactly one word: "
-     "'man' if the main person is male, 'woman' if female, 'both' if there are "
-     "clearly both a man and a woman, or 'none' if no person is visible.")
+CATEGORIES = ["one_woman", "one_man", "two_women", "two_men", "man_and_woman",
+              "group", "none"]
+Q = ("Categorize the people in this image. Reply with EXACTLY one of these labels "
+     "and nothing else: 'one_woman' (a single woman), 'one_man' (a single man), "
+     "'two_women' (two women), 'two_men' (two men), 'man_and_woman' (one man and "
+     "one woman), 'group' (three or more people), 'none' (no people visible). "
+     "Choose based on the clearly visible foreground people.")
 
 
 def mid_frame(clip: Path, size: int = 448) -> Image.Image:
@@ -52,9 +56,10 @@ def main() -> None:
         text = proc.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
         inputs = proc(text=[text], images=[img], return_tensors="pt").to("cuda")
         with torch.inference_mode():
-            gen = model.generate(**inputs, max_new_tokens=5, do_sample=False)
+            gen = model.generate(**inputs, max_new_tokens=10, do_sample=False)
         ans = proc.batch_decode(gen[:, inputs.input_ids.shape[1]:], skip_special_tokens=True)[0].strip().lower()
-        label = next((g for g in ("woman", "man", "both", "none") if g in ans), "none")
+        ans_norm = ans.replace(" ", "_").replace("-", "_")
+        label = next((c for c in CATEGORIES if c in ans_norm), "none")
         out[clip.stem] = label
         if (i + 1) % 15 == 0:
             print(f"  {i+1}/{len(clips)}")

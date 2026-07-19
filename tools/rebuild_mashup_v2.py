@@ -148,24 +148,27 @@ def prepare(scenes_dir: Path, output_dir: Path, min_frames: int) -> None:
     from collections import Counter as _Counter
     _random.seed(0)
 
+    # Composition categories (from classify_scene_gender.py): a scene is paired only
+    # with scenes of the SAME composition, so a two-men target isn't matched to a
+    # single-man/single-woman reference. 'group'/'none' are excluded from pairing.
+    PAIR_CATEGORIES = {"one_woman", "one_man", "two_women", "two_men", "man_and_woman"}
     gender_file = output_dir / "scene_gender.json"
     gender: dict[str, str] = json.load(open(gender_file)) if gender_file.exists() else {}
     if not gender:
-        print("WARN: no scene_gender.json — run tools/classify_scene_gender.py first; "
-              "falling back to ungendered pairing is NOT done.")
+        print("WARN: no scene_gender.json — run tools/classify_scene_gender.py first.")
 
     by_gender: dict[str, list[dict]] = {}
     for s in scenes:
         g = gender.get(s["name"], "none")
-        if g in ("man", "woman"):
+        if g in PAIR_CATEGORIES:
             by_gender.setdefault(g, []).append(s)
 
-    K_REFS = 4  # same-gender references per target
+    K_REFS = 4  # same-composition references per target
     pairs: list[dict] = []
     idx = 0
     for tgt in scenes:
         g = gender.get(tgt["name"], "none")
-        if g not in ("man", "woman"):
+        if g not in PAIR_CATEGORIES:
             continue
         candidates = [r for r in by_gender[g] if r["name"] != tgt["name"]]
         diff_reel = [r for r in candidates if r["reel_id"] != tgt["reel_id"]]

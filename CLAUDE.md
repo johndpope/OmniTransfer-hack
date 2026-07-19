@@ -1,3 +1,29 @@
+# ⚠️ CURRENT STRATEGY (2026-07-19): Ingredients IC-LoRA + MetaQuery
+
+> For **identity** we pivoted from the from-scratch OmniTransfer port to the official
+> **LTX-2.3-22b-IC-LoRA-Ingredients** LoRA (proven, rank-128). See `README.md` and the
+> `ingredients-identity-pivot` memory. Working pieces:
+>
+> - **Identity (V1, no training):** `tools/ingredients_generate.py --image <portrait> --prompt "<scene>"`.
+>   Run via castlehill's `ltx_pipelines.distilled`. **Use the FULL multi-shard
+>   `/media/2TB/ltx-models/gemma`** (the fp4 gemma is text-only → vision-tower meta-tensor crash).
+>   Use a **clean cropped portrait** (`tools/extract_portraits.py`), not a full scene frame.
+> - **Semantic control (V2):** train a **MetaQuery/TMA connector on the FROZEN Ingredients base**.
+>   No new strategy code — use the OmniTransfer strategy with **`enable_tpb/rcl/concept_embeddings: false`**
+>   (that == IC-LoRA conditioning: clean ref + noised target, full attention), `training_stage: 2`,
+>   `enable_tma: true`, and **`model.load_checkpoint` = the Ingredients LoRA** with `lora.rank: 128` +
+>   attn+FFN `target_modules`. Config: `data/mashup_v2/train_config_mq_ingredients.yaml`. Precompute
+>   features with `scripts/compute_qwen_vl_features.py`. `tools/metaquery_ingredients.py` is the
+>   inference bridge (prepends the connector's context into the Ingredients pipeline; zero-init gated).
+> - **Data:** pair references with the **same composition** (`tools/classify_scene_gender.py` +
+>   `rebuild_mashup_v2.py`) — a two-men target must not get a single-person reference, or the model
+>   ignores the reference (seen in W&B reconstructions).
+>
+> The OmniTransfer port (TPB/RCL/TMA) still lives in `ltx-trainer/.../omnitransfer/` as the research
+> track / in-repo trainer. Monitor runs via `output_dir/debug_info.txt`, launch with `setsid`.
+
+---
+
 1. Plan Node Default
 •Enter plan mode for any non-trivial task (three or more steps, or involving architectural decisions).
 •If something goes wrong, stop and re-plan immediately rather than continuing blindly.

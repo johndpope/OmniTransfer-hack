@@ -19,7 +19,7 @@ research track and as the **in‑repo trainer** for making/adapting IC‑LoRAs.
 |------|------|-----------|
 | **Character identity → new scene from 1 image** | Ingredients IC‑LoRA (inference) | ❌ none |
 | Adapt/finetune identity to *your* characters | `video_to_video` IC‑LoRA trainer (this repo), warm‑start from Ingredients | ✅ in‑repo |
-| Semantic control over *which* attributes carry | MetaQuery/TMA layer (V2, scaffolded) | ✅ in‑repo |
+| Semantic control over *which* attributes carry | MetaQuery/TMA connector, trained on the frozen Ingredients base (V2) | ✅ in‑repo |
 
 ```bash
 # One portrait + a prompt → identity‑preserving clip (no training)
@@ -88,14 +88,46 @@ uv run python ltx-trainer/scripts/train.py ltx-trainer/configs/ltx2_v2v_ic_lora.
 Data layout is the same one `tools/rebuild_mashup_v2.py` produces:
 `latents/` (target), `reference_latents/` (clean ref), `conditions/` (text).
 
-### 4. (V2) MetaQuery semantic control — scaffolded
-`tools/metaquery_ingredients.py` adds a learnable **MetaQuery** channel: an MLLM
-(Qwen‑VL) reads the reference, learnable queries aggregate it, a connector maps to
-the DiT context dim, and the result is **prepended to `video_context`** (the
-injection point in castlehill `distilled.py:101`). The conditioner is **zero‑init
-gated** (a no‑op until trained, so it can't degrade output). Remaining milestone:
-train the connector (flow‑matching, DiT + Ingredients LoRA frozen) with the
-in‑repo trainer.
+### 4. (V2) MetaQuery semantic control — training on the Ingredients base
+Adds a learnable **MetaQuery** channel on top of Ingredients: an MLLM (Qwen‑VL)
+reads the reference, learnable queries aggregate it, a connector maps to the DiT
+context dim, and the result is **prepended to the cross‑attention context**. This
+gives learnable control over *which* semantics carry.
+
+**How it's trained (no new strategy code):** the OmniTransfer strategy with
+`enable_tpb/rcl/concept_embeddings: false` **is** the IC‑LoRA conditioning (clean
+reference + noised target, full attention) — exactly what Ingredients expects. So:
+
+```yaml
+model:
+  training_mode: lora
+  load_checkpoint: /media/2TB/ltx-models/LTX-2.3-22b-IC-LoRA-Ingredients/ltx-2.3-22b-ic-lora-ingredients-0.9.safetensors
+lora:
+  rank: 128            # match Ingredients
+  alpha: 128
+  target_modules: [attn1.to_q, attn1.to_k, attn1.to_v, attn1.to_out.0,
+                   attn2.to_q, attn2.to_k, attn2.to_v, attn2.to_out.0,
+                   ff.net.0.proj, ff.net.2]
+training_strategy:
+  name: omnitransfer
+  training_stage: 2    # freeze DiT + Ingredients LoRA, train the TMA connector
+  enable_tpb: false
+  enable_rcl: false
+  enable_concept_embeddings: false
+  enable_tma: true                    # MetaQuery/TMA connector
+  use_cached_tma_features: true
+  tma_features_dir: qwen_vl_features  # from compute_qwen_vl_features.py
+  tma_mllm_hidden_dim: 3584           # Qwen2.5-VL-7B
+```
+```bash
+# 1. precompute MLLM features for each pair
+python ltx-trainer/scripts/compute_qwen_vl_features.py --data-root <data> --model-path /media/2TB/ltx-models/qwen2.5-vl-7b
+# 2. train the connector on the frozen Ingredients base
+uv run python ltx-trainer/scripts/train.py <config with the above>
+```
+`tools/metaquery_ingredients.py` is the **inference bridge** — it prepends the
+trained connector's context into castlehill's fast pipeline (injection point
+`distilled.py:101`), with a zero‑init gate so an untrained connector is a no‑op.
 
 ---
 
